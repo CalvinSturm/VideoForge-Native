@@ -119,6 +119,48 @@ class SafeRealESRGANer(RealESRGANer):
 
 
 # -----------------------------------------------------------------------------
+# WATCHDOG (Suicide Pact)
+# -----------------------------------------------------------------------------
+import threading
+import ctypes
+
+def is_pid_alive(pid):
+    """Check if PID is alive on Windows using ctypes kernel32"""
+    try:
+        # PROCESS_QUERY_INFORMATION (0x0400) or PROCESS_QUERY_LIMITED_INFORMATION (0x1000)
+        # SYNCHRONIZE (0x00100000)
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+            
+        exit_code = ctypes.c_ulong()
+        if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            ctypes.windll.kernel32.CloseHandle(handle)
+            # STAY_ALIVE (259) means still running
+            return exit_code.value == 259
+            
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return False
+    except:
+        return False
+
+def watchdog_loop(parent_pid):
+    """Monitor parent. If it dies, we die."""
+    print(f"[Python] Watchdog started for Parent PID: {parent_pid}", flush=True)
+    while True:
+        if not is_pid_alive(parent_pid):
+            print(f"[Python] Parent {parent_pid} died. Committing seppuku...", flush=True)
+            # Hard exit, no cleanup needed (OS handles it)
+            os._exit(0)
+        time.sleep(2)
+
+def start_watchdog(parent_pid):
+    if parent_pid <= 0: return
+    t = threading.Thread(target=watchdog_loop, args=(parent_pid,), daemon=True)
+    t.start()
+
+# -----------------------------------------------------------------------------
 # WORKER CLASS
 # -----------------------------------------------------------------------------
 
@@ -630,5 +672,11 @@ class AIWorker:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=str, default="7447")
+    parser.add_argument("--parent-pid", type=int, default=0, help="Parent Process ID to monitor")
     args = parser.parse_args()
+    
+    if args.parent_pid > 0:
+        start_watchdog(args.parent_pid)
+        
     AIWorker(args.port)
+    sys.exit(0)

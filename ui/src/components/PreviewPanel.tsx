@@ -25,6 +25,7 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
    inputPreview, activeJob, videoState, onFileDrop, mode, editState, setEditState, viewMode, setViewMode
 }) => {
    const [isPlaying, setIsPlaying] = useState(false);
+   const [isScrubbing, setIsScrubbing] = useState(false);
    const [isMuted, setIsMuted] = useState(false);
 
    const [zoom, setZoom] = useState(1);
@@ -91,6 +92,12 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
       let animationFrameId: number;
 
       const syncLoop = () => {
+         // Fix: If scrubbing, abort sync logic to prevent fighting manual seek
+         if (isCropDragging || isScrubbing) {
+            animationFrameId = requestAnimationFrame(syncLoop);
+            return;
+         }
+
          if (isPlaying && videoRef.current && resultVideoRef.current) {
             const source = videoRef.current;
             const result = resultVideoRef.current;
@@ -99,45 +106,64 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
             const start = editState.trimStart;
             const end = editState.trimEnd;
 
-            // --- A. FRAME-PERFECT LOOPING ---
-            // We handle looping here instead of onTimeUpdate to catch the end instantly
+            // --- A. PAUSE ON COMPLETION (No Loop) ---
+            // User requested to pause at end instead of looping to avoid sync lag
 
-            // 1. Sample Preview Loop (2s limit)
+            // 1. Sample Preview Limit (2s default + start)
             if (videoState.samplePreview) {
                if (t >= start + 2.0) {
+                  source.pause();
                   source.currentTime = start;
-                  result.currentTime = 0; // Result is 0-based
-                  // Do not process sync this frame, we just jumped
-                  animationFrameId = requestAnimationFrame(syncLoop);
+                  result.currentTime = 0; // Result is 0-based for samples
+                  setIsPlaying(false);
                   return;
                }
             }
-            // 2. Standard Trim Loop
+            // 2. Standard Trim Limit
             else if (end > 0 && end < videoState.duration) {
                if (t >= end) {
+                  source.pause();
                   source.currentTime = start;
-                  result.currentTime = start; // Result is source-time based
-                  animationFrameId = requestAnimationFrame(syncLoop);
+                  result.currentTime = start;
+                  setIsPlaying(false);
                   return;
                }
             }
-
-            // --- B. SYNC CORRECTION ---
-            let targetTime = 0;
-
-            if (videoState.samplePreview) {
-               targetTime = source.currentTime - start;
-               if (targetTime < 0) targetTime = 0;
-            } else {
-               targetTime = source.currentTime;
+            // 3. Natural End (Full Video)
+            else if (source.ended) {
+               source.currentTime = start;
+               if (result) result.currentTime = start;
+               setIsPlaying(false);
+               return;
             }
 
-            // FIX: Only sync if result is NOT currently seeking
-            // This prevents fighting the browser's seek engine and causing stutters
-            if (!result.seeking) {
+            // --- B. BUFFERING / SEEK PROTECTION ---
+            // If result is struggling (seeking or buffering), pause source to wait for it.
+            // This prevents "Death Spiral" where source keeps advancing, forcing result to seek repeatedly.
+            const isResultNotReady = result.seeking || result.readyState < 3; // 3 = HAVE_FUTURE_DATA
+
+            if (isResultNotReady) {
+               source.pause();
+            } else if (isPlaying && source.paused) {
+               // Only resume if we are globally "Playing" and source was paused by us (or stalled)
+               source.play();
+            }
+
+            // --- C. SYNC CORRECTION ---
+            // Only sync if result is playing normally
+            if (!isResultNotReady) {
+               let targetTime = 0;
+
+               if (videoState.samplePreview) {
+                  targetTime = source.currentTime - start;
+                  if (targetTime < 0) targetTime = 0;
+               } else {
+                  targetTime = source.currentTime;
+               }
+
                const diff = Math.abs(result.currentTime - targetTime);
-               // Threshold: 0.04s (~1 frame at 25fps)
-               if (diff > 0.04) {
+               // Threshold: 0.08s (~2-3 frames at 30fps) - Increased from 0.04 to prevent jitter
+               if (diff > 0.08) {
                   result.currentTime = targetTime;
                }
             }
@@ -150,7 +176,7 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
       }
 
       return () => cancelAnimationFrame(animationFrameId);
-   }, [isPlaying, videoState.samplePreview, editState.trimStart, editState.trimEnd, videoState.duration]);
+   }, [isPlaying, videoState.samplePreview, editState.trimStart, editState.trimEnd, videoState.duration, isCropDragging, isScrubbing]);
 
    // --- 3. INPUT HANDLERS ---
 
@@ -394,7 +420,7 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
             <div style={{
                height: '36px',
                borderBottom: '1px solid var(--panel-border)',
-               background: '#09090b',
+               background: 'var(--panel-bg)',
                display: 'flex', alignItems: 'center',
                padding: '0 12px',
                justifyContent: 'space-between',
@@ -418,7 +444,7 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
          )}
 
          {/* Viewport */}
-         <div ref={viewportRef} style={{ flex: 1, position: 'relative', display: 'flex', overflow: 'hidden', background: '#09090b' }} onMouseDown={handleMouseDown}>
+         <div ref={viewportRef} style={{ flex: 1, position: 'relative', display: 'flex', overflow: 'hidden', background: 'var(--bg-color)' }} onMouseDown={handleMouseDown}>
             {/* Define SVG Filter for Color Grading */}
             {svgFilterDetails && (
                <svg style={{ position: 'absolute', width: 0, height: 0, pointerEvents: 'none' }}>
@@ -542,8 +568,11 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
 
                <div style={{ width: '100%' }}>
                   <Timeline
+                     onInteractionStart={() => setIsScrubbing(true)}
+                     onInteractionEnd={() => setIsScrubbing(false)}
                      duration={videoState.duration} currentTime={videoState.currentTime}
                      trimStart={editState.trimStart} trimEnd={editState.trimEnd}
+                     renderedRange={videoState.renderedRange}
                      onSeek={(t) => {
                         if (videoRef.current) videoRef.current.currentTime = t;
                         videoState.setCurrentTime(t);

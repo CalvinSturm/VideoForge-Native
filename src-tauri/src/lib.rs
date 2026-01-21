@@ -545,6 +545,10 @@ async fn upscale_request(
     cmd.arg(script_path);
     cmd.arg("--port");
     cmd.arg(port.to_string());
+    cmd.arg("--parent-pid");
+    cmd.arg(std::process::id().to_string());
+    cmd.stdout(Stdio::null()); // Prevent blocking on pipe buffer
+    cmd.stderr(Stdio::null());
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000);
 
@@ -802,17 +806,22 @@ async fn upscale_request(
     let _ = publisher
         .put(serde_json::json!({ "command": "shutdown" }).to_string())
         .await;
+    // Targeted Cleanup
     if let Some(mut child) = python_guard.disarm() {
-        let _ = timeout(Duration::from_secs(5), child.wait()).await;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/F", "/IM", "python.exe"])
-            .creation_flags(0x08000000)
-            .output()
-            .await;
+        // Try graceful shutdown first
+        if timeout(Duration::from_secs(3), child.wait()).await.is_err() {
+            println!("Engine did not exit in time. Forcing kill...");
+            let _ = child.start_kill(); // Tokio's kill
+            
+            // Double-tap with Windows taskkill by PID to be sure
+            #[cfg(target_os = "windows")]
+            if let Some(pid) = child.id() {
+                 let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .creation_flags(0x08000000)
+                    .output();
+            }
+        }
     }
 
     Ok(output_path)

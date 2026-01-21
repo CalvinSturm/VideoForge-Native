@@ -37,6 +37,66 @@
   /* FONTS */
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+  /* DOCK (Defaults) */
+  --dock-bg: #111113;
+  --dock-border: rgba(255, 255, 255, 0.1);
+  --dock-hover: #1a1a1c;
+  /* SCROLLBARS */
+  --scrollbar-thumb: #333;
+  --scrollbar-thumb-hover: #555;
+}
+
+/* ============================================================
+   LIGHT MODE OVERRIDES
+   ============================================================ */
+.light-mode-container {
+  /* LIGHT BACKGROUNDS - Darker Greys */
+  --bg-color: #e4e4e7;
+  /* Zinc-200 */
+  --bg-gradient: radial-gradient(circle at 50% 0%, #f4f4f5 0%, #e4e4e7 40%);
+
+  --panel-bg: #fafafa;
+  /* Darker border */
+  --panel-border: #a1a1aa;
+  /* Zinc-400 */
+  --section-bg: #f4f4f5;
+
+  /* BRAND - Keep somewhat similar but readable */
+  --brand-primary: #059669;
+  /* Emerald-600 (Darker/Rich Green for text legibility) */
+  --brand-dim: rgba(5, 150, 105, 0.1);
+  --brand-text-on-primary: #ffffff;
+
+  /* TEXT - Sharper Contrast */
+  --text-primary: #09090b;
+  /* Zinc-950 (Almost Black) */
+  --text-secondary: #52525b;
+  /* Zinc-600 (Darker Grey) */
+  --text-muted: #71717a;
+  /* Zinc-500 */
+
+  /* CONTROLS */
+  --button-bg: #ffffff;
+  --button-hover-bg: #f4f4f5;
+  --input-bg: #ffffff;
+  --input-border: #a1a1aa;
+  /* Match panel border */
+
+  /* SHADOWS - stronger for definition */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.1);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.15);
+  --bevel-light: inset 0 1px 0 0 rgba(255, 255, 255, 0.8);
+  --inset-deep: inset 0 1px 3px 0 rgba(0, 0, 0, 0.1);
+
+  /* MOSAIC SPECIFIC */
+  --mosaic-title-bg: #e4e4e7;
+  --mosaic-title-border: #a1a1aa;
+  /* SCROLLBARS */
+  --scrollbar-thumb: #d4d4d8;
+  /* Zinc-300 */
+  --scrollbar-thumb-hover: #a1a1aa;
+  /* Zinc-400 */
 }
 
 /* FIX: Override Blueprint's default grey background */
@@ -54,11 +114,10 @@
   background-color: transparent !important;
 }
 
-/* Global Background Enforcer */
-html, body, #root {
-  background-color: var(--bg-color) !important;
-  background-image: var(--bg-gradient) !important;
-  color: var(--text-primary) !important;
+/* Global Background Enforcer - MOVED TO APP CONTAINER */
+html,
+body,
+#root {
   margin: 0;
   height: 100vh;
   width: 100vw;
@@ -66,6 +125,17 @@ html, body, #root {
   font-family: var(--font-sans);
   letter-spacing: -0.01em;
   -webkit-font-smoothing: antialiased;
+  background-color: #09090b;
+  /* Fallback dark */
+}
+
+.app-container {
+  height: 100vh;
+  width: 100vw;
+  background-color: var(--bg-color);
+  background-image: var(--bg-gradient);
+  display: flex;
+  flex-direction: column;
 }
 
 /* ============================================================
@@ -76,24 +146,36 @@ html, body, #root {
   height: 8px;
   background: transparent;
 }
+
 ::-webkit-scrollbar-track {
   background: transparent;
 }
+
 ::-webkit-scrollbar-thumb {
-  background: #333;
+  background: var(--scrollbar-thumb);
   border-radius: 4px;
-  border: 2px solid var(--bg-color); /* Matches bg to fake padding */
+  border: 2px solid var(--bg-color);
+  /* Matches bg to fake padding */
 }
+
 ::-webkit-scrollbar-thumb:hover {
-  background: #555;
+  background: var(--scrollbar-thumb-hover);
 }
+
 ::-webkit-scrollbar-corner {
   background: transparent;
 }
 
 /* GLOBAL LAYOUT */
-* { box-sizing: border-box; }
-img, video { display: block; max-width: 100%; }
+* {
+  box-sizing: border-box;
+}
+
+img,
+video {
+  display: block;
+  max-width: 100%;
+}
 
 /* ============================================================
    3. COMPONENT OVERRIDES
@@ -116,17 +198,23 @@ h3 {
   display: flex;
   align-items: center;
   gap: 8px;
-  text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
 }
 
 h3::before {
-  content: ''; display: block; width: 3px; height: 3px;
-  background: var(--brand-primary); opacity: 0.8;
+  content: '';
+  display: block;
+  width: 3px;
+  height: 3px;
+  background: var(--brand-primary);
+  opacity: 0.8;
   box-shadow: 0 0 5px var(--brand-primary);
 }
 
 /* Inputs */
-select, input, .bp5-html-select select {
+select,
+input,
+.bp5-html-select select {
   background-color: var(--input-bg);
   border: 1px solid var(--input-border);
   color: var(--text-primary);
@@ -139,7 +227,8 @@ select, input, .bp5-html-select select {
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
-select:focus, input:focus {
+select:focus,
+input:focus {
   border-color: var(--brand-primary);
   box-shadow: 0 0 0 1px var(--brand-dim), var(--inset-deep);
   outline: none;
@@ -149,8 +238,8 @@ select:focus, input:focus {
 button {
   background: var(--button-bg);
   color: var(--text-primary);
-  border: 1px solid rgba(0,0,0,0.2);
-  border-top: 1px solid rgba(255,255,255,0.08);
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 4px;
   font-family: var(--font-sans);
   font-weight: 600;
@@ -160,8 +249,11 @@ button {
   box-shadow: var(--shadow-sm);
   transition: all 0.1s cubic-bezier(0.4, 0, 0.2, 1);
   cursor: pointer;
-  display: inline-flex; align-items: center; justify-content: center;
-  user-select: none; letter-spacing: 0.02em;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  letter-spacing: 0.02em;
 }
 
 button:hover:not(:disabled) {
@@ -172,11 +264,14 @@ button:hover:not(:disabled) {
 
 button:active:not(:disabled) {
   transform: translateY(0);
-  box-shadow: inset 0 2px 4px rgba(0,0,0,0.4);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.4);
 }
 
 button:disabled {
-  opacity: 0.4; cursor: not-allowed; transform: none !important; box-shadow: none !important;
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none !important;
+  box-shadow: none !important;
 }
 
 button.action-primary {
@@ -185,21 +280,21 @@ button.action-primary {
   font-weight: 800;
   text-transform: uppercase;
   border: none !important;
-  box-shadow: 0 0 10px rgba(0,255,136,0.3), inset 0 1px 0 rgba(255,255,255,0.4) !important;
+  box-shadow: 0 0 10px rgba(0, 255, 136, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.4) !important;
 }
 
 button.action-primary:hover:not(:disabled) {
   background: #33ff99 !important;
-  box-shadow: 0 0 20px rgba(0,255,136,0.5), inset 0 1px 0 rgba(255,255,255,0.4) !important;
+  box-shadow: 0 0 20px rgba(0, 255, 136, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.4) !important;
 }
 
 button.action-primary:active:not(:disabled) {
   background: #00cc6a !important;
-  box-shadow: inset 0 2px 8px rgba(0,0,0,0.2) !important;
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.2) !important;
 }
 
 button.action-secondary {
-  background: rgba(255,255,255,0.03) !important;
+  background: rgba(255, 255, 255, 0.03) !important;
   border: 1px solid var(--panel-border) !important;
   color: var(--text-secondary) !important;
   box-shadow: var(--shadow-sm);
@@ -208,7 +303,7 @@ button.action-secondary {
 button.action-secondary:hover:not(:disabled) {
   border-color: var(--text-primary) !important;
   color: var(--text-primary) !important;
-  background: rgba(255,255,255,0.06) !important;
+  background: rgba(255, 255, 255, 0.06) !important;
 }
 
 button.toggle-active {
@@ -216,7 +311,7 @@ button.toggle-active {
   color: #000 !important;
   font-weight: 800 !important;
   border-color: var(--brand-primary) !important;
-  box-shadow: 0 0 8px rgba(0,255,136,0.4) !important;
+  box-shadow: 0 0 8px rgba(0, 255, 136, 0.4) !important;
 }
 
 .titlebar-btn {
@@ -225,13 +320,29 @@ button.toggle-active {
   box-shadow: none !important;
   border-top: none !important;
 }
+
 .titlebar-btn:hover {
-  background-color: rgba(255, 255, 255, 0.08) !important;
+  background-color: var(--button-hover-bg, rgba(255, 255, 255, 0.08)) !important;
   color: var(--text-primary) !important;
 }
+
 .titlebar-btn.danger-hover:hover {
   background-color: #e81123 !important;
   color: white !important;
+}
+
+/* DOCK STRIP - The collapsed panel tabs */
+.dock-strip {
+  background-color: var(--dock-bg, #111113);
+  border: 1px solid var(--dock-border, rgba(255, 255, 255, 0.1));
+  color: var(--text-secondary);
+  transition: all 0.1s;
+}
+
+.dock-strip:hover {
+  background-color: var(--dock-hover, #1a1a1c);
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
 }
 
 /* ============================================================
@@ -251,7 +362,8 @@ button.toggle-active {
 /* 2. The Panels (Windows) */
 /* The visible box inside the padded tile */
 .mosaic-window {
-  margin: 0 !important; /* Margin handled by tile padding */
+  margin: 0 !important;
+  /* Margin handled by tile padding */
   width: 100% !important;
   height: 100% !important;
 
@@ -260,7 +372,7 @@ button.toggle-active {
   border: 1px solid var(--panel-border);
   border-radius: 6px;
   /* Deep shadow for floating effect */
-  box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -300,22 +412,28 @@ button.toggle-active {
 }
 
 .timeline-scroll-area::-webkit-scrollbar {
-  height: 6px; /* Slimmer horizontal bar */
-  background: #09090b; /* Match bg */
+  height: 6px;
+  /* Slimmer horizontal bar */
+  background: #09090b;
+  /* Match bg */
 }
 
 .timeline-scroll-area::-webkit-scrollbar-track {
-  background: #18181b; /* Dark track */
+  background: #18181b;
+  /* Dark track */
   border-radius: 3px;
-  margin: 0 16px; /* Padding from edges */
+  margin: 0 16px;
+  /* Padding from edges */
 }
 
 .timeline-scroll-area::-webkit-scrollbar-thumb {
-  background: #3f3f46; /* Subtle grey thumb */
+  background: #3f3f46;
+  /* Subtle grey thumb */
   border-radius: 3px;
   border: 1px solid #18181b;
 }
 
 .timeline-scroll-area::-webkit-scrollbar-thumb:hover {
-  background: #52525b; /* Lighter on hover */
+  background: #52525b;
+  /* Lighter on hover */
 }

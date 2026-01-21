@@ -59,6 +59,7 @@ export interface VideoState {
   samplePreview: string | null;
   renderSample: () => void;
   clearPreview: () => void;
+  renderedRange?: { start: number; end: number } | null; // NEW: Track separately from trim
 }
 
 export interface SystemStats {

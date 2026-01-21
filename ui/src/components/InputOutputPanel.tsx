@@ -79,14 +79,14 @@ const SmartPath: React.FC<{ path: string; placeholder?: string }> = ({ path, pla
 const SelectionCard = ({ selected, onClick, title, subtitle, icon, disabled }: any) => (
   <button onClick={onClick} disabled={disabled} style={{
     flex: 1, display: "flex", flexDirection: "column", alignItems: "flex-start", justifyContent: "center",
-    height: "64px", padding: "8px 12px",
-    background: selected ? "rgba(0, 255, 136, 0.05)" : "var(--panel-bg)",
-    border: selected ? "1px solid var(--brand-primary)" : "1px solid rgba(255,255,255,0.08)",
-    borderTop: selected ? "1px solid var(--brand-primary)" : "1px solid rgba(255,255,255,0.12)",
+    height: "64px", padding: "8px 12px", minWidth: "130px",
+    background: selected ? "var(--brand-dim)" : "var(--panel-bg)",
+    border: selected ? "1px solid var(--brand-primary)" : "1px solid var(--panel-border)",
+    borderTop: selected ? "1px solid var(--brand-primary)" : "1px solid var(--panel-border)",
     borderRadius: "6px", cursor: disabled ? "not-allowed" : "pointer",
     transition: "all 0.15s ease", position: "relative", overflow: "hidden",
     opacity: disabled ? 0.3 : 1,
-    boxShadow: selected ? "0 0 10px rgba(0,255,136,0.1)" : "0 2px 4px rgba(0,0,0,0.2)"
+    boxShadow: selected ? "0 0 10px rgba(0,255,136,0.1)" : "var(--shadow-sm)"
   }}>
     <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px" }}>
       <div style={{ color: selected && !disabled ? "var(--brand-primary)" : "var(--text-muted)" }}>{icon}</div>
@@ -99,8 +99,8 @@ const SelectionCard = ({ selected, onClick, title, subtitle, icon, disabled }: a
 
 const ToggleGroup = ({ options, value, onChange, disabled }: any) => (
   <div style={{
-    display: "flex", background: "#050505", padding: "3px", borderRadius: "6px",
-    border: "1px solid rgba(255,255,255,0.08)", boxShadow: "inset 0 2px 4px rgba(0,0,0,0.5)",
+    display: "flex", background: "var(--input-bg)", padding: "3px", borderRadius: "6px",
+    border: "1px solid rgba(255,255,255,0.08)", boxShadow: "inset 0 2px 4px rgba(0,0,0,0.05)",
     opacity: disabled ? 0.5 : 1, pointerEvents: disabled ? 'none' : 'auto'
   }}>
     {options.map((opt: any) => {
@@ -109,7 +109,7 @@ const ToggleGroup = ({ options, value, onChange, disabled }: any) => (
         <button key={opt.label} onClick={() => onChange(opt.value)}
           className={isActive ? "toggle-active" : ""}
           style={{
-            flex: 1, height: "30px", border: "none", borderRadius: "4px",
+            flex: 1, height: "30px", border: "none", borderRadius: "4px", minWidth: "60px",
             background: "transparent", color: "var(--text-muted)",
             fontSize: "10px", fontWeight: 500, fontFamily: 'var(--font-sans)',
             display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', lineHeight: 1.1,
@@ -129,12 +129,12 @@ const Section = ({ title, children, defaultOpen = true, extra }: any) => {
   return (
     <div style={{
       marginBottom: "16px", background: "var(--panel-bg)", border: "1px solid var(--panel-border)",
-      borderTop: "1px solid rgba(255,255,255,0.1)", borderRadius: "6px", overflow: "hidden", flexShrink: 0,
-      boxShadow: "0 4px 6px -1px rgba(0,0,0,0.3)"
+      borderTop: "1px solid var(--panel-border)", borderRadius: "6px", overflow: "hidden", flexShrink: 0,
+      boxShadow: "var(--shadow-md)"
     }}>
       <div onClick={() => setIsOpen(!isOpen)} style={{
         display: "flex", alignItems: "center", justifyContent: "space-between",
-        cursor: "pointer", padding: "10px 12px", background: "rgba(255, 255, 255, 0.02)",
+        cursor: "pointer", padding: "10px 12px", background: "var(--section-bg)",
         userSelect: "none", transition: "background 0.2s",
         borderBottom: isOpen ? "1px solid var(--panel-border)" : "none", height: "36px"
       }}>
@@ -412,7 +412,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             </div>
           }
         >
-          <div style={{ display: "flex", gap: "8px", opacity: isAIActive ? 1 : 0.4, pointerEvents: isAIActive ? 'auto' : 'none', transition: 'opacity 0.2s' }}>
+          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", opacity: isAIActive ? 1 : 0.4, pointerEvents: isAIActive ? 'auto' : 'none', transition: 'opacity 0.2s' }}>
             <SelectionCard title="REALISTIC" subtitle="PHOTO / FILM" icon={<IconCamera />} selected={!isAnime} disabled={!isAIActive} onClick={() => setIntent('real', currentPerf)} />
             <SelectionCard title="ANIMATION" subtitle="2D / LINE ART" icon={<IconAnimation />} selected={isAnime} disabled={!isAIActive} onClick={() => setIntent('anime', currentPerf)} />
           </div>

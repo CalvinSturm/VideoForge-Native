@@ -94,14 +94,14 @@ const PlayheadIcon = () => (
 
 // --- MAIN COMPONENT ---
 
-export const Timeline: React.FC<any> = ({ duration, currentTime, trimStart, trimEnd, onSeek, onTrimChange, hasAudio = true }) => {
+export const Timeline: React.FC<any> = ({ duration, currentTime, trimStart, trimEnd, onSeek, onTrimChange, hasAudio = true, onInteractionStart, onInteractionEnd }) => {
   const trackRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [zoom, setZoom] = useState(1);
   const [hoverTime, setHoverTime] = useState<number | null>(null);
 
-  const propsRef = useRef({ duration, currentTime, trimStart, trimEnd, onSeek, onTrimChange });
-  useEffect(() => { propsRef.current = { duration, currentTime, trimStart, trimEnd, onSeek, onTrimChange }; });
+  const propsRef = useRef({ duration, currentTime, trimStart, trimEnd, onSeek, onTrimChange, onInteractionStart, onInteractionEnd });
+  useEffect(() => { propsRef.current = { duration, currentTime, trimStart, trimEnd, onSeek, onTrimChange, onInteractionStart, onInteractionEnd }; });
 
   const dragState = useRef<{
     active: boolean;
@@ -128,10 +128,10 @@ export const Timeline: React.FC<any> = ({ duration, currentTime, trimStart, trim
     const epsilon = minorStep / 10;
 
     for (let t = 0; t <= safeDuration + epsilon; t += minorStep) {
-       const time = Math.abs(Math.round(t * 1000) / 1000);
-       const nearestMajor = Math.round(time / majorStep) * majorStep;
-       const isMajor = Math.abs(time - nearestMajor) < epsilon;
-       ticks.push({ time, pct: (time / safeDuration) * 100, isMajor });
+      const time = Math.abs(Math.round(t * 1000) / 1000);
+      const nearestMajor = Math.round(time / majorStep) * majorStep;
+      const isMajor = Math.abs(time - nearestMajor) < epsilon;
+      ticks.push({ time, pct: (time / safeDuration) * 100, isMajor });
     }
     return ticks;
   }, [duration, zoom]);
@@ -146,15 +146,19 @@ export const Timeline: React.FC<any> = ({ duration, currentTime, trimStart, trim
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     if (e.ctrlKey || e.metaKey) {
-        e.preventDefault();
-        e.stopPropagation();
-        setZoom(z => Math.max(1, Math.min(20, z - e.deltaY * 0.005)));
+      e.preventDefault();
+      e.stopPropagation();
+      setZoom(z => Math.max(1, Math.min(20, z - e.deltaY * 0.005)));
     }
   }, []);
 
   const handleMouseDown = (e: React.MouseEvent, target: 'playhead' | 'start' | 'end' | 'range') => {
     e.stopPropagation();
     e.preventDefault();
+
+    // Notify Interaction Start
+    if (propsRef.current.onInteractionStart) propsRef.current.onInteractionStart();
+
     const currentDuration = propsRef.current.duration;
     dragState.current = {
       active: true, target,
@@ -194,6 +198,10 @@ export const Timeline: React.FC<any> = ({ duration, currentTime, trimStart, trim
     if (dragState.current.active) {
       e.preventDefault(); e.stopPropagation();
       dragState.current.active = false;
+
+      // Notify Interaction End
+      if (propsRef.current.onInteractionEnd) propsRef.current.onInteractionEnd();
+
       window.removeEventListener('mousemove', onWindowMouseMove, { capture: true });
       window.removeEventListener('mouseup', onWindowMouseUp, { capture: true });
     }
@@ -228,64 +236,64 @@ export const Timeline: React.FC<any> = ({ duration, currentTime, trimStart, trim
         marginBottom: '4px', padding: '4px', height: '32px',
         borderBottom: '1px solid rgba(255,255,255,0.06)', background: '#09090b'
       }}>
-         {/* LEFT: RANGE */}
-         <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-            <TimeInput label="IN" time={trimStart} max={trimEnd} onChange={(v:any) => { onTrimChange(v, trimEnd); if(currentTime < v) onSeek(v); }} />
-            <div style={{ width: '8px', height: '1px', background: '#3f3f46' }}></div>
-            <TimeInput label="OUT" time={trimEnd} max={duration} onChange={(v:any) => { onTrimChange(trimStart, v); if(currentTime > v) onSeek(v); }} />
-         </div>
+        {/* LEFT: RANGE */}
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <TimeInput label="IN" time={trimStart} max={trimEnd} onChange={(v: any) => { onTrimChange(v, trimEnd); if (currentTime < v) onSeek(v); }} />
+          <div style={{ width: '8px', height: '1px', background: '#3f3f46' }}></div>
+          <TimeInput label="OUT" time={trimEnd} max={duration} onChange={(v: any) => { onTrimChange(trimStart, v); if (currentTime > v) onSeek(v); }} />
+        </div>
 
-         {/* CENTER: HEAD */}
-         <div style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)' }}>
-            <TimeInput label="HEAD" time={currentTime} max={trimEnd} highlight onChange={(v:any) => onSeek(Math.max(trimStart, Math.min(trimEnd, v)))} />
-         </div>
+        {/* CENTER: HEAD */}
+        <div style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)' }}>
+          <TimeInput label="HEAD" time={currentTime} max={trimEnd} highlight onChange={(v: any) => onSeek(Math.max(trimStart, Math.min(trimEnd, v)))} />
+        </div>
 
-         {/* RIGHT: TOOLS */}
-         <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-            {isTrimmed && (
-              <button onClick={() => onTrimChange(0, duration)}
-                title="Reset Trim Range"
-                style={{
-                  background: 'transparent', border: '1px solid #3f3f46',
-                  color: '#a1a1aa', borderRadius: '3px', padding: '0 8px',
-                  fontSize: '9px', cursor: 'pointer', height: '24px', fontWeight: 600,
-                  display: 'flex', alignItems: 'center'
-                }}>
-                RESET TRIM
-              </button>
-            )}
-            <div style={{ fontSize: '9px', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', display: 'flex', gap: '8px', alignItems: 'center' }}>
-               <span>ZOOM: {Math.round(zoom * 100)}%</span>
-               {zoom > 1 && <button onClick={()=>setZoom(1)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--brand-primary)', fontWeight: 700, padding: 0 }}>[RESET]</button>}
-            </div>
-         </div>
+        {/* RIGHT: TOOLS */}
+        <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+          {isTrimmed && (
+            <button onClick={() => onTrimChange(0, duration)}
+              title="Reset Trim Range"
+              style={{
+                background: 'transparent', border: '1px solid #3f3f46',
+                color: '#a1a1aa', borderRadius: '3px', padding: '0 8px',
+                fontSize: '9px', cursor: 'pointer', height: '24px', fontWeight: 600,
+                display: 'flex', alignItems: 'center'
+              }}>
+              RESET TRIM
+            </button>
+          )}
+          <div style={{ fontSize: '9px', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', display: 'flex', gap: '8px', alignItems: 'center' }}>
+            <span>ZOOM: {Math.round(zoom * 100)}%</span>
+            {zoom > 1 && <button onClick={() => setZoom(1)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--brand-primary)', fontWeight: 700, padding: 0 }}>[RESET]</button>}
+          </div>
+        </div>
       </div>
 
       {/* TRACK CONTAINER */}
       <div ref={scrollContainerRef} onWheel={handleWheel} className="timeline-scroll-area"
-           style={{ width: '100%', overflowX: 'auto', overflowY: 'hidden', position: 'relative', paddingTop: '28px', paddingBottom: '12px', paddingLeft: '16px', paddingRight: '16px', boxSizing: 'border-box' }}>
+        style={{ width: '100%', overflowX: 'auto', overflowY: 'hidden', position: 'relative', paddingTop: '28px', paddingBottom: '12px', paddingLeft: '16px', paddingRight: '16px', boxSizing: 'border-box' }}>
 
         <div ref={trackRef} style={{ width: `${100 * zoom}%`, height: '24px', position: 'relative' }}
-             onMouseMove={(e) => { if (trackRef.current) setHoverTime(getTimeFromEvent(e.clientX, duration)); }}
-             onMouseLeave={() => setHoverTime(null)}
-             onMouseDown={(e) => {
-                if (e.target === trackRef.current || (e.target as HTMLElement).className.includes('bg-layer')) {
-                    handleMouseDown(e, 'playhead');
-                    const t = getTimeFromEvent(e.clientX, duration);
-                    onSeek(Math.max(trimStart, Math.min(trimEnd, t)));
-                }
-             }}>
+          onMouseMove={(e) => { if (trackRef.current) setHoverTime(getTimeFromEvent(e.clientX, duration)); }}
+          onMouseLeave={() => setHoverTime(null)}
+          onMouseDown={(e) => {
+            if (e.target === trackRef.current || (e.target as HTMLElement).className.includes('bg-layer')) {
+              handleMouseDown(e, 'playhead');
+              const t = getTimeFromEvent(e.clientX, duration);
+              onSeek(Math.max(trimStart, Math.min(trimEnd, t)));
+            }
+          }}>
 
           {/* RULER */}
           <div style={{ position: 'absolute', top: -14, left: 0, right: 0, height: '14px', pointerEvents: 'none', zIndex: 1 }}>
-             {getRulerTicks.map((tick, i) => (
-                <div key={i} style={{ position: 'absolute', left: `${tick.pct}%`, bottom: 0, transform: 'translateX(-50%)', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-                   {tick.isMajor && (
-                      <span style={{ fontSize: '9px', color: '#a1a1aa', marginBottom: '2px', fontFamily: 'var(--font-mono)', fontWeight: 500 }}>{formatRulerTime(tick.time)}</span>
-                   )}
-                   <div style={{ width: 1, height: tick.isMajor ? 6 : 3, background: tick.isMajor ? '#a1a1aa' : '#52525b', opacity: tick.isMajor ? 0.8 : 0.5 }} />
-                </div>
-             ))}
+            {getRulerTicks.map((tick, i) => (
+              <div key={i} style={{ position: 'absolute', left: `${tick.pct}%`, bottom: 0, transform: 'translateX(-50%)', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                {tick.isMajor && (
+                  <span style={{ fontSize: '9px', color: '#a1a1aa', marginBottom: '2px', fontFamily: 'var(--font-mono)', fontWeight: 500 }}>{formatRulerTime(tick.time)}</span>
+                )}
+                <div style={{ width: 1, height: tick.isMajor ? 6 : 3, background: tick.isMajor ? '#a1a1aa' : '#52525b', opacity: tick.isMajor ? 0.8 : 0.5 }} />
+              </div>
+            ))}
           </div>
 
           {/* GROOVE */}
@@ -294,7 +302,15 @@ export const Timeline: React.FC<any> = ({ duration, currentTime, trimStart, trim
           </div>
 
           {/* HANDLES & ZONES */}
-          <div onMouseDown={(e) => handleMouseDown(e, 'range')} style={{ position: 'absolute', top: 9, bottom: 9, left: `${startPct}%`, width: `${widthPct}%`, background: 'rgba(0, 255, 136, 0.15)', cursor: 'grab', zIndex: 6, borderLeft: '1px solid var(--brand-primary)', borderRight: '1px solid var(--brand-primary)' }} />
+          {/* Enhanced Glow Style here */}
+          <div onMouseDown={(e) => handleMouseDown(e, 'range')} style={{
+            position: 'absolute', top: 9, bottom: 9, left: `${startPct}%`, width: `${widthPct}%`,
+            background: 'rgba(0, 255, 136, 0.25)', // Brighter green
+            cursor: 'grab', zIndex: 6,
+            borderLeft: '1px solid var(--brand-primary)', borderRight: '1px solid var(--brand-primary)',
+            boxShadow: '0 0 10px rgba(0, 255, 136, 0.4)' // Green glow
+          }} />
+
           <div style={{ position: 'absolute', top: 8, bottom: 8, left: 0, width: `${startPct}%`, background: 'rgba(0,0,0,0.7)', backdropFilter: 'grayscale(1)', pointerEvents: 'none', zIndex: 5, borderRadius: '4px 0 0 4px' }} />
           <div style={{ position: 'absolute', top: 8, bottom: 8, left: `${endPct}%`, right: 0, background: 'rgba(0,0,0,0.7)', backdropFilter: 'grayscale(1)', pointerEvents: 'none', zIndex: 5, borderRadius: '0 4px 4px 0' }} />
 
@@ -302,14 +318,14 @@ export const Timeline: React.FC<any> = ({ duration, currentTime, trimStart, trim
           <div onMouseDown={(e) => handleMouseDown(e, 'end')} style={{ position: 'absolute', left: `${endPct}%`, top: -4, height: '32px', width: '60px', marginLeft: '-30px', cursor: 'ew-resize', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }} title="Drag End"><TrimEndIcon /></div>
 
           <div onMouseDown={(e) => handleMouseDown(e, 'playhead')} style={{ position: 'absolute', left: `${currPct}%`, top: -6, bottom: -2, width: '60px', marginLeft: '-30px', cursor: 'grab', zIndex: 110, display: 'flex', flexDirection: 'column', alignItems: 'center' }} title="Scrub">
-             <PlayheadIcon />
-             <div style={{ width: 1, height: '100%', background: '#fff', boxShadow: '0 0 4px rgba(0,0,0,0.8)', marginTop: '-4px' }} />
+            <PlayheadIcon />
+            <div style={{ width: 1, height: '100%', background: '#fff', boxShadow: '0 0 4px rgba(0,0,0,0.8)', marginTop: '-4px' }} />
           </div>
 
           {hoverTime !== null && !dragState.current.active && (
-             <div style={{ position: 'absolute', left: `${(hoverTime / safeDur) * 100}%`, top: -30, transform: 'translateX(-50%)', background: '#222', padding: '2px 6px', borderRadius: '4px', fontSize: '10px', border: '1px solid #444', pointerEvents: 'none', zIndex: 120, color: '#fff', fontFamily: 'monospace', boxShadow: '0 2px 8px rgba(0,0,0,0.5)', whiteSpace: 'nowrap' }}>
-               {formatTimeFull(hoverTime)}
-             </div>
+            <div style={{ position: 'absolute', left: `${(hoverTime / safeDur) * 100}%`, top: -30, transform: 'translateX(-50%)', background: '#222', padding: '2px 6px', borderRadius: '4px', fontSize: '10px', border: '1px solid #444', pointerEvents: 'none', zIndex: 120, color: '#fff', fontFamily: 'monospace', boxShadow: '0 2px 8px rgba(0,0,0,0.5)', whiteSpace: 'nowrap' }}>
+              {formatTimeFull(hoverTime)}
+            </div>
           )}
         </div>
       </div>

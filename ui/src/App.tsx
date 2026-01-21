@@ -50,43 +50,33 @@ const DEFAULT_LAYOUT: MosaicNode<PanelId> = {
   splitPercentage: 20
 };
 
-const DockStrip = ({ position, onClick, label, icon }: { position: 'right' | 'bottom', onClick: () => void, label: string, icon: React.ReactNode }) => {
-  const isRight = position === 'right';
+const DockStrip = ({ position, onClick, label, icon }: { position: 'right' | 'bottom' | 'left', onClick: () => void, label: string, icon: React.ReactNode }) => {
+  const isVertical = position === 'right' || position === 'left';
   return (
     <div
       onClick={onClick}
       title={`Open ${label}`}
+      className="dock-strip"
       style={{
         position: 'absolute',
         [position]: 0,
-        [isRight ? 'top' : 'left']: '50%',
-        transform: isRight ? 'translateY(-50%)' : 'translateX(-50%)',
-        [isRight ? 'width' : 'height']: '24px',
-        backgroundColor: '#111113',
-        border: '1px solid rgba(255,255,255,0.1)',
-        borderRadius: isRight ? '4px 0 0 4px' : '4px 4px 0 0',
+        [isVertical ? 'top' : 'left']: '50%',
+        transform: isVertical ? 'translateY(-50%)' : 'translateX(-50%)',
+        [isVertical ? 'width' : 'height']: '24px',
+        borderRadius: position === 'right' ? '4px 0 0 4px' : position === 'left' ? '0 4px 4px 0' : '4px 4px 0 0',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
         cursor: 'pointer',
         zIndex: 50,
-        transition: 'all 0.1s',
-        padding: isRight ? '12px 0' : '0 12px',
-        boxShadow: '0 2px 10px rgba(0,0,0,0.5)'
-      }}
-      onMouseEnter={(e) => {
-        e.currentTarget.style.backgroundColor = '#1a1a1c';
-        e.currentTarget.style.borderColor = 'rgba(255,255,255,0.2)';
-      }}
-      onMouseLeave={(e) => {
-        e.currentTarget.style.backgroundColor = '#111113';
-        e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)';
+        padding: isVertical ? '12px 0' : '0 12px',
+        boxShadow: 'var(--shadow-md)'
       }}
     >
       <div style={{
-        writingMode: isRight ? 'vertical-rl' : 'horizontal-tb',
-        transform: isRight ? 'rotate(180deg)' : 'none',
-        color: '#a1a1aa', fontSize: '10px', fontWeight: 600, letterSpacing: '0.1em',
+        writingMode: isVertical ? 'vertical-rl' : 'horizontal-tb',
+        transform: position === 'right' ? 'rotate(180deg)' : 'none',
+        fontSize: '10px', fontWeight: 600, letterSpacing: '0.1em',
         display: 'flex', alignItems: 'center', gap: '8px'
       }}>
         {icon}
@@ -126,6 +116,36 @@ const App: React.FC = () => {
   });
   const [inputDims, setInputDims] = useState({ w: 0, h: 0 });
   const { setIsProcessing, setCurrentFrame } = useJobStore();
+
+  // --- Keybinds ---
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Check for Ctrl (or Command on Mac)
+      if (e.ctrlKey || e.metaKey) {
+        switch (e.key) {
+          case '1':
+            e.preventDefault();
+            togglePanel('SETTINGS');
+            break;
+          case '2':
+            e.preventDefault();
+            togglePanel('PREVIEW');
+            break;
+          case '3':
+            e.preventDefault();
+            togglePanel('QUEUE');
+            break;
+          case '4':
+            e.preventDefault();
+            togglePanel('ACTIVITY');
+            break;
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [togglePanel]);
 
   useEffect(() => { checkEngine(); }, []);
   const checkEngine = async () => {
@@ -222,10 +242,12 @@ const App: React.FC = () => {
     });
     setVideoTime(0); setVideoDuration(0); setInputDims({ w: 0, h: 0 });
     setViewMode('edit'); setOutputPath(""); setPreviewFile(null); setActiveJob(null);
+    setRenderedRange(null); // Reset rendered range
   };
 
   const [videoTime, setVideoTime] = useState(0);
   const [videoDuration, setVideoDuration] = useState(0);
+  const [renderedRange, setRenderedRange] = useState<{ start: number; end: number } | null>(null);
 
   const videoState: VideoState = useMemo(() => ({
     src: inputPath, currentTime: videoTime, setCurrentTime: setVideoTime, duration: videoDuration, setDuration: setVideoDuration,
@@ -233,7 +255,8 @@ const App: React.FC = () => {
     trimStart: editState.trimStart, trimEnd: editState.trimEnd, setTrimStart: (t) => setEditState(p => ({ ...p, trimStart: t })), setTrimEnd: (t) => setEditState(p => ({ ...p, trimEnd: t })),
     crop: { x: 0, y: 0, width: 0, height: 0 }, setCrop: () => { }, samplePreview: previewFile,
     renderSample: () => { }, clearPreview: () => setPreviewFile(null),
-  }), [inputPath, videoTime, videoDuration, editState, inputDims, model, previewFile]);
+    renderedRange // Pass to downstream components
+  }), [inputPath, videoTime, videoDuration, editState, inputDims, model, previewFile, renderedRange]);
 
   const addToast = (m: string, t: string) => setToasts(prev => [...prev, { id: Math.random().toString(), message: m, type: t as any }]);
   const pickInput = async () => { const s = await open({ multiple: false }); if (s && typeof s === 'string') handleNewInput(s); };
@@ -310,6 +333,7 @@ const App: React.FC = () => {
       setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'done', progress: 100, outputPath: resultPath } : j));
       setActiveJob(prev => prev?.id === jobId ? { ...prev, status: 'done', outputPath: resultPath, progress: 100 } : prev);
       setPreviewFile(resultPath); addToast("Preview Ready", "success");
+      setRenderedRange({ start, end }); // Set specific sample range
     } catch (e) {
       addToast("Preview Failed: " + e, "error");
       setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'error', errorMessage: String(e) } : j));
@@ -366,6 +390,15 @@ const App: React.FC = () => {
         />
 
         {/* DOCK STRIPS */}
+        {!panels.SETTINGS && (
+          <DockStrip
+            position="left"
+            label="SETTINGS"
+            // Use a settings/sliders icon
+            icon={<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>}
+            onClick={() => openPanel('SETTINGS')}
+          />
+        )}
         {!panels.QUEUE && (
           <DockStrip
             position="right"
@@ -383,7 +416,13 @@ const App: React.FC = () => {
           />
         )}
       </div>
-      <StatusFooter toggleTheme={() => setDarkMode(!darkMode)} darkMode={darkMode} showTechSpecs={showTechSpecs} setShowTechSpecs={setShowTechSpecs} outputPath={outputPath} />
+      <StatusFooter
+        toggleTheme={() => setDarkMode(!darkMode)}
+        darkMode={darkMode}
+        showTechSpecs={showTechSpecs}
+        setShowTechSpecs={setShowTechSpecs}
+        outputPath={outputPath}
+      />
     </div>
   );
 };

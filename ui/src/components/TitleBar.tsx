@@ -64,11 +64,11 @@ export const TitleBar: React.FC = () => {
   return (
     <div style={{
       height: '32px',
-      background: '#09090b',
+      background: 'var(--bg-color)',
       display: 'flex',
       justifyContent: 'space-between',
       alignItems: 'center',
-      borderBottom: '1px solid rgba(255,255,255,0.06)',
+      borderBottom: '1px solid var(--panel-border)',
       fontFamily: 'Inter, sans-serif',
       userSelect: 'none',
       position: 'relative',
@@ -79,8 +79,8 @@ export const TitleBar: React.FC = () => {
       {/* LEFT: Branding & Menu */}
       <div style={{ display: 'flex', alignItems: 'center', height: '100%', paddingLeft: '16px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginRight: '16px' }}>
-          <div style={{ width: '6px', height: '6px', background: '#00ff88', borderRadius: '50%', boxShadow: '0 0 6px rgba(0, 255, 136, 0.4)' }} />
-          <span style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '0.05em', color: '#ededed' }}>
+          <div style={{ width: '6px', height: '6px', background: 'var(--brand-primary)', borderRadius: '50%', boxShadow: '0 0 6px rgba(0, 255, 136, 0.4)' }} />
+          <span style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '0.05em', color: 'var(--text-primary)' }}>
             VIDEOFORGE
           </span>
         </div>
@@ -97,7 +97,7 @@ export const TitleBar: React.FC = () => {
           style={buttonStyle}
           onClick={handleMin}
           title="Minimize"
-          onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.04)'; e.currentTarget.style.color = '#fff'; }}
+          onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.04)'; e.currentTarget.style.color = 'var(--text-primary)'; }}
           onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; e.currentTarget.style.color = '#a1a1aa'; }}
         >
           <IconMinus />
@@ -107,7 +107,7 @@ export const TitleBar: React.FC = () => {
           style={buttonStyle}
           onClick={handleMax}
           title={isMaximized ? "Restore" : "Maximize"}
-          onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.04)'; e.currentTarget.style.color = '#fff'; }}
+          onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.04)'; e.currentTarget.style.color = 'var(--text-primary)'; }}
           onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'transparent'; e.currentTarget.style.color = '#a1a1aa'; }}
         >
           {isMaximized ? <IconRestore /> : <IconSquare />}

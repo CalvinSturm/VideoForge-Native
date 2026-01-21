@@ -7,7 +7,7 @@ const IconSun = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none
 const IconMoon = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /></svg>;
 const IconFolder = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg>;
 // NEW: Info Icon
-const IconInfo = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>;
+const IconInfo = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><line x1="12" y1="16" x2="12" y2="12" /><line x1="12" y1="8" x2="12.01" y2="8" /></svg>;
 
 // --- HELPERS ---
 const fmtMem = (bytes: number) => {
@@ -39,39 +39,41 @@ export const StatusFooter: React.FC<StatusFooterProps> = ({
     padding: '0 8px', borderLeft: '1px solid rgba(255,255,255,0.08)', height: '16px'
   };
 
+  // --- GRID LAYOUT TO PREVENT JITTER ---
   return (
     <footer style={{
-      height: '28px', // Slightly slimmer for sleekness
-      backgroundColor: '#09090b',
-      borderTop: '1px solid rgba(255,255,255,0.06)',
-      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      height: '32px', // Slightly taller for better touch target
+      backgroundColor: 'var(--bg-color)', // Use var
+      borderTop: '1px solid var(--panel-border)', // Use var
+      display: 'grid',
+      gridTemplateColumns: '1fr auto 1fr', // 3 Columns: Left(Expand), Center(Auto), Right(Expand)
+      alignItems: 'center',
       padding: '0 12px',
       fontSize: '10px',
       fontFamily: '"JetBrains Mono", monospace',
-      color: '#71717a',
+      color: 'var(--text-secondary)',
       userSelect: 'none',
       zIndex: 1000
     }}>
 
       {/* LEFT: Toggles (Ghost Buttons) */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+      <div style={{ justifySelf: 'start', display: 'flex', alignItems: 'center', gap: '4px' }}>
         <button
           onClick={() => setShowTechSpecs(!showTechSpecs)}
           title="Toggle Hardware Stats"
           style={{
-            background: showTechSpecs ? 'rgba(255,255,255,0.08)' : 'transparent',
+            background: showTechSpecs ? 'rgba(255,255,255,0.1)' : 'transparent',
             border: 'none',
-            color: showTechSpecs ? '#ededed' : '#71717a',
+            color: showTechSpecs ? 'var(--text-primary)' : 'var(--text-secondary)',
             cursor: 'pointer',
             padding: '4px',
             borderRadius: '4px',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             transition: 'all 0.1s'
           }}
-          onMouseEnter={(e) => !showTechSpecs && (e.currentTarget.style.color = '#ededed')}
-          onMouseLeave={(e) => !showTechSpecs && (e.currentTarget.style.color = '#71717a')}
+          onMouseEnter={(e) => !showTechSpecs && (e.currentTarget.style.color = 'var(--text-primary)')}
+          onMouseLeave={(e) => !showTechSpecs && (e.currentTarget.style.color = 'var(--text-secondary)')}
         >
-          {/* UPDATED ICON */}
           <IconInfo />
         </button>
 
@@ -81,20 +83,20 @@ export const StatusFooter: React.FC<StatusFooterProps> = ({
           style={{
             background: 'transparent',
             border: 'none',
-            color: '#71717a',
+            color: 'var(--text-secondary)',
             cursor: 'pointer',
             padding: '4px',
             borderRadius: '4px',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             transition: 'color 0.1s'
           }}
-          onMouseEnter={(e) => (e.currentTarget.style.color = '#ededed')}
-          onMouseLeave={(e) => (e.currentTarget.style.color = '#71717a')}
+          onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--text-primary)')}
+          onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-secondary)')}
         >
           {darkMode ? <IconMoon /> : <IconSun />}
         </button>
 
-        <div style={{ width: 1, height: 12, background: 'rgba(255,255,255,0.1)', margin: '0 6px' }} />
+        <div style={{ width: 1, height: 12, background: 'var(--panel-border)', margin: '0 6px' }} />
 
         <button
           onClick={handleOpenFolder}
@@ -103,69 +105,72 @@ export const StatusFooter: React.FC<StatusFooterProps> = ({
           style={{
             background: 'transparent',
             border: 'none',
-            color: outputPath ? '#71717a' : '#333',
+            color: outputPath ? 'var(--text-secondary)' : 'var(--text-muted)',
             cursor: outputPath ? 'pointer' : 'default',
             padding: '4px',
             borderRadius: '4px',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             transition: 'color 0.1s'
           }}
-          onMouseEnter={(e) => outputPath && (e.currentTarget.style.color = '#ededed')}
-          onMouseLeave={(e) => outputPath && (e.currentTarget.style.color = '#71717a')}
+          onMouseEnter={(e) => outputPath && (e.currentTarget.style.color = 'var(--text-primary)')}
+          onMouseLeave={(e) => outputPath && (e.currentTarget.style.color = 'var(--text-secondary)')}
         >
           <IconFolder />
         </button>
       </div>
 
-      {/* CENTER: Frame Progress */}
-      <div style={{ flex: 1, display: 'flex', justifyContent: 'center' }}>
+      {/* CENTER: Frame Progress (ABSOLUTE CENTERED) */}
+      <div style={{ justifySelf: 'center', display: 'flex', justifyContent: 'center' }}>
         {isProcessing ? (
-           <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-             <span style={{ color: '#00ff88', fontWeight: 'bold' }}>
-               PROCESSING
-             </span>
-             <div style={{ width: '150px', height: '3px', background: '#27272a', borderRadius: '2px', overflow: 'hidden' }}>
-                <div style={{
-                   width: `${progressPercent}%`,
-                   height: '100%', background: '#00ff88',
-                   transition: 'width 0.2s linear'
-                }} />
-             </div>
-             <span style={{ color: '#ededed' }}>
-                {totalFrames > 0
-                  ? `${framesProcessed} / ${totalFrames}`
-                  : `${Math.round(progressPercent)}%`
-                }
-             </span>
-           </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <span style={{ color: 'var(--brand-primary)', fontWeight: 'bold' }}>
+              PROCESSING
+            </span>
+            <div style={{ width: '150px', height: '4px', background: 'var(--button-bg)', borderRadius: '2px', overflow: 'hidden' }}>
+              <div style={{
+                width: `${progressPercent}%`,
+                height: '100%', background: 'var(--brand-primary)',
+                transition: 'width 0.2s linear'
+              }} />
+            </div>
+            <span style={{ color: 'var(--text-primary)' }}>
+              {totalFrames > 0
+                ? `${framesProcessed} / ${totalFrames}`
+                : `${Math.round(progressPercent)}%`
+              }
+            </span>
+          </div>
         ) : (
-           <span style={{ color: '#3f3f46', cursor: 'default' }}>
-             {outputPath ? "READY" : "IDLE"}
-           </span>
+          <span style={{ color: 'var(--text-muted)', cursor: 'default' }}>
+            {outputPath ? "READY" : "IDLE"}
+          </span>
         )}
       </div>
 
-      {/* RIGHT: Stats (Only visible if active) */}
-      {showTechSpecs ? (
-        <div style={{ display: 'flex', alignItems: 'center' }}>
-          <div style={statItemStyle}>
-             <span style={{ opacity: 0.5 }}>CPU</span>
-             <span>{Math.round(stats.cpu)}%</span>
-          </div>
-          <div style={statItemStyle}>
-             <span style={{ opacity: 0.5 }}>RAM</span>
-             <span style={{ color: stats.ramUsed > stats.ramTotal * 0.9 ? '#ef4444' : 'inherit' }}>
+      {/* RIGHT: Stats (Fixed Width Container) */}
+      <div style={{ justifySelf: 'end' }}>
+        {showTechSpecs ? (
+          <div style={{ display: 'flex', alignItems: 'center' }}>
+            <div style={statItemStyle}>
+              <span style={{ opacity: 0.5 }}>CPU</span>
+              <span>{Math.round(stats.cpu)}%</span>
+            </div>
+            <div style={statItemStyle}>
+              <span style={{ opacity: 0.5 }}>RAM</span>
+              <span style={{ color: stats.ramUsed > stats.ramTotal * 0.9 ? '#ef4444' : 'inherit' }}>
                 {fmtMem(stats.ramUsed)}
-             </span>
+              </span>
+            </div>
+            <div style={{ ...statItemStyle, borderRight: 'none', borderLeft: '1px solid var(--panel-border)' }}>
+              <span style={{ color: 'var(--brand-primary)', marginRight: '4px' }}>GPU</span>
+              <span style={{ opacity: 0.7 }}>ACTIVE</span>
+            </div>
           </div>
-          <div style={{ ...statItemStyle, borderRight: 'none', borderLeft: '1px solid rgba(255,255,255,0.08)' }}>
-             <span style={{ color: '#00ff88', marginRight: '4px' }}>GPU</span>
-             <span style={{ opacity: 0.7 }}>ACTIVE</span>
-          </div>
-        </div>
-      ) : (
-        <div style={{ width: '100px' }} />
-      )}
+        ) : (
+          /* Placeholder to balance layout if needed, but Grid handles it */
+          <div />
+        )}
+      </div>
 
     </footer>
   );
