@@ -1,0 +1,6 @@
+    Updating crates.io index
+error: no matching package found
+searched package name: `tracing_subscriber`
+perhaps you meant:      tracing-subscriber
+location searched: crates.io index
+required by package `visual_enhancement_engine v0.1.0 (C:\Users\Calvin\VideoForge\rust_video_upscaler)`
