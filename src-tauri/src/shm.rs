@@ -1,9 +1,15 @@
 use anyhow::{anyhow, Result};
 use memmap2::MmapMut;
 use std::fs::OpenOptions;
-
+use thiserror::Error;
 
 pub const RING_SIZE: usize = 3;
+
+#[derive(Error, Debug)]
+pub enum ShmError {
+    #[error("SHM slot index {index} out of bounds (max {max})")]
+    IndexOutOfBounds { index: usize, max: usize },
+}
 
 pub struct VideoShm {
     // We hold the MmapMut which keeps the mapping alive
@@ -64,21 +70,27 @@ impl VideoShm {
         })
     }
 
-    pub fn input_slot_mut(&mut self, index: usize) -> &mut [u8] {
+    pub fn input_slot_mut(&mut self, index: usize) -> Result<&mut [u8], ShmError> {
         if index >= RING_SIZE {
-            panic!("SHM Index out of bounds");
+            return Err(ShmError::IndexOutOfBounds {
+                index,
+                max: RING_SIZE - 1,
+            });
         }
         let offset = index * self.slot_total_size;
         let end = offset + self.slot_input_size;
-        &mut self.mmap[offset..end]
+        Ok(&mut self.mmap[offset..end])
     }
 
-    pub fn output_slot(&self, index: usize) -> &[u8] {
+    pub fn output_slot(&self, index: usize) -> Result<&[u8], ShmError> {
         if index >= RING_SIZE {
-            panic!("SHM Index out of bounds");
+            return Err(ShmError::IndexOutOfBounds {
+                index,
+                max: RING_SIZE - 1,
+            });
         }
         let offset = (index * self.slot_total_size) + self.slot_input_size;
         let end = offset + self.slot_output_size;
-        &self.mmap[offset..end]
+        Ok(&self.mmap[offset..end])
     }
 }

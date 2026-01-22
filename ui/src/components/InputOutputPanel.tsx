@@ -5,6 +5,10 @@ import { SignalSummary } from "./SignalSummary";
 // --- ICONS ---
 // (Icons are unchanged, keeping them brief for this output)
 const IconCamera = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" /><circle cx="12" cy="13" r="4" /></svg>;
+const IconRotateCW = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" /></svg>;
+const IconRotateCCW = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 1 0 2.12-9.36L1 10" /></svg>;
+const IconFlipH = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v18" /><path d="M16 7l4 5-4 5" /><path d="M8 7l-4 5 4 5" /></svg>;
+const IconFlipV = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12h18" /><path d="M7 8L12 4l5 4" /><path d="M7 16l5 4 5-4" /></svg>;
 const IconAnimation = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" /></svg>;
 const IconImport = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>;
 const IconSave = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" /></svg>;
@@ -467,6 +471,102 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
               </div>
             </>
           )}
+        </Section>
+
+        <Section title="Transform"
+          extra={
+            (editState.rotation !== 0 || editState.flipH || editState.flipV) && (
+              <button onClick={(e) => {
+                e.stopPropagation();
+                setEditState({ ...editState, rotation: 0, flipH: false, flipV: false });
+              }}
+                style={{
+                  height: '22px', fontSize: '9px', padding: '0 10px', borderRadius: '4px',
+                  border: '1px solid var(--panel-border)', background: 'transparent',
+                  color: 'var(--text-muted)', cursor: 'pointer'
+                }}>RESET</button>
+            )
+          }
+        >
+          <div>
+            <label style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.05em', marginBottom: '6px', display: 'block' }}>ROTATION</label>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <button onClick={() => {
+                const rotations: (0 | 90 | 180 | 270)[] = [0, 90, 180, 270];
+                const idx = rotations.indexOf(editState.rotation);
+                const newRotation = rotations[(idx + 3) % 4] as 0 | 90 | 180 | 270;
+                setEditState({ ...editState, rotation: newRotation });
+              }}
+                style={{
+                  fontSize: '9px', height: '32px', width: '40px', borderRadius: '4px',
+                  background: "var(--input-bg)", border: "1px solid var(--input-border)", color: "var(--text-muted)",
+                  boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
+                  display: 'flex', alignItems: 'center', justifyContent: 'center'
+                }}
+                title="Rotate Counter-Clockwise"
+              >
+                <IconRotateCCW />
+              </button>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '4px', flex: 1 }}>
+                {([0, 90, 180, 270] as const).map(deg => (
+                  <button key={deg} onClick={() => setEditState({ ...editState, rotation: deg })}
+                    className={editState.rotation === deg ? "toggle-active" : ""}
+                    style={{
+                      fontSize: '9px', height: '32px', borderRadius: '4px',
+                      background: "var(--input-bg)", border: "1px solid var(--input-border)", color: "var(--text-muted)",
+                      boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px'
+                    }}
+                  >
+                    {deg === 0 ? '0°' : deg === 90 ? '90°' : deg === 180 ? '180°' : '270°'}
+                  </button>
+                ))}
+              </div>
+              <button onClick={() => {
+                const rotations: (0 | 90 | 180 | 270)[] = [0, 90, 180, 270];
+                const idx = rotations.indexOf(editState.rotation);
+                const newRotation = rotations[(idx + 1) % 4] as 0 | 90 | 180 | 270;
+                setEditState({ ...editState, rotation: newRotation });
+              }}
+                style={{
+                  fontSize: '9px', height: '32px', width: '40px', borderRadius: '4px',
+                  background: "var(--input-bg)", border: "1px solid var(--input-border)", color: "var(--text-muted)",
+                  boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
+                  display: 'flex', alignItems: 'center', justifyContent: 'center'
+                }}
+                title="Rotate Clockwise"
+              >
+                <IconRotateCW />
+              </button>
+            </div>
+          </div>
+          <div>
+            <label style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.05em', marginBottom: '6px', display: 'block' }}>FLIP / MIRROR</label>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '4px' }}>
+              <button onClick={() => setEditState({ ...editState, flipH: !editState.flipH })}
+                className={editState.flipH ? "toggle-active" : ""}
+                style={{
+                  fontSize: '9px', height: '32px', borderRadius: '4px',
+                  background: "var(--input-bg)", border: "1px solid var(--input-border)", color: "var(--text-muted)",
+                  boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px'
+                }}
+              >
+                <IconFlipH /> HORIZONTAL
+              </button>
+              <button onClick={() => setEditState({ ...editState, flipV: !editState.flipV })}
+                className={editState.flipV ? "toggle-active" : ""}
+                style={{
+                  fontSize: '9px', height: '32px', borderRadius: '4px',
+                  background: "var(--input-bg)", border: "1px solid var(--input-border)", color: "var(--text-muted)",
+                  boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px'
+                }}
+              >
+                <IconFlipV /> VERTICAL
+              </button>
+            </div>
+          </div>
         </Section>
 
         <Section title="Color Grading"

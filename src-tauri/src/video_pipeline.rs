@@ -98,64 +98,55 @@ impl VideoDecoder {
 // -----------------------------------------------------------------------------
 
 /// Returns (Width, Height, Duration, FPS, TotalFrames)
+/// Uses a single ffprobe call with JSON output for efficiency.
 pub fn probe_video(path: &str) -> Result<(usize, usize, f64, f64, u64)> {
-    // 1. Probe Resolution
-    let output_res = std::process::Command::new("ffprobe")
+    let output = std::process::Command::new("ffprobe")
         .args(&[
             "-v",
             "error",
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height",
-            "-of",
-            "csv=s=x:p=0",
-            path,
-        ])
-        .output()?;
-
-    if !output_res.status.success() {
-        return Err(anyhow::anyhow!("ffprobe failed"));
-    }
-
-    let res_str = String::from_utf8(output_res.stdout)?;
-    let parts: Vec<&str> = res_str.trim().split('x').collect();
-    let w: usize = parts[0].parse().unwrap_or(0);
-    let h: usize = parts[1].parse().unwrap_or(0);
-
-    // 2. Probe Duration
-    let output_dur = std::process::Command::new("ffprobe")
-        .args(&[
-            "-v",
-            "error",
+            "stream=width,height,r_frame_rate",
             "-show_entries",
             "format=duration",
             "-of",
-            "default=noprint_wrappers=1:nokey=1",
+            "json",
             path,
         ])
         .output()?;
-    let duration: f64 = String::from_utf8(output_dur.stdout)?
-        .trim()
-        .parse()
-        .unwrap_or(0.0);
 
-    // 3. Probe FPS
-    let output_fps = std::process::Command::new("ffprobe")
-        .args(&[
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=r_frame_rate",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            path,
-        ])
-        .output()?;
-    let fps_str = String::from_utf8(output_fps.stdout)?;
-    let fps_parts: Vec<&str> = fps_str.trim().split('/').collect();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("ffprobe failed: {}", stderr));
+    }
+
+    let json_str = String::from_utf8(output.stdout)
+        .context("Invalid UTF-8 in ffprobe output")?;
+    let json: serde_json::Value = serde_json::from_str(&json_str)
+        .context("Failed to parse ffprobe JSON output")?;
+
+    // Extract stream info
+    let stream = json
+        .get("streams")
+        .and_then(|s| s.get(0))
+        .ok_or_else(|| anyhow::anyhow!("No video stream found"))?;
+
+    let w = stream
+        .get("width")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let h = stream
+        .get("height")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    // Parse frame rate (format: "30/1" or "30000/1001")
+    let fps_str = stream
+        .get("r_frame_rate")
+        .and_then(|v| v.as_str())
+        .unwrap_or("30/1");
+    let fps_parts: Vec<&str> = fps_str.split('/').collect();
     let fps: f64 = if fps_parts.len() == 2 {
         let num: f64 = fps_parts[0].parse().unwrap_or(30.0);
         let den: f64 = fps_parts[1].parse().unwrap_or(1.0);
@@ -165,8 +156,16 @@ pub fn probe_video(path: &str) -> Result<(usize, usize, f64, f64, u64)> {
             num / den
         }
     } else {
-        fps_str.trim().parse().unwrap_or(30.0)
+        fps_str.parse().unwrap_or(30.0)
     };
+
+    // Extract format info (duration)
+    let duration = json
+        .get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(|d| d.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
 
     let total_frames = (duration * fps).round() as u64;
 

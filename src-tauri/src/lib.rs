@@ -1,12 +1,14 @@
 use anyhow::{anyhow, Context, Result};
 use dirs::data_local_dir;
 use futures_util::StreamExt;
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
 use std::io::{Cursor, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::Arc;
 use sysinfo::System;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -15,6 +17,11 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration, Instant};
 use zenoh::Config;
+
+// Global tracker for spawned Python PIDs (for targeted cleanup)
+lazy_static::lazy_static! {
+    static ref PYTHON_PIDS: Arc<std::sync::Mutex<HashSet<u32>>> = Arc::new(std::sync::Mutex::new(HashSet::new()));
+}
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -73,32 +80,44 @@ fn resolve_python_environment() -> Result<(String, String)> {
         ));
     }
 
-    // Dev Fallback
-    let local_venv = Path::new(r"C:\Users\Calvin\VideoForge\venv310\Scripts\python.exe");
-    if local_venv.exists() {
-        if let Ok(cwd) = env::current_dir() {
-            let script_local = cwd.join("python").join("shm_worker.py");
-            if script_local.exists() {
-                return Ok((
-                    local_venv.to_string_lossy().to_string(),
-                    script_local.to_string_lossy().to_string(),
-                ));
-            }
-            let script_up = cwd
-                .parent()
-                .unwrap_or(Path::new(".."))
-                .join("python")
-                .join("shm_worker.py");
-            if script_up.exists() {
-                return Ok((
-                    local_venv.to_string_lossy().to_string(),
-                    script_up.to_string_lossy().to_string(),
-                ));
+    // Dev Fallback: Check VIDEOFORGE_DEV_PYTHON environment variable first
+    let dev_python_paths: Vec<PathBuf> = if let Ok(dev_python) = env::var("VIDEOFORGE_DEV_PYTHON") {
+        vec![PathBuf::from(dev_python)]
+    } else {
+        // Common dev venv locations to check
+        vec![
+            PathBuf::from(r"C:\Users\Calvin\VideoForge\venv310\Scripts\python.exe"),
+            PathBuf::from(r".\venv\Scripts\python.exe"),
+            PathBuf::from(r"..\venv\Scripts\python.exe"),
+        ]
+    };
+
+    for local_venv in dev_python_paths {
+        if local_venv.exists() {
+            if let Ok(cwd) = env::current_dir() {
+                let script_local = cwd.join("python").join("shm_worker.py");
+                if script_local.exists() {
+                    return Ok((
+                        local_venv.to_string_lossy().to_string(),
+                        script_local.to_string_lossy().to_string(),
+                    ));
+                }
+                let script_up = cwd
+                    .parent()
+                    .unwrap_or(Path::new(".."))
+                    .join("python")
+                    .join("shm_worker.py");
+                if script_up.exists() {
+                    return Ok((
+                        local_venv.to_string_lossy().to_string(),
+                        script_up.to_string_lossy().to_string(),
+                    ));
+                }
             }
         }
     }
 
-    Err(anyhow!("AI Engine not found. Please run the installer."))
+    Err(anyhow!("AI Engine not found. Please run the installer or set VIDEOFORGE_DEV_PYTHON environment variable."))
 }
 
 fn get_smart_output_path(input: &str, is_video: bool) -> String {
@@ -248,36 +267,63 @@ async fn reset_engine() -> Result<(), String> {
     println!("Panic Button: Forcing Engine Shutdown...");
     #[cfg(target_os = "windows")]
     {
-        let _ = StdCommand::new("taskkill")
-            .args(["/F", "/IM", "python.exe"])
-            .creation_flags(0x08000000)
-            .output();
+        // Kill only our tracked Python processes by PID
+        let pids: Vec<u32> = {
+            let guard = PYTHON_PIDS.lock().unwrap();
+            guard.iter().copied().collect()
+        };
+
+        for pid in pids {
+            println!("Killing Python PID: {}", pid);
+            let _ = StdCommand::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .creation_flags(0x08000000)
+                .output();
+        }
+
+        // Clear the tracked PIDs
+        PYTHON_PIDS.lock().unwrap().clear();
     }
     Ok(())
 }
 
 #[tauri::command]
 async fn show_in_folder(path: String) -> Result<(), String> {
+    // Validate the path exists before trying to reveal it
+    let file_path = Path::new(&path);
+    if !file_path.exists() {
+        return Err(format!("Path does not exist: {}", path));
+    }
+
     #[cfg(target_os = "windows")]
     {
+        // Use explorer with /select, - the comma must be adjacent to /select
+        // and the path is passed as part of the same argument
         StdCommand::new("explorer")
-            .args(["/select,", &path])
+            .arg(format!("/select,{}", path))
             .spawn()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Failed to open explorer: {}", e))?;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On other platforms, reveal the parent directory
+        if let Some(parent) = file_path.parent() {
+            opener::open(parent).map_err(|e| format!("Failed to open folder: {}", e))?;
+        }
     }
     Ok(())
 }
 
 #[tauri::command]
 async fn open_media(path: String) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        StdCommand::new("cmd")
-            .args(["/C", "start", "", &path])
-            .spawn()
-            .map_err(|e| e.to_string())?;
+    // Validate the path exists before trying to open it
+    if !Path::new(&path).exists() {
+        return Err(format!("File does not exist: {}", path));
     }
-    Ok(())
+
+    // Use the opener crate for safe, cross-platform file opening
+    opener::open(&path).map_err(|e| format!("Failed to open file: {}", e))
 }
 
 // -----------------------------------------------------------------------------
@@ -555,6 +601,12 @@ async fn upscale_request(
     let python_child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn python: {}", e))?;
+
+    // Register the PID for targeted cleanup
+    if let Some(pid) = python_child.id() {
+        PYTHON_PIDS.lock().unwrap().insert(pid);
+    }
+
     let mut python_guard = ProcessGuard::new(python_child);
 
     if timeout(Duration::from_secs(60), subscriber.recv_async())
@@ -634,7 +686,15 @@ async fn upscale_request(
             .put(serde_json::json!({ "command": "shutdown" }).to_string())
             .await;
         if let Some(mut child) = python_guard.disarm() {
-            let _ = child.wait().await;
+            // Remove PID from tracking before cleanup
+            if let Some(pid) = child.id() {
+                PYTHON_PIDS.lock().unwrap().remove(&pid);
+            }
+            // Wait with timeout
+            if timeout(Duration::from_secs(10), child.wait()).await.is_err() {
+                println!("Image engine did not exit in time. Forcing kill...");
+                let _ = child.start_kill();
+            }
         }
 
         return Ok(output_path);
@@ -702,8 +762,15 @@ async fn upscale_request(
                 .map_err(|e| e.to_string())?;
         while let Some(slot_idx) = free_rx.recv().await {
             let mut shm_guard = shared_shm.lock().await;
+            let input_slot = match shm_guard.input_slot_mut(slot_idx) {
+                Ok(slot) => slot,
+                Err(e) => {
+                    eprintln!("SHM Error: {}", e);
+                    break;
+                }
+            };
             if decoder
-                .read_raw_frame_into(shm_guard.input_slot_mut(slot_idx))
+                .read_raw_frame_into(input_slot)
                 .await
                 .unwrap_or(false)
             {
@@ -755,11 +822,19 @@ async fn upscale_request(
         .map_err(|e| e.to_string())?;
         let mut processed_count = 0u64;
         let eta_start = Instant::now();
+        let mut last_emit = Instant::now();
 
         while let Some(slot_idx) = enc_rx.recv().await {
             let shm_guard = shared_shm.lock().await;
+            let output_slot = match shm_guard.output_slot(slot_idx) {
+                Ok(slot) => slot,
+                Err(e) => {
+                    eprintln!("SHM Error: {}", e);
+                    break;
+                }
+            };
             if let Err(e) = encoder
-                .write_raw_frame(shm_guard.output_slot(slot_idx))
+                .write_raw_frame(output_slot)
                 .await
             {
                 eprintln!("Encoder Write Error: {}", e);
@@ -769,8 +844,10 @@ async fn upscale_request(
             let _ = free_tx.send(slot_idx).await;
 
             processed_count += 1;
+            let is_last_frame = processed_count >= process_frames;
 
-            if processed_count % 5 == 0 || processed_count == process_frames {
+            // Time-based throttling: emit progress at most every 100ms or on last frame
+            if last_emit.elapsed() > Duration::from_millis(100) || is_last_frame {
                 let pct =
                     ((processed_count as f64 / process_frames as f64) * 100.0).min(100.0) as u32;
 
@@ -787,8 +864,9 @@ async fn upscale_request(
                     "message": format!("Processing Frame {}/{}", processed_count, process_frames),
                     "eta": eta
                 }));
+                last_emit = Instant::now();
             }
-            if processed_count >= process_frames {
+            if is_last_frame {
                 break;
             }
         }
@@ -808,11 +886,15 @@ async fn upscale_request(
         .await;
     // Targeted Cleanup
     if let Some(mut child) = python_guard.disarm() {
+        // Remove PID from tracking before cleanup
+        if let Some(pid) = child.id() {
+            PYTHON_PIDS.lock().unwrap().remove(&pid);
+        }
         // Try graceful shutdown first
         if timeout(Duration::from_secs(3), child.wait()).await.is_err() {
             println!("Engine did not exit in time. Forcing kill...");
             let _ = child.start_kill(); // Tokio's kill
-            
+
             // Double-tap with Windows taskkill by PID to be sure
             #[cfg(target_os = "windows")]
             if let Some(pid) = child.id() {

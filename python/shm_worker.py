@@ -20,9 +20,20 @@ except ImportError as e:
     print(f"[Python Critical] Missing Dependency: {e}", flush=True)
 
 # -----------------------------------------------------------------------------
+# CONFIGURATION (Extracted Magic Numbers)
+# -----------------------------------------------------------------------------
+class Config:
+    TILE_SIZE = 512
+    TILE_PAD = 32
+    RING_SIZE = 3
+    PARENT_CHECK_INTERVAL = 2  # seconds
+    ZENOH_PREFIX = "videoforge/ipc"
+
+
+# -----------------------------------------------------------------------------
 # CONSTANTS & PATHS
 # -----------------------------------------------------------------------------
-ZENOH_PREFIX = "videoforge/ipc"
+ZENOH_PREFIX = Config.ZENOH_PREFIX
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
@@ -133,16 +144,17 @@ def is_pid_alive(pid):
         handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             return False
-            
+
         exit_code = ctypes.c_ulong()
         if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
             ctypes.windll.kernel32.CloseHandle(handle)
             # STAY_ALIVE (259) means still running
             return exit_code.value == 259
-            
+
         ctypes.windll.kernel32.CloseHandle(handle)
         return False
-    except:
+    except Exception as e:
+        print(f"[Python Warning] PID check failed: {e}", flush=True)
         return False
 
 def watchdog_loop(parent_pid):
@@ -153,7 +165,7 @@ def watchdog_loop(parent_pid):
             print(f"[Python] Parent {parent_pid} died. Committing seppuku...", flush=True)
             # Hard exit, no cleanup needed (OS handles it)
             os._exit(0)
-        time.sleep(2)
+        time.sleep(Config.PARENT_CHECK_INTERVAL)
 
 def start_watchdog(parent_pid):
     if parent_pid <= 0: return
@@ -170,15 +182,26 @@ class AIWorker:
         print(f"[Python] Initializing Zenoh on Port {port}...", flush=True)
         conf = zenoh.Config()
         conf.insert_json5("connect/endpoints", json.dumps([f"tcp/127.0.0.1:{port}"]))
-        self.session = zenoh.open(conf)
+
+        # Zenoh connection with validation
+        try:
+            self.session = zenoh.open(conf)
+            print("[Python] Zenoh connected successfully", flush=True)
+        except Exception as e:
+            print(f"[Python CRITICAL] Zenoh connection failed: {e}", flush=True)
+            sys.exit(1)
 
         # FIX: Match the unique key prefix from Rust
         unique_prefix = f"{ZENOH_PREFIX}/{port}"
 
-        self.pub = self.session.declare_publisher(f"{unique_prefix}/res")
-        self.sub = self.session.declare_subscriber(
-            f"{unique_prefix}/req", self.on_request
-        )
+        try:
+            self.pub = self.session.declare_publisher(f"{unique_prefix}/res")
+            self.sub = self.session.declare_subscriber(
+                f"{unique_prefix}/req", self.on_request
+            )
+        except Exception as e:
+            print(f"[Python CRITICAL] Zenoh pub/sub setup failed: {e}", flush=True)
+            sys.exit(1)
 
         self.shm_file = None
         self.mmap = None
@@ -209,20 +232,23 @@ class AIWorker:
         if self.mmap:
             try:
                 self.mmap.close()
-            except:
-                pass
+            except Exception as e:
+                print(f"[Python Warning] mmap close failed: {e}", flush=True)
         if self.shm_file:
             try:
                 self.shm_file.close()
                 if self.shm_path and os.path.exists(self.shm_path):
                     os.unlink(self.shm_path)
-            except:
-                pass
+            except Exception as e:
+                print(f"[Python Warning] SHM file cleanup failed: {e}", flush=True)
         if self.session:
             try:
                 self.session.close()
-            except:
-                pass
+            except Exception as e:
+                print(f"[Python Warning] Zenoh session close failed: {e}", flush=True)
+        # Free GPU memory on cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def load_model(self, model_filename):
         weight_path = find_weight_file(model_filename)
@@ -375,8 +401,8 @@ class AIWorker:
             payload.update(extra)
         try:
             self.pub.put(json.dumps(payload).encode("utf-8"))
-        except:
-            pass
+        except Exception as e:
+            print(f"[Python Warning] Failed to send status: {e}", flush=True)
 
     def on_request(self, sample):
         try:
@@ -402,8 +428,8 @@ class AIWorker:
     # TILING LOGIC (Progress-Aware)
     # -------------------------------------------------------------------------
     def process_image_tile(self, img, job_id):
-        tile_size = 512
-        tile_pad = 32
+        tile_size = Config.TILE_SIZE
+        tile_pad = Config.TILE_PAD
         scale = self.model_scale
 
         h, w, c = img.shape
@@ -420,6 +446,9 @@ class AIWorker:
         img_padded = np.pad(
             img, ((tile_pad, tile_pad), (tile_pad, tile_pad), (0, 0)), mode="reflect"
         )
+
+        # Determine dtype for tensor transfers (optimized)
+        target_dtype = torch.float16 if self.upsampler.half else torch.float32
 
         for y in y_steps:
             for x in x_steps:
@@ -455,11 +484,10 @@ class AIWorker:
                 if pad_h or pad_w:
                     tile_in = np.pad(tile_in, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
 
-                # Tensor
-                tile_tensor = torch.from_numpy(tile_in.transpose(2, 0, 1)).float()
-                tile_tensor = tile_tensor.unsqueeze(0).to(self.upsampler.device)
-                if self.upsampler.half:
-                    tile_tensor = tile_tensor.half()
+                # Optimized Tensor Transfer: directly convert to target dtype on GPU
+                tile_tensor = torch.from_numpy(tile_in.transpose(2, 0, 1)).to(
+                    device=self.upsampler.device, dtype=target_dtype, non_blocking=True
+                ).unsqueeze(0)
 
                 # Inference
                 with torch.no_grad():
@@ -501,6 +529,10 @@ class AIWorker:
                 self.send_status(
                     "progress", {"current": count, "total": total_tiles, "id": job_id}
                 )
+
+        # Free GPU memory after processing
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return output_img
 
@@ -667,6 +699,10 @@ class AIWorker:
         except Exception as e:
             traceback.print_exc()
             self.send_status("error", {"message": str(e)})
+        finally:
+            # Free GPU memory after each frame to prevent memory buildup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
