@@ -37,3 +37,10 @@ Thumbs.db
 
 # Python runtime embedded folder (optional if you want to exclude runtime binaries)
 /python-runtime/
+
+# Agent Dev
+.agents/
+.agent/
+.cursor/
+.gemini/
+.opencode/
