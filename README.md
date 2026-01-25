@@ -1,319 +1,114 @@
-# Visual Enhancement Engine
+# Deterministic AI Upscaling – VideoForge v1.0
 
-**A deterministic, local-first engine for professional image and video enhancement.**
+**Editor-grade image and video enhancement with user-controlled model options.**
 
----
-
-## Overview
-
-This project is a **local-first visual enhancement engine** for images and video.
-
-It is designed for creators, editors, and developers who require **predictable, controllable improvements** to visual media. The system prioritizes reproducibility, transparency, and user control over novelty or automation.
-
-Machine learning models are used as **implementation tools**, not decision-makers.
+This project provides a high-performance, local AI upscaling worker for professional pipelines, emphasizing reproducibility, efficiency, and flexibility.
 
 ---
 
-## Purpose
+## Core Philosophy
 
-The goal of this project is to make visual enhancement **reliable and understandable**, rather than opaque or speculative.
-
-Users interact with the system through clear intent and measurable constraints, not prompts or probabilistic guesswork.
-
----
-
-## What This Project Is
-
-* A deterministic enhancement engine for images and video
-* An intent-driven system for tasks such as:
-
-  * Blur repair
-  * Upscaling
-  * Motion smoothing
-  * Compression artifact repair
-  * Region-specific editing
-* A curated alternative to freeform node-based workflows
-* A professional tool focused on preview, validation, and user authority
+- **Privacy First:** All processing happens locally on the user’s GPU.
+- **Zero-Copy Pipeline:** Video frames move between decoder, AI engine, and encoder via **Shared Memory (SHM)** to avoid unnecessary serialization.
+- **User Authority:** Users can control all pipeline steps, including trimming, cropping, resizing, pausing, resuming, and stopping processes.
+- **Flexible Model Selection:** Users choose which AI model to run based on workflow needs.
 
 ---
 
-## What This Project Is Not
+## Available Models
 
-This project does **not** aim to be:
+VideoForge supports multiple upscaling models. Each model runs locally and can be selected per job:
 
-* A prompt-driven generation system
-* A text-to-video or text-to-image product
-* A cloud-dependent service
-* A one-click, fully automated enhancement tool
-* A freeform experimental sandbox
+- **RCAN / EDSR** – Deterministic models focused on structural fidelity and reproducibility.
+- **RealESRGAN** – GAN-based model designed for high-quality perceptual upscaling. Slight visual variation may occur.
 
-If the goal is generative content, speculative reconstruction, or novelty output, this tool is intentionally not designed for that use case.
+Users can switch models at any point in the pipeline.
 
 ---
 
-## Core Principles
+## High-Level Overview
 
-### 1. Determinism
+**VideoForge** is a local-first, high-performance visual enhancement engine for images and videos.
 
-Given the same input, configuration, and model versions, the output must be reproducible.
+### Functional Architecture
 
-* No hidden randomness
-* No silent parameter changes
-* No implicit model switching
+**1. Orchestration (Rust / Tauri)**
+- Manages Python worker lifecycle
+- Allocates the SHM ring buffer
+- Controls FFmpeg decode/encode
+- Computes ETA and emits progress events
 
-Determinism is treated as a system requirement, not an optimization.
+**2. AI Engine (Python / PyTorch)**
+- Runs as a standalone process
+- Loads selected models
+- Reads frames from SHM, performs upscaling, writes results back
+- Communicates via **Zenoh** IPC for low latency
 
----
+**3. UI Layer (React / TypeScript)**
+- Mosaic-style professional layout
+- Job queue for batch processing
+- Interactive preview with cropping and trimming controls
 
-### 2. Intent-Driven Operation
+### Video Data Flow
 
-Users operate in terms of **what they want to achieve**, not which model to run.
-
-Examples of intent:
-
-* Fix blur
-* Improve clarity
-* Smooth motion
-* Repair compression
-* Edit a defined region
-
-Model selection and execution are internal implementation details and are not exposed as primary UX controls.
-
----
-
-### 3. Preview Before Commitment
-
-No operation processes an entire asset blindly.
-
-Every enhancement:
-
-* Can be previewed on a scoped segment
-* Can be limited to specific frames or regions
-* Can be adjusted before final output
-
-This applies equally to images and long-form video.
+1. Rust spawns Python worker and performs a handshake via Zenoh
+2. Rust requests SHM setup from Python worker
+3. Processing loop:
+   - **Decode:** FFmpeg → Rust → SHM input slot
+   - **Inference:** Python reads SHM → selected model → writes SHM output slot
+   - **Encode:** Rust reads SHM → FFmpeg encoder
+4. Cleanup: SHM files removed, worker terminated
 
 ---
 
-### 4. Explicit Reconstruction
+## UI / UX Design
 
-Any operation that reconstructs, infers, or generates visual content:
+- **Left Panel:** Inputs, outputs, model selection, resolution/FPS toggle
+- **Center Panel:** Video viewport with crop overlay and timeline trimming
+- **Right Panel:** Job queue with ETA and progress bars
+- **Footer:** GPU status, technical details, panic kill switch
 
-* Is explicitly declared
-* Is limited in scope
-* Can be reviewed and reversed
-
-The system does not silently invent visual detail.
-
----
-
-### 5. Temporal and Spatial Integrity
-
-The engine treats pixels, frames, and temporal continuity as first-class constraints.
-
-Artifacts such as:
-
-* Flicker
-* Temporal drift
-* Instability
-* Frame corruption
-
-are considered failures and are surfaced to the user through validation and diagnostics.
+**Notable Features**
+- Real-time ETA estimation
+- Crash recovery via watchdog and kill switch
+- Visual progress feedback and error notifications
 
 ---
 
-### 6. Local Execution and User-Owned Compute
+## Technical Details
 
-* All processing runs locally
-* GPU usage is owned and controlled by the user
-* No forced uploads
-* No hidden cloud execution
-* No usage-based compute pricing
+**Python Runtime Resolution**
+- Bundled runtime for distribution builds
+- Local virtual environment for development
+- User-installable runtime under `%APPDATA%/VideoForge/python`
 
-The user retains full control over their data and hardware.
+**Safe Upscaler Wrapper**
+- Explicit model weight loading, handles nested dictionaries
+- Enforces correct color space (BGR) for OpenCV compatibility
+- Supports tile-based processing with mirror padding for consistency
 
----
-
-### 7. User Authority
-
-The engine may warn, guide, and recommend corrective actions, but the user always retains final control over what is processed and exported.
-
-No valid output is blocked for aesthetic or subjective reasons.
-
----
-
-## Architecture Overview
-
-The system is **pipeline-centric**, not model-centric.
-
-```
-Decode → Analyze → Enhance → Validate → Encode
-```
-
-Each stage is:
-
-* Explicit
-* Ordered
-* Auditable
-* Deterministic
+**Shared Memory (SHM)**
+- Ring buffer with multiple slots
+- Rust `mpsc` channels enforce producer/consumer safety
+- Efficient zero-copy data transfer to minimize overhead
 
 ---
 
-## Core Engine Abstractions
+## Determinism and Model Notes
 
-### Asset
-
-An immutable source image or video.
-
-```ts
-Asset {
-  sourcePath
-  metadata
-  decodedFrames // lazy
-}
-```
-
----
-
-### Operation (Intent Layer)
-
-A semantic action applied to an asset.
-
-Examples:
-
-* FixBlur
-* Upscale
-* InterpolateFrames
-* RepairCompression
-* EditRegion
-
-Operations define *what* should happen, not *how* it is implemented.
-
-```ts
-Operation {
-  type
-  parameters
-  scope // frames, regions
-}
-```
-
----
-
-### Pipeline
-
-A curated enhancement chain.
-
-* Ordered
-* Validated
-* Cycle-free
-* Reorderable only where safe
-
-```ts
-Pipeline {
-  operations[]
-  constraints
-}
-```
-
----
-
-### Model Adapter
-
-Models are interchangeable backends behind a stable interface.
-
-```ts
-ModelAdapter {
-  supports(operationType)
-  estimateVRAM()
-  run(inputFrames, params)
-}
-```
-
-Models may change over time.
-Behavioral semantics must not.
-
----
-
-### Validation (Required)
-
-Every pipeline output is inspected for measurable issues, including:
-
-* Temporal instability
-* Facial distortion
-* Over-sharpening
-* Frame corruption
-
-The engine may:
-
-* Warn the user
-* Recommend alternative workflows
-* Reduce or revert specific operations
-
-Validation is advisory unless output integrity would be compromised.
-
----
-
-### Cache and Replay
-
-All operations are:
-
-* Chunked
-* Cached
-* Replayable
-
-Changing one parameter does not invalidate unrelated work.
-
----
-
-## Language and Stack
-
-This project is intentionally multi-language, with strict responsibility boundaries.
-
-| Layer              | Technology                  | Responsibility                         |
-| ------------------ | --------------------------- | -------------------------------------- |
-| Core Models        | Python + PyTorch            | Model execution                        |
-| Pipeline Authority | Rust                        | Determinism, orchestration, validation |
-| UI                 | TypeScript (Tauri/Electron) | Timeline, previews, UX                 |
-| IPC                | MessagePack / gRPC          | Clean process boundaries               |
-
-> Code that executes models must never own orchestration or authority.
-
----
-
-## Deliberate Exclusions
-
-These constraints are intentional and enforced.
-
-* No prompt-driven image or video generation
-* No freeform node graphs
-* No blind batch processing
-* No cloud lock-in
-* No model-chasing without stability gains
-* No silent reconstruction
-* No AI usage where traditional methods are superior
-
-If a conventional algorithm is faster, more stable, or more predictable, it is preferred.
-
----
-
-## Project Goal
-
-> To make visual enhancement **trustworthy, understandable, and controllable**.
-
-This project exists to give users confidence in their results without requiring machine learning expertise or experimental workflows.
-
----
-
-## Status
-
-Early development.
-Architecture-first.
-Features ship only when they meet the principles above.
+- RCAN and EDSR are deterministic; same input produces same output
+- RealESRGAN may exhibit slight perceptual variation due to GAN-based inference
+- Users can select the model that best fits the required workflow
 
 ---
 
 ## License
 
-TBD
+[Specify license here]
 
 ---
+
+## Contributing
+
+Contributions are welcome. When contributing models or pipeline changes, ensure that determinism and performance characteristics are preserved where applicable.
+

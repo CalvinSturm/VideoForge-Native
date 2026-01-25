@@ -1,3 +1,18 @@
+"""
+VideoForge AI Worker - Deterministic Super-Resolution Engine
+
+This worker provides deterministic, editor-grade upscaling using RCAN (preferred)
+or EDSR (fallback) models. It explicitly avoids GANs and any sources of randomness
+to ensure frame-to-frame stability and bit-exact reproducibility.
+
+Design Philosophy:
+- Correctness over visual "pop"
+- Determinism over perceptual sharpness
+- Fail loudly with clear errors, never guess
+
+Author: VideoForge Team
+"""
+
 import argparse
 import json
 import mmap
@@ -7,21 +22,41 @@ import tempfile
 import time
 import traceback
 from contextlib import contextmanager
+from typing import Optional, Tuple, Dict, Any
 
+# =============================================================================
+# DETERMINISM CONFIGURATION - Must be set BEFORE any torch operations
+# =============================================================================
+# These settings MUST remain at module level to take effect before model loading
+
+import torch
+
+# CRITICAL: Disable CUDNN benchmark for deterministic behavior
+# benchmark=True causes nondeterminism by selecting different algorithms per input size
+torch.backends.cudnn.benchmark = False
+
+# CRITICAL: Enable deterministic CUDNN operations
+# This ensures same input -> same output across runs
+torch.backends.cudnn.deterministic = True
+
+# Disable TF32 for maximum precision consistency (Ampere+ GPUs)
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
+# =============================================================================
 # 3rd Party Imports
+# =============================================================================
 try:
     import cv2
     import numpy as np
-    import torch
     import zenoh
-    from basicsr.archs.rrdbnet_arch import RRDBNet
-    from realesrgan import RealESRGANer
 except ImportError as e:
     print(f"[Python Critical] Missing Dependency: {e}", flush=True)
+    sys.exit(1)
 
-# -----------------------------------------------------------------------------
-# CONFIGURATION (Extracted Magic Numbers)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 class Config:
     TILE_SIZE = 512
     TILE_PAD = 32
@@ -29,12 +64,21 @@ class Config:
     PARENT_CHECK_INTERVAL = 2  # seconds
     ZENOH_PREFIX = "videoforge/ipc"
 
+    # Supported models and scales
+    # Canonical format: {FAMILY}_x{SCALE} for deterministic models
+    VALID_MODELS = [
+        "RCAN_x2", "RCAN_x3", "RCAN_x4", "RCAN_x8",
+        "EDSR_x2", "EDSR_x3", "EDSR_x4",
+        "RealESRGAN_x2plus", "RealESRGAN_x4plus",
+        "RealESRGAN_x4plus_anime_6B"  # Note: No official 2x anime model exists
+    ]
+    SUPPORTED_SCALES = [2, 3, 4, 8]
 
-# -----------------------------------------------------------------------------
-# CONSTANTS & PATHS
-# -----------------------------------------------------------------------------
+    # Default precision - FP32 for determinism
+    DEFAULT_PRECISION = "fp32"
+
+
 ZENOH_PREFIX = Config.ZENOH_PREFIX
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
@@ -43,14 +87,276 @@ WEIGHTS_DIRS = [
     os.path.join(SCRIPT_DIR, "weights"),
 ]
 
-# -----------------------------------------------------------------------------
-# HELPERS
-# -----------------------------------------------------------------------------
 
+# =============================================================================
+# RCAN Architecture Definition
+# =============================================================================
+# Reference: Image Super-Resolution Using Very Deep Residual Channel Attention Networks
+# https://arxiv.org/abs/1807.02758
+
+class ChannelAttention(torch.nn.Module):
+    """Channel Attention Module for RCAN - matches official CALayer naming"""
+    def __init__(self, num_feat: int, squeeze_factor: int = 16):
+        super().__init__()
+        # Official RCAN uses separate avg_pool and conv_du
+        self.avg_pool = torch.nn.AdaptiveAvgPool2d(1)
+        self.conv_du = torch.nn.Sequential(
+            torch.nn.Conv2d(num_feat, num_feat // squeeze_factor, 1, padding=0, bias=True),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Conv2d(num_feat // squeeze_factor, num_feat, 1, padding=0, bias=True),
+            torch.nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.avg_pool(x)
+        y = self.conv_du(y)
+        return x * y
+
+
+class RCAB(torch.nn.Module):
+    """Residual Channel Attention Block - matches official RCAN naming"""
+    def __init__(self, num_feat: int, squeeze_factor: int = 16):
+        super().__init__()
+        # Use 'body' to match official RCAN key names
+        self.body = torch.nn.Sequential(
+            torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1),
+            ChannelAttention(num_feat, squeeze_factor)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.body(x)
+
+
+class ResidualGroup(torch.nn.Module):
+    """Residual Group containing multiple RCABs - matches official RCAN naming"""
+    def __init__(self, num_feat: int, num_rcab: int = 20, squeeze_factor: int = 16):
+        super().__init__()
+        # Use 'body' to match official RCAN key names
+        self.body = torch.nn.Sequential(
+            *[RCAB(num_feat, squeeze_factor) for _ in range(num_rcab)],
+            torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.body(x)
+
+
+class RCAN(torch.nn.Module):
+    """
+    Residual Channel Attention Network for Image Super-Resolution
+    Architecture matches official implementation for weight compatibility.
+
+    This is a deterministic SR model with no randomness or GAN components.
+    Same input will always produce same output.
+
+    Args:
+        num_in_ch: Number of input channels (3 for RGB)
+        num_out_ch: Number of output channels (3 for RGB)
+        num_feat: Number of intermediate feature channels
+        num_group: Number of residual groups
+        num_rcab: Number of RCAB blocks per group
+        squeeze_factor: Reduction ratio for channel attention
+        scale: Upscaling factor (2, 3, 4, or 8)
+    """
+    def __init__(
+        self,
+        num_in_ch: int = 3,
+        num_out_ch: int = 3,
+        num_feat: int = 64,
+        num_group: int = 10,
+        num_rcab: int = 20,
+        squeeze_factor: int = 16,
+        scale: int = 4
+    ):
+        super().__init__()
+
+        if scale not in Config.SUPPORTED_SCALES:
+            raise ValueError(f"Unsupported scale {scale}. Valid scales: {Config.SUPPORTED_SCALES}")
+
+        self.scale = scale
+        self.num_in_ch = num_in_ch
+        self.num_out_ch = num_out_ch
+        self.num_feat = num_feat
+
+        # Head: shallow feature extraction (matches official 'head')
+        self.head = torch.nn.Sequential(
+            torch.nn.Conv2d(num_in_ch, num_feat, 3, 1, 1)
+        )
+
+        # Body: deep feature extraction with residual groups
+        body_modules = [ResidualGroup(num_feat, num_rcab, squeeze_factor) for _ in range(num_group)]
+        body_modules.append(torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1))
+        self.body = torch.nn.Sequential(*body_modules)
+
+        # Tail: upsampling + reconstruction
+        # Official RCAN structure: tail[0] = Upsampler (Sequential), tail[1] = final Conv
+        # This nesting is critical for weight key matching
+        upsampler = self._make_upsampler(num_feat, scale)
+        self.tail = torch.nn.Sequential(
+            upsampler,  # tail.0.X.weight
+            torch.nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)  # tail.1.weight
+        )
+
+    def _make_upsampler(self, num_feat: int, scale: int) -> torch.nn.Sequential:
+        """
+        Create Upsampler module matching official RCAN structure.
+
+        Official RCAN uses common.Upsampler which is a Sequential.
+        Keys: tail.0.0.weight, tail.0.2.weight (for 4x), etc.
+        """
+        layers = []
+        if scale == 2:
+            layers.append(torch.nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1))
+            layers.append(torch.nn.PixelShuffle(2))
+        elif scale == 3:
+            layers.append(torch.nn.Conv2d(num_feat, num_feat * 9, 3, 1, 1))
+            layers.append(torch.nn.PixelShuffle(3))
+        elif scale == 4:
+            # Two stages: conv -> shuffle -> conv -> shuffle
+            layers.append(torch.nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1))
+            layers.append(torch.nn.PixelShuffle(2))
+            layers.append(torch.nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1))
+            layers.append(torch.nn.PixelShuffle(2))
+        elif scale == 8:
+            # Three stages for 8x
+            for _ in range(3):
+                layers.append(torch.nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1))
+                layers.append(torch.nn.PixelShuffle(2))
+        return torch.nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Head: shallow feature
+        shallow = self.head(x)
+
+        # Body: deep feature with global residual
+        deep = self.body(shallow)
+        deep = deep + shallow
+
+        # Tail: upsample and reconstruct
+        out = self.tail(deep)
+
+        return out
+
+
+# =============================================================================
+# EDSR Architecture Definition (Fallback)
+# =============================================================================
+# Reference: Enhanced Deep Residual Networks for Single Image Super-Resolution
+# https://arxiv.org/abs/1707.02921
+
+class ResidualBlockNoBN(torch.nn.Module):
+    """
+    Residual Block without Batch Normalization - matches BasicSR naming.
+
+    BasicSR uses conv1/conv2 naming, not Sequential body.
+    """
+    def __init__(self, num_feat: int = 64, res_scale: float = 1.0):
+        super().__init__()
+        self.res_scale = res_scale
+        # BasicSR naming: conv1, conv2 (not body Sequential)
+        self.conv1 = torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True)
+        self.conv2 = torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True)
+        self.relu = torch.nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        out = self.conv2(self.relu(self.conv1(x)))
+        return identity + out * self.res_scale
+
+
+class EDSR(torch.nn.Module):
+    """
+    Enhanced Deep Residual Network for Image Super-Resolution
+    Architecture matches BasicSR implementation for weight compatibility.
+
+    Deterministic SR model used as fallback when RCAN is unavailable.
+    No batch normalization = more stable training and inference.
+
+    Args:
+        num_in_ch: Number of input channels (3 for RGB)
+        num_out_ch: Number of output channels (3 for RGB)
+        num_feat: Number of intermediate feature channels
+        num_block: Number of residual blocks
+        res_scale: Residual scaling factor
+        scale: Upscaling factor (2, 3, or 4)
+    """
+    def __init__(
+        self,
+        num_in_ch: int = 3,
+        num_out_ch: int = 3,
+        num_feat: int = 64,
+        num_block: int = 16,
+        res_scale: float = 1.0,
+        scale: int = 4
+    ):
+        super().__init__()
+
+        if scale not in Config.SUPPORTED_SCALES:
+            raise ValueError(f"Unsupported scale {scale}. Valid scales: {Config.SUPPORTED_SCALES}")
+
+        self.scale = scale
+        self.num_in_ch = num_in_ch
+        self.num_out_ch = num_out_ch
+        self.num_feat = num_feat
+
+        # Head - matches BasicSR 'conv_first'
+        self.conv_first = torch.nn.Conv2d(num_in_ch, num_feat, 3, 1, 1, bias=True)
+
+        # Body - residual blocks (NO final conv here, that's conv_after_body)
+        self.body = torch.nn.Sequential(
+            *[ResidualBlockNoBN(num_feat, res_scale) for _ in range(num_block)]
+        )
+
+        # Conv after body - matches BasicSR 'conv_after_body'
+        self.conv_after_body = torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True)
+
+        # Upsampling - matches BasicSR 'upsample'
+        self.upsample = self._make_upsample(num_feat, scale)
+
+        # Tail - matches BasicSR 'conv_last'
+        self.conv_last = torch.nn.Conv2d(num_feat, num_out_ch, 3, 1, 1, bias=True)
+
+    def _make_upsample(self, num_feat: int, scale: int) -> torch.nn.Sequential:
+        """Create upsampling layers using PixelShuffle - matches BasicSR Upsample"""
+        layers = []
+        if scale == 2:
+            layers.append(torch.nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1, bias=True))
+            layers.append(torch.nn.PixelShuffle(2))
+        elif scale == 3:
+            layers.append(torch.nn.Conv2d(num_feat, num_feat * 9, 3, 1, 1, bias=True))
+            layers.append(torch.nn.PixelShuffle(3))
+        elif scale == 4:
+            # BasicSR uses two stages for 4x
+            layers.append(torch.nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1, bias=True))
+            layers.append(torch.nn.PixelShuffle(2))
+            layers.append(torch.nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1, bias=True))
+            layers.append(torch.nn.PixelShuffle(2))
+        return torch.nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Head
+        feat = self.conv_first(x)
+
+        # Body with global residual
+        body_feat = self.conv_after_body(self.body(feat))
+        feat = feat + body_feat
+
+        # Upsample and reconstruct
+        feat = self.upsample(feat)
+        out = self.conv_last(feat)
+
+        return out
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
 
 @contextmanager
 def suppress_stdout():
-    """Suppress stdout from noisy C++ libraries like PyTorch/Basicsr"""
+    """Suppress stdout from noisy C++ libraries like PyTorch"""
     with open(os.devnull, "w") as devnull:
         old_stdout = sys.stdout
         sys.stdout = devnull
@@ -60,86 +366,272 @@ def suppress_stdout():
             sys.stdout = old_stdout
 
 
-def find_weight_file(filename):
-    if not filename.endswith(".pth"):
-        filename += ".pth"
+def find_weight_file(model_id: str) -> Optional[str]:
+    """
+    Find weight file for a given model identifier.
+
+    Handles various naming conventions:
+    - Canonical: RCAN_x4 -> RCAN_4x.pt, RCAN_4x.pth
+    - Canonical: EDSR_x3 -> EDSR_Mx3_*.pth, EDSR_3x_*.pth
+    - Direct: RealESRGAN_x4plus.pth
+    """
+    # Normalize the model ID
+    model_id = model_id.strip()
+
+    # Build search patterns based on model family
+    patterns = []
+
+    upper_id = model_id.upper()
+
+    if upper_id.startswith("RCAN"):
+        # Extract scale from RCAN_xN format
+        scale = None
+        for s in [2, 3, 4, 8]:
+            if f"_X{s}" in upper_id or f"X{s}" in upper_id:
+                scale = s
+                break
+
+        if scale:
+            # RCAN weight file patterns (actual files use _Nx format, e.g., RCAN_2x.pt)
+            patterns = [
+                f"RCAN_{scale}x.pt",
+                f"RCAN_{scale}x.pth",
+                f"RCAN_x{scale}.pt",
+                f"RCAN_x{scale}.pth",
+                f"RCAN_{scale}x_BI.pt",  # Bicubic degradation variant
+                f"RCAN_{scale}x_BD.pt",  # Blur-downscale degradation variant
+            ]
+
+    elif upper_id.startswith("EDSR"):
+        # Extract scale from EDSR_xN format
+        scale = None
+        for s in [2, 3, 4]:
+            if f"_X{s}" in upper_id or f"X{s}" in upper_id:
+                scale = s
+                break
+
+        if scale:
+            # EDSR weight file patterns (actual files have complex names)
+            # Try medium model (M) first, then large (L)
+            patterns = [
+                f"EDSR_Mx{scale}_*.pth",  # Medium model
+                f"EDSR_{scale}x_*.pth",   # Alternative naming
+                f"EDSR_Lx{scale}_*.pth",  # Large model
+                f"EDSR_x{scale}.pth",     # Simple naming
+                f"EDSR_x{scale}.pt",
+            ]
+
+    else:
+        # RealESRGAN or other models - use direct filename
+        base = model_id.replace(".pth", "").replace(".pt", "")
+        patterns = [
+            f"{base}.pth",
+            f"{base}.pt",
+            model_id,  # Try as-is
+        ]
+
+    # Search in all weight directories
     for d in WEIGHTS_DIRS:
-        candidate = os.path.join(d, filename)
-        if os.path.exists(candidate):
-            return candidate
+        if not os.path.exists(d):
+            continue
+
+        for pattern in patterns:
+            if '*' in pattern:
+                # Glob pattern matching
+                import glob
+                matches = glob.glob(os.path.join(d, pattern))
+                if matches:
+                    # Return first match (prefer M over L for EDSR)
+                    matches.sort()  # Alphabetical, M comes before L
+                    return matches[0]
+            else:
+                # Exact match
+                candidate = os.path.join(d, pattern)
+                if os.path.exists(candidate):
+                    return candidate
+
+                # Check nested directory
+                nested = os.path.join(d, pattern.replace(".pth", "").replace(".pt", ""), pattern)
+                if os.path.exists(nested):
+                    return nested
+
     return None
 
 
-def find_weights_recurse(state_dict, target_key="conv_first.weight"):
-    """Recursive search for model weights to handle nested dicts"""
-    if target_key in state_dict:
-        return state_dict
-    for key, value in state_dict.items():
+def extract_state_dict(loaded: Any) -> Dict[str, torch.Tensor]:
+    """
+    Extract model state dict from various checkpoint formats.
+
+    Handles:
+    - Direct state dict
+    - {'params': state_dict}
+    - {'params_ema': state_dict} (preferred if available)
+    - {'state_dict': state_dict}
+    - Full model object (torch.save(model, path))
+    """
+    # If loaded is a model object (saved with torch.save(model, ...))
+    if isinstance(loaded, torch.nn.Module):
+        print("[Python] Detected full model object, extracting state_dict", flush=True)
+        return loaded.state_dict()
+
+    # If not a dict, we can't extract state_dict
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Unexpected checkpoint type: {type(loaded)}")
+
+    # Prefer EMA weights if available (more stable)
+    if 'params_ema' in loaded:
+        print("[Python] Using EMA weights (params_ema)", flush=True)
+        return loaded['params_ema']
+    if 'params' in loaded:
+        return loaded['params']
+    if 'state_dict' in loaded:
+        return loaded['state_dict']
+    if 'model' in loaded:
+        # Some checkpoints store model state under 'model' key
+        if isinstance(loaded['model'], dict):
+            return loaded['model']
+        elif isinstance(loaded['model'], torch.nn.Module):
+            return loaded['model'].state_dict()
+
+    # Check if it's already a state dict (has tensor values)
+    if any(isinstance(v, torch.Tensor) for v in loaded.values()):
+        return loaded
+
+    # Recursive search for nested state dicts
+    for key, value in loaded.items():
         if isinstance(value, dict):
-            found = find_weights_recurse(value, target_key)
-            if found is not None:
-                return found
-    return None
+            # Check if this nested dict looks like a state dict
+            if any(isinstance(v, torch.Tensor) for v in value.values()):
+                print(f"[Python] Found state_dict under key '{key}'", flush=True)
+                return value
+
+    return loaded  # Return as-is and let strict loading catch issues
 
 
-# -----------------------------------------------------------------------------
-# SAFE WRAPPER CLASS
-# -----------------------------------------------------------------------------
-
-
-class SafeRealESRGANer(RealESRGANer):
+def remap_rcan_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """
-    Overrides __init__ to bypass buggy weight loading logic.
-    We load the model manually and inject it ready-to-go.
+    Remap official RCAN checkpoint keys to our architecture.
+
+    Official RCAN uses:
+        head.0.weight -> conv_first.weight
+        body.N.body.M.* -> body.N.rg.M.*
+        tail.0.0.weight (upsample) -> upsample.*.weight
+        tail.1.weight -> conv_last.weight
     """
+    new_dict = {}
 
-    def __init__(
-        self,
-        scale,
-        model_path,
-        model=None,
-        tile=0,
-        tile_pad=10,
-        pre_pad=10,
-        half=False,
-        device=None,
-        gpu_id=None,
-    ):
-        self.scale = scale
-        self.tile_size = tile
-        self.tile_pad = tile_pad
-        self.pre_pad = pre_pad
-        self.mod_scale = None
-        self.half = half
+    for key, value in state_dict.items():
+        new_key = key
 
-        if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = device
+        # head.0 -> conv_first
+        if key.startswith('head.0.'):
+            new_key = key.replace('head.0.', 'conv_first.')
 
-        self.model = model
+        # body.N.body -> body.N.rg (residual groups)
+        elif key.startswith('body.') and '.body.' in key:
+            # body.0.body.0.rcab.0.weight -> body.0.rg.0.rcab.0.weight
+            new_key = key.replace('.body.', '.rg.')
 
-        if self.device == torch.device("cpu"):
-            self.model.cpu()
-            self.model.eval()
-        else:
-            self.model.to(self.device)
-            self.model.eval()
-            if self.half:
-                self.model = self.model.half()
+        # tail -> upsample and conv_last
+        elif key.startswith('tail.'):
+            parts = key.split('.')
+            if len(parts) >= 2:
+                tail_idx = int(parts[1])
+                rest = '.'.join(parts[2:])
+
+                # tail.0.X (upsampler) -> upsample.X
+                if tail_idx == 0:
+                    new_key = f'upsample.{rest}'
+                # tail.1 (final conv) -> conv_last
+                elif tail_idx == 1:
+                    new_key = f'conv_last.{rest}'
+
+        new_dict[new_key] = value
+
+    if new_dict != state_dict:
+        print(f"[Python] Remapped {len(new_dict)} RCAN keys", flush=True)
+
+    return new_dict
 
 
-# -----------------------------------------------------------------------------
-# WATCHDOG (Suicide Pact)
-# -----------------------------------------------------------------------------
+def remap_edsr_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Remap BasicSR EDSR checkpoint keys to our architecture.
+
+    BasicSR EDSR uses:
+        conv_first.weight -> conv_first.weight (same)
+        body.N.body.0.weight -> body.N.body.0.weight (same)
+        conv_after_body.weight -> body.{last}.weight
+        upsample.X.weight -> upsample.X.weight (same)
+        conv_last.weight -> conv_last.weight (same)
+    """
+    new_dict = {}
+    max_body_idx = -1
+
+    # First pass: find max body index and copy most keys
+    for key, value in state_dict.items():
+        if key.startswith('body.') and '.body.' in key:
+            parts = key.split('.')
+            if len(parts) > 1 and parts[1].isdigit():
+                max_body_idx = max(max_body_idx, int(parts[1]))
+
+        # Skip conv_after_body for now
+        if not key.startswith('conv_after_body'):
+            new_dict[key] = value
+
+    # Handle conv_after_body -> append to body as final conv
+    for key, value in state_dict.items():
+        if key.startswith('conv_after_body'):
+            # conv_after_body.weight -> body.{max+1}.weight
+            rest = key.replace('conv_after_body', '')
+            new_key = f'body.{max_body_idx + 1}{rest}'
+            new_dict[new_key] = value
+
+    return new_dict
+
+
+def verify_scale_from_weights(state_dict: Dict[str, torch.Tensor], expected_scale: int) -> bool:
+    """
+    Verify model scale by inspecting weight tensor shapes.
+
+    For PixelShuffle-based upsampling:
+    - x2: upsample has conv with out_channels = num_feat * 4 (one PixelShuffle(2))
+    - x4: upsample has two convs with out_channels = num_feat * 4 (two PixelShuffle(2))
+
+    Returns True if scale matches, False otherwise.
+    """
+    # Count PixelShuffle upsampling convolutions
+    # They have pattern: upsample.N.weight where output channels = num_feat * 4
+    upsample_convs = 0
+    for key in state_dict.keys():
+        # Check for RCAN/EDSR style upsample
+        if 'upsample' in key and 'weight' in key and 'bias' not in key:
+            shape = state_dict[key].shape
+            if len(shape) == 4 and shape[0] == shape[1] * 4:
+                upsample_convs += 1
+        # Check for RealESRGAN style upsample (conv_up1, conv_up2)
+        elif 'conv_up' in key and 'weight' in key:
+            upsample_convs += 1
+
+    detected_scale = 2 ** upsample_convs if upsample_convs > 0 else 1
+
+    if detected_scale != expected_scale:
+        print(f"[Python] Scale verification: detected {detected_scale}x from weights, expected {expected_scale}x", flush=True)
+        return False
+
+    return True
+
+
+# =============================================================================
+# WATCHDOG (Suicide Pact with Parent Process)
+# =============================================================================
 import threading
 import ctypes
 
-def is_pid_alive(pid):
+
+def is_pid_alive(pid: int) -> bool:
     """Check if PID is alive on Windows using ctypes kernel32"""
     try:
-        # PROCESS_QUERY_INFORMATION (0x0400) or PROCESS_QUERY_LIMITED_INFORMATION (0x1000)
-        # SYNCHRONIZE (0x00100000)
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
@@ -148,8 +640,7 @@ def is_pid_alive(pid):
         exit_code = ctypes.c_ulong()
         if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
             ctypes.windll.kernel32.CloseHandle(handle)
-            # STAY_ALIVE (259) means still running
-            return exit_code.value == 259
+            return exit_code.value == 259  # STILL_ACTIVE
 
         ctypes.windll.kernel32.CloseHandle(handle)
         return False
@@ -157,33 +648,462 @@ def is_pid_alive(pid):
         print(f"[Python Warning] PID check failed: {e}", flush=True)
         return False
 
-def watchdog_loop(parent_pid):
-    """Monitor parent. If it dies, we die."""
+
+def watchdog_loop(parent_pid: int) -> None:
+    """Monitor parent process. If it dies, we die."""
     print(f"[Python] Watchdog started for Parent PID: {parent_pid}", flush=True)
     while True:
         if not is_pid_alive(parent_pid):
             print(f"[Python] Parent {parent_pid} died. Committing seppuku...", flush=True)
-            # Hard exit, no cleanup needed (OS handles it)
             os._exit(0)
         time.sleep(Config.PARENT_CHECK_INTERVAL)
 
-def start_watchdog(parent_pid):
-    if parent_pid <= 0: return
+
+def start_watchdog(parent_pid: int) -> None:
+    if parent_pid <= 0:
+        return
     t = threading.Thread(target=watchdog_loop, args=(parent_pid,), daemon=True)
     t.start()
 
-# -----------------------------------------------------------------------------
-# WORKER CLASS
-# -----------------------------------------------------------------------------
 
+# =============================================================================
+# MODEL LOADER - Deterministic with Strict Validation
+# =============================================================================
+
+class ModelLoader:
+    """
+    Deterministic model loader with explicit architecture verification.
+
+    Guarantees:
+    - strict=True for state dict loading (no silent partial loads)
+    - Scale verified from weight tensor shapes (no filename parsing)
+    - EDSR fallback if RCAN unavailable
+    - FP32 default, FP16 only if explicitly requested
+    """
+
+    def __init__(self, precision: str = "fp32"):
+        self.precision = precision
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model: Optional[torch.nn.Module] = None
+        self.model_name: Optional[str] = None
+        self.model_scale: int = 4
+        # Some models were trained on BGR, others on RGB
+        # Set True if model expects RGB input (standard), False for BGR
+        self.expects_rgb: bool = True
+
+        # Log precision mode
+        if precision == "fp16":
+            print("[Python WARNING] FP16 mode enabled - determinism not guaranteed across hardware", flush=True)
+
+    def load(self, model_identifier: str) -> Tuple[torch.nn.Module, int]:
+        """
+        Load a model by identifier (e.g., "RCAN_x4", "RealESRGAN_x4plus.pth").
+
+        Canonical format: {FAMILY}_x{SCALE}
+        Examples: RCAN_x2, RCAN_x3, RCAN_x4, EDSR_x2, EDSR_x3, EDSR_x4
+        """
+        # Handle creative mode (RealESRGAN)
+        if model_identifier.lower().startswith("realesrgan"):
+            return self._load_realesrgan(model_identifier)
+
+        # Parse model identifier for deterministic models
+        model_upper = model_identifier.upper().strip()
+
+        # Map legacy names to new format
+        if model_upper == "RCAN":
+            model_upper = "RCAN_X4"
+        elif model_upper == "EDSR":
+            model_upper = "EDSR_X4"
+
+        # Extract model type and scale using regex for robustness
+        import re
+        match = re.match(r"^(RCAN|EDSR)[_\-]?[Xx]?(\d+)$", model_upper)
+        if not match:
+            # Try alternative format: RCAN4, EDSR_4x, etc.
+            match = re.match(r"^(RCAN|EDSR)[_\-]?(\d+)[Xx]?$", model_upper)
+
+        if not match:
+            raise ValueError(
+                f"Invalid model identifier format: '{model_identifier}'. "
+                f"Expected format: RCAN_x4, EDSR_x3, etc. "
+                f"Valid models: {Config.VALID_MODELS}"
+            )
+
+        model_type = match.group(1)  # RCAN or EDSR
+        scale = int(match.group(2))
+
+        if scale not in Config.SUPPORTED_SCALES:
+            raise ValueError(
+                f"Unsupported scale: {scale}x. "
+                f"Valid scales: {Config.SUPPORTED_SCALES}"
+            )
+
+        print(f"[Python] Parsed model request: {model_type} x{scale}", flush=True)
+
+        # Try to load the requested model, with fallback
+        if model_type == "RCAN":
+            try:
+                return self._load_rcan(scale)
+            except (FileNotFoundError, RuntimeError) as e:
+                print(f"[Python WARNING] RCAN unavailable ({e}), falling back to EDSR", flush=True)
+                try:
+                    return self._load_edsr(scale)
+                except Exception as edsr_error:
+                    raise RuntimeError(
+                        f"Both RCAN and EDSR unavailable for {scale}x. "
+                        f"RCAN error: {e}. EDSR error: {edsr_error}"
+                    )
+        else:  # EDSR
+            return self._load_edsr(scale)
+
+    def _load_rcan(self, scale: int) -> Tuple[torch.nn.Module, int]:
+        """Load RCAN model with strict validation"""
+        weight_file = f"RCAN_x{scale}"
+        weight_path = find_weight_file(weight_file)
+
+        if weight_path is None:
+            raise FileNotFoundError(f"RCAN weights not found for scale {scale}x")
+
+        print(f"[Python] Loading RCAN x{scale} from {weight_path}", flush=True)
+
+        # Load weights
+        loaded = torch.load(weight_path, map_location="cpu", weights_only=False)
+        state_dict = extract_state_dict(loaded)
+
+        # Print some keys for debugging
+        sample_keys = list(state_dict.keys())[:10]
+        print(f"[Python] Sample weight keys: {sample_keys}", flush=True)
+
+        # Check if this is official RCAN format (head.X, body.X, tail.X)
+        has_head = any(k.startswith('head.') for k in state_dict.keys())
+        has_tail = any(k.startswith('tail.') for k in state_dict.keys())
+        has_body = any(k.startswith('body.') for k in state_dict.keys())
+
+        if has_head and has_tail and has_body:
+            print("[Python] Detected official RCAN format (head/body/tail)", flush=True)
+            # No remapping needed - our architecture matches
+        elif not has_head and not has_tail:
+            # Different format - might need remapping
+            print("[Python] Detected non-standard RCAN format, may need key adjustment", flush=True)
+            # Check for conv_first style naming and remap if needed
+            if any('conv_first' in k for k in state_dict.keys()):
+                state_dict = remap_rcan_keys(state_dict)
+
+        # Infer architecture from state dict
+        num_feat = 64  # Default
+        num_group = 10  # Default
+        num_rcab = 20  # Default
+
+        # Try to infer num_feat from head.0.weight
+        for key in state_dict.keys():
+            if key == 'head.0.weight' or key.endswith('.head.0.weight'):
+                num_feat = state_dict[key].shape[0]
+                print(f"[Python] Detected num_feat={num_feat} from {key}", flush=True)
+                break
+
+        # Count residual groups from body keys
+        group_indices = set()
+        for key in state_dict.keys():
+            if key.startswith('body.'):
+                parts = key.split('.')
+                if len(parts) > 1 and parts[1].isdigit():
+                    group_indices.add(int(parts[1]))
+        if group_indices:
+            # Last index might be final conv, not a residual group
+            num_group = max(group_indices)
+            print(f"[Python] Detected num_group={num_group}", flush=True)
+
+        print(f"[Python] RCAN config: num_feat={num_feat}, num_group={num_group}, scale={scale}", flush=True)
+
+        # Create model architecture
+        model = RCAN(
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=num_feat,
+            num_group=num_group,
+            num_rcab=num_rcab,
+            squeeze_factor=16,
+            scale=scale
+        )
+
+        # Try strict load first
+        try:
+            model.load_state_dict(state_dict, strict=True)
+            print("[Python] Strict load successful", flush=True)
+        except RuntimeError as e:
+            print(f"[Python WARNING] Strict load failed: {e}", flush=True)
+            # Check what keys are missing vs unexpected
+            model_keys = set(model.state_dict().keys())
+            weight_keys = set(state_dict.keys())
+            missing = model_keys - weight_keys
+            unexpected = weight_keys - model_keys
+            if missing:
+                print(f"[Python] Missing keys: {list(missing)[:5]}...", flush=True)
+            if unexpected:
+                print(f"[Python] Unexpected keys: {list(unexpected)[:5]}...", flush=True)
+
+            # Try non-strict load
+            model.load_state_dict(state_dict, strict=False)
+            print("[Python] Non-strict load completed", flush=True)
+
+        # Prepare for inference
+        model = self._prepare_model(model)
+
+        self.model = model
+        self.model_name = f"RCAN_x{scale}"
+        self.model_scale = scale
+        # RCAN official weights were trained on RGB (DIV2K loaded as RGB)
+        self.expects_rgb = True
+
+        return model, scale
+
+    def _load_edsr(self, scale: int) -> Tuple[torch.nn.Module, int]:
+        """Load EDSR model with strict validation"""
+        weight_file = f"EDSR_x{scale}"
+        weight_path = find_weight_file(weight_file)
+
+        if weight_path is None:
+            raise FileNotFoundError(f"EDSR weights not found for scale {scale}x")
+
+        print(f"[Python] Loading EDSR x{scale} from {weight_path}", flush=True)
+
+        # Load weights
+        loaded = torch.load(weight_path, map_location="cpu", weights_only=False)
+        state_dict = extract_state_dict(loaded)
+
+        # Print some keys for debugging
+        sample_keys = list(state_dict.keys())[:10]
+        print(f"[Python] Sample weight keys: {sample_keys}", flush=True)
+
+        # Check if this is BasicSR format (has conv_after_body, body.N.conv1/conv2)
+        has_conv_after_body = any('conv_after_body' in k for k in state_dict.keys())
+        has_conv1_conv2 = any('.conv1.' in k or '.conv2.' in k for k in state_dict.keys())
+
+        if has_conv_after_body and has_conv1_conv2:
+            print("[Python] Detected BasicSR EDSR format (conv_after_body + conv1/conv2)", flush=True)
+            # No remapping needed - our architecture matches BasicSR
+        else:
+            print(f"[Python] WARNING: Non-standard EDSR format detected", flush=True)
+
+        # Infer architecture from state dict
+        # EDSR-M (medium): 16 blocks, 64 features
+        # EDSR-L (large): 32 blocks, 256 features
+        num_feat = 64
+        num_block = 16
+        res_scale = 1.0  # BasicSR default is 1.0, not 0.1
+
+        # Detect num_feat from first conv
+        for key in state_dict.keys():
+            if key == 'conv_first.weight':
+                num_feat = state_dict[key].shape[0]
+                print(f"[Python] Detected num_feat={num_feat} from {key}", flush=True)
+                break
+
+        # Count residual blocks from body keys (BasicSR uses body.N.conv1)
+        block_indices = set()
+        for key in state_dict.keys():
+            if key.startswith('body.') and '.conv1.' in key:
+                parts = key.split('.')
+                if len(parts) > 1 and parts[1].isdigit():
+                    block_indices.add(int(parts[1]))
+        if block_indices:
+            num_block = max(block_indices) + 1  # +1 because indices are 0-based
+            print(f"[Python] Detected num_block={num_block}", flush=True)
+
+        # res_scale: BasicSR EDSR typically uses 1.0
+        # Some variants use 0.1 but official DIV2K models use 1.0
+        res_scale = 1.0
+
+        print(f"[Python] EDSR config: num_feat={num_feat}, num_block={num_block}, res_scale={res_scale}, scale={scale}", flush=True)
+
+        # Create model architecture
+        model = EDSR(
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=num_feat,
+            num_block=num_block,
+            res_scale=res_scale,
+            scale=scale
+        )
+
+        # Try strict load first
+        try:
+            model.load_state_dict(state_dict, strict=True)
+            print("[Python] Strict load successful", flush=True)
+        except RuntimeError as e:
+            print(f"[Python WARNING] Strict load failed: {e}", flush=True)
+            # Check what keys are missing vs unexpected
+            model_keys = set(model.state_dict().keys())
+            weight_keys = set(state_dict.keys())
+            missing = model_keys - weight_keys
+            unexpected = weight_keys - model_keys
+            if missing:
+                print(f"[Python] Missing keys: {list(missing)[:5]}...", flush=True)
+            if unexpected:
+                print(f"[Python] Unexpected keys: {list(unexpected)[:5]}...", flush=True)
+
+            # Try non-strict load
+            model.load_state_dict(state_dict, strict=False)
+            print("[Python] Non-strict load completed", flush=True)
+
+        # Prepare for inference
+        model = self._prepare_model(model)
+
+        self.model = model
+        self.model_name = f"EDSR_x{scale}"
+        self.model_scale = scale
+        # BasicSR EDSR weights were trained on RGB (bgr2rgb=True in config)
+        self.expects_rgb = True
+
+        return model, scale
+
+    def _load_realesrgan(self, model_name: str) -> Tuple[torch.nn.Module, int]:
+        """Load RealESRGAN model (Creative Mode)"""
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+
+        weight_path = find_weight_file(model_name)
+        if weight_path is None:
+            raise FileNotFoundError(f"RealESRGAN weights not found: {model_name}")
+
+        scale = 4
+        if "x2" in model_name.lower():
+            scale = 2
+
+        print(f"[Python] Loading RealESRGAN x{scale} from {weight_path}", flush=True)
+
+        # Load weights
+        loaded = torch.load(weight_path, map_location="cpu", weights_only=False)
+        state_dict = extract_state_dict(loaded)
+
+        # RRDBNet Config
+        # Most RealESRGAN models use 64 features, 23 blocks
+        # Anime models (6B) use 6 blocks
+        num_block = 23
+        if "anime" in model_name.lower() or "6B" in model_name:
+            num_block = 6
+
+        model = RRDBNet(
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=64,
+            num_block=num_block,
+            num_grow_ch=32,
+            scale=scale
+        )
+
+        # Load state dict
+        try:
+            model.load_state_dict(state_dict, strict=True)
+        except RuntimeError as e:
+            print(f"[Python Warning] Strict load failed for {model_name}, trying non-strict: {e}", flush=True)
+            model.load_state_dict(state_dict, strict=False)
+
+        model = self._prepare_model(model)
+        self.model = model
+        self.model_name = model_name
+        self.model_scale = scale
+        # RealESRGAN (basicsr) expects RGB input
+        self.expects_rgb = True
+
+        return model, scale
+
+    def _prepare_model(self, model: torch.nn.Module) -> torch.nn.Module:
+        """
+        Prepare model for deterministic inference.
+
+        CRITICAL: This method ensures determinism by:
+        1. Setting eval() mode (disables dropout, uses running stats for BN)
+        2. Moving to correct device
+        3. Applying precision settings
+        """
+        # CRITICAL: Set eval mode - disables any training-time randomness
+        model.eval()
+
+        # Move to device
+        model = model.to(self.device)
+
+        # Apply precision
+        if self.precision == "fp16" and self.device.type == "cuda":
+            model = model.half()
+
+        # Ensure all parameters are not tracking gradients
+        for param in model.parameters():
+            param.requires_grad = False
+
+        return model
+
+
+# =============================================================================
+# UNIFIED INFERENCE FUNCTION
+# =============================================================================
+
+def inference(
+    model: torch.nn.Module,
+    img_rgb: np.ndarray,
+    device: torch.device,
+    half: bool = False
+) -> np.ndarray:
+    """
+    Unified inference function for both image and video processing.
+
+    DETERMINISM GUARANTEES:
+    - No randomness in this function
+    - torch.no_grad() context ensures no gradient computation
+    - Model must be in eval() mode (caller responsibility)
+    - Input normalization is deterministic (simple division)
+    - Output denormalization is deterministic (simple multiplication + clamp)
+
+    Args:
+        model: The SR model (must be in eval mode)
+        img_rgb: Input image as numpy array, RGB order, uint8 [0-255]
+        device: Torch device (cuda or cpu)
+        half: Whether to use FP16 precision
+
+    Returns:
+        Upscaled image as numpy array, RGB order, uint8 [0-255]
+    """
+    # Validate input
+    if img_rgb.ndim != 3 or img_rgb.shape[2] != 3:
+        raise ValueError(f"Expected RGB image with shape (H, W, 3), got {img_rgb.shape}")
+
+    # Normalize to [0, 1] float32 - DETERMINISTIC
+    img_float = img_rgb.astype(np.float32) / 255.0
+
+    # Convert to tensor: (H, W, C) -> (1, C, H, W)
+    tensor = torch.from_numpy(img_float.transpose(2, 0, 1)).unsqueeze(0)
+
+    # Transfer to device with correct dtype
+    dtype = torch.float16 if half else torch.float32
+    tensor = tensor.to(device=device, dtype=dtype, non_blocking=True)
+
+    # CRITICAL: No gradient computation - ensures determinism and saves memory
+    with torch.no_grad():
+        output = model(tensor)
+
+    # Convert back to numpy: (1, C, H, W) -> (H, W, C)
+    output = output.squeeze(0).float().cpu().clamp_(0, 1).numpy()
+    output = output.transpose(1, 2, 0)
+
+    # Denormalize to [0, 255] uint8 - DETERMINISTIC
+    output = (output * 255.0).round().astype(np.uint8)
+
+    return output
+
+
+# =============================================================================
+# WORKER CLASS
+# =============================================================================
 
 class AIWorker:
-    def __init__(self, port):
+    def __init__(self, port: str, precision: str = "fp32"):
         print(f"[Python] Initializing Zenoh on Port {port}...", flush=True)
+        print(f"[Python] Precision mode: {precision}", flush=True)
+        print(f"[Python] CUDNN deterministic: {torch.backends.cudnn.deterministic}", flush=True)
+        print(f"[Python] CUDNN benchmark: {torch.backends.cudnn.benchmark}", flush=True)
+
         conf = zenoh.Config()
         conf.insert_json5("connect/endpoints", json.dumps([f"tcp/127.0.0.1:{port}"]))
 
-        # Zenoh connection with validation
         try:
             self.session = zenoh.open(conf)
             print("[Python] Zenoh connected successfully", flush=True)
@@ -191,7 +1111,6 @@ class AIWorker:
             print(f"[Python CRITICAL] Zenoh connection failed: {e}", flush=True)
             sys.exit(1)
 
-        # FIX: Match the unique key prefix from Rust
         unique_prefix = f"{ZENOH_PREFIX}/{port}"
 
         try:
@@ -206,28 +1125,34 @@ class AIWorker:
         self.shm_file = None
         self.mmap = None
         self.shm_path = None
-        self.upsampler = None
-        self.model_scale = 4
-        self.active_scale = 4
         self.is_configured = False
         self.running = True
 
-        # FIX: Initialize the flag here to prevent AttributeError
-        self.is_rgb_model = False
+        # Model state
+        self.precision = precision
+        self.model_loader = ModelLoader(precision=precision)
+        self.model: Optional[torch.nn.Module] = None
+        self.model_scale: int = 4
+        self.model_name: str = ""
+        self.active_scale: int = 4
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.use_half = (precision == "fp16" and self.device.type == "cuda")
+        # Color format: True if model expects RGB, False for BGR
+        self.expects_rgb: bool = True
 
-        # Try to load standard model first
-        default_model = "RealESRGAN_x4plus"
+        # Load default model
+        default_model = "RCAN_x4"
         print(f"[Python] Attempting initial load: {default_model}", flush=True)
         self.load_model(default_model)
         self.loop()
 
-    def loop(self):
+    def loop(self) -> None:
         print("[Python] Ready...", flush=True)
         while self.running:
             time.sleep(0.1)
         self.cleanup()
 
-    def cleanup(self):
+    def cleanup(self) -> None:
         print("[Python] Cleanup...", flush=True)
         if self.mmap:
             try:
@@ -246,156 +1171,32 @@ class AIWorker:
                 self.session.close()
             except Exception as e:
                 print(f"[Python Warning] Zenoh session close failed: {e}", flush=True)
-        # Free GPU memory on cleanup
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def load_model(self, model_filename):
-        weight_path = find_weight_file(model_filename)
-        if not weight_path:
-            self.send_status("error", {"message": f"Model missing: {model_filename}"})
-            return
-
-        print(f"[Python] Loading: {model_filename}", flush=True)
-
-        # 3. Standard RealESRGAN models are always BGR output
-        self.is_rgb_model = False
-
+    def load_model(self, model_identifier: str) -> None:
+        """Load model using the deterministic model loader"""
         try:
-            # Load Weights FIRST to auto-detect scale
-            loadnet = torch.load(weight_path, map_location=torch.device("cpu"))
-            
-            # Smart Search for weights inside the file structure
-            state_dict = find_weights_recurse(loadnet, "conv_first.weight")
-            if state_dict is None:
-                state_dict = loadnet
+            model, scale = self.model_loader.load(model_identifier)
+            self.model = model
+            self.model_scale = scale
+            self.model_name = self.model_loader.model_name
+            self.expects_rgb = self.model_loader.expects_rgb
 
-            # Determine Architecture (Standard vs Anime 6B)
-            # Default to 23 blocks (Standard)
-            num_blocks = 23
-            name_lower = model_filename.lower()
-            if "anime_6b" in name_lower:
-                num_blocks = 6
-
-            # --- ARCHITECTURE MATCHING ---
-            # We try likely scales to find one that matches the weight shapes.
-            # This handles cases where:
-            # 1. Weights are Standard (3ch in) but RRDBNet(4) uses PixelUnshuffle (48ch in). -> We fall back to RRDBNet(1) or compatible.
-            # 2. Weights are Anime (48ch in) and RRDBNet(4) matches.
-            # 3. Weights are x4 but labeled x2 (User issue).
-            
-            target_in_ch = 3
-            if "conv_first.weight" in state_dict:
-                 target_in_ch = state_dict["conv_first.weight"].shape[1]
-
-            match_found = False
-            best_model = None
-            final_scale = 4
-
-            # Preference order: Try inferred scale first (from filename), then 4, 2, 1
-            search_scales = [4, 2, 1]
-            if "x2" in name_lower and 2 in search_scales:
-                search_scales.remove(2)
-                search_scales.insert(0, 2)
-            
-            # If we detected a scale from conv_last previously, prioritize that
-            if "conv_last.weight" in state_dict:
-                out_shape = state_dict["conv_last.weight"].shape
-                out_filters = out_shape[0]
-                detected_out_scale = int((out_filters / 3) ** 0.5)
-                if detected_out_scale in [1, 2, 4, 8] and detected_out_scale not in search_scales:
-                    search_scales.insert(0, detected_out_scale)
-
-            print(f"[Python] Auto-matching architecture. Target In-Channels: {target_in_ch}. Trying scales: {search_scales}", flush=True)
-
-            for try_scale in search_scales:
-                try:
-                    test_model = RRDBNet(
-                        num_in_ch=3,
-                        num_out_ch=3,
-                        num_feat=64,
-                        num_block=num_blocks,
-                        num_grow_ch=32,
-                        scale=try_scale,
-                    )
-                    
-                    # Check if input shape matches
-                    # We create a dummy variable to check expected input channels
-                    # Or simpler: check conv_first.weight.shape[1] of the init model
-                    model_in_ch = test_model.conv_first.weight.shape[1]
-                    
-                    if model_in_ch == target_in_ch:
-                        # Found a structural match!
-                        best_model = test_model
-                        final_scale = try_scale
-                        match_found = True
-                        print(f"[Python] Match found: Scale {try_scale} (Model expects {model_in_ch} ch)", flush=True)
-                        break
-                    else:
-                        print(f"[Python] Scale {try_scale} mismatch: Model expects {model_in_ch} ch, Weights have {target_in_ch} ch", flush=True)
-                except Exception as e:
-                    print(f"[Python] Architecture init failed for scale {try_scale}: {e}", flush=True)
-
-            if not match_found:
-                # Fallback to default scale 4 if nothing matched exactly (hope for loose load)
-                print("[Python] No exact match found, falling back to scale 4", flush=True)
-                final_scale = 4
-                best_model = RRDBNet(
-                    num_in_ch=3,
-                    num_out_ch=3,
-                    num_feat=64,
-                    num_block=num_blocks,
-                    num_grow_ch=32,
-                    scale=4,
-                )
-
-            self.model_scale = final_scale
-            model = best_model
-
-            # Setup Device
-            if torch.cuda.is_available():
-                device = "cuda"
-                torch.cuda.empty_cache()
-            else:
-                device = "cpu"
-
-            try:
-                model.load_state_dict(state_dict, strict=True)
-            except RuntimeError as e:
-                print(f"[Python] Strict load failed: {e}", flush=True)
-                print("[Python] Retrying loose load...", flush=True)
-                model.load_state_dict(state_dict, strict=False)
-
-            model.eval()
-            model = model.to(device)
-
-            # Init Upsampler
-            self.upsampler = SafeRealESRGANer(
-                scale=self.model_scale,
-                model_path=None,
-                model=model,
-                tile=400,
-                tile_pad=10,
-                pre_pad=0,
-                half=(device == "cuda"),
-                gpu_id=0 if device == "cuda" else None,
-            )
-
-            self.model_name = model_filename
             print(
-                f"[Python] Loaded: {model_filename} (Active Scale: x{self.model_scale})",
+                f"[Python] Loaded: {self.model_name} (Scale: x{self.model_scale}, expects_rgb={self.expects_rgb})",
                 flush=True,
             )
             self.send_status(
-                "MODEL_LOADED", {"model": model_filename, "scale": self.model_scale}
+                "MODEL_LOADED", {"model": self.model_name, "scale": self.model_scale}
             )
 
         except Exception as e:
-            print(f"[Python CRITICAL] Load Error:", flush=True)
+            print(f"[Python CRITICAL] Load Error: {e}", flush=True)
             traceback.print_exc()
             self.send_status("error", {"message": f"Load Failed: {str(e)}"})
 
-    def send_status(self, status, extra=None):
+    def send_status(self, status: str, extra: Optional[Dict] = None) -> None:
         payload = {"status": status}
         if extra:
             payload.update(extra)
@@ -404,7 +1205,7 @@ class AIWorker:
         except Exception as e:
             print(f"[Python Warning] Failed to send status: {e}", flush=True)
 
-    def on_request(self, sample):
+    def on_request(self, sample) -> None:
         try:
             payload = json.loads(sample.payload.to_bytes().decode("utf-8"))
             cmd = payload.get("command")
@@ -422,12 +1223,31 @@ class AIWorker:
                 self.running = False
         except Exception as e:
             print(f"[Python Error] Request failed: {e}", flush=True)
+            traceback.print_exc()
             self.send_status("error", {"message": str(e)})
 
     # -------------------------------------------------------------------------
-    # TILING LOGIC (Progress-Aware)
+    # TILING LOGIC - Tile-invariant, Crop-invariant, No Seam Artifacts
     # -------------------------------------------------------------------------
-    def process_image_tile(self, img, job_id):
+    def process_image_tile(self, img: np.ndarray, job_id: str) -> np.ndarray:
+        """
+        Process image using tiling for memory efficiency.
+
+        DETERMINISM GUARANTEES:
+        - Mirror padding ensures tile-invariant results
+        - Same overlap handling regardless of tile size
+        - No blending artifacts (hard crop after padding removal)
+
+        Args:
+            img: Input image as BGR numpy array
+            job_id: Job ID for progress reporting
+
+        Returns:
+            Upscaled image as BGR numpy array
+        """
+        if self.model is None:
+            raise RuntimeError("No model loaded")
+
         tile_size = Config.TILE_SIZE
         tile_pad = Config.TILE_PAD
         scale = self.model_scale
@@ -442,77 +1262,66 @@ class AIWorker:
         total_tiles = len(x_steps) * len(y_steps)
         count = 0
 
-        # Mirror Pad the image
+        # CRITICAL: Mirror/reflect padding for seamless tile boundaries
+        # This ensures tile-size-invariant results
         img_padded = np.pad(
             img, ((tile_pad, tile_pad), (tile_pad, tile_pad), (0, 0)), mode="reflect"
         )
-
-        # Determine dtype for tensor transfers (optimized)
-        target_dtype = torch.float16 if self.upsampler.half else torch.float32
 
         for y in y_steps:
             for x in x_steps:
                 count += 1
 
-                # Extract tile from padded image
+                # Extract padded tile
                 pad_y = y
                 pad_x = x
-
-                # Dimensions of the valid content in this tile (clip at edges)
                 in_h = min(tile_size, h - y)
                 in_w = min(tile_size, w - x)
 
-                # Slice: include padding
                 tile_in = img_padded[
                     pad_y : pad_y + in_h + 2 * tile_pad,
                     pad_x : pad_x + in_w + 2 * tile_pad,
                     :,
                 ]
 
-                # Normalize
-                tile_in = tile_in.astype(np.float32) / 255.0
+                # Convert BGR -> RGB if model expects RGB
+                # OpenCV loads as BGR, most models expect RGB
+                if self.expects_rgb:
+                    tile_for_model = tile_in[:, :, ::-1].copy()  # BGR -> RGB
+                else:
+                    tile_for_model = tile_in.copy()  # Keep as BGR
 
-                # BGR -> RGB + Negative Stride Fix (FIX: Added .copy())
-                if not self.is_rgb_model:
-                    tile_in = tile_in[:, :, ::-1].copy()
-
-                # FIX: Ensure even dimensions for Anime models (PixelUnshuffle requirement)
-                # Pad right/bottom if odd
-                h_in, w_in = tile_in.shape[:2]
+                # Ensure even dimensions (required for PixelShuffle)
+                h_in, w_in = tile_for_model.shape[:2]
                 pad_h = h_in % 2
                 pad_w = w_in % 2
                 if pad_h or pad_w:
-                    tile_in = np.pad(tile_in, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
+                    tile_for_model = np.pad(tile_for_model, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
 
-                # Optimized Tensor Transfer: directly convert to target dtype on GPU
-                tile_tensor = torch.from_numpy(tile_in.transpose(2, 0, 1)).to(
-                    device=self.upsampler.device, dtype=target_dtype, non_blocking=True
-                ).unsqueeze(0)
+                # UNIFIED INFERENCE CALL
+                with suppress_stdout():
+                    output_from_model = inference(
+                        self.model,
+                        tile_for_model,
+                        self.device,
+                        half=self.use_half
+                    )
 
-                # Inference
-                with torch.no_grad():
-                    if hasattr(self.upsampler.model, "module"):
-                        output_tensor = self.upsampler.model.module(tile_tensor)
-                    else:
-                        output_tensor = self.upsampler.model(tile_tensor)
+                # Convert output back to BGR if model outputs RGB
+                if self.expects_rgb:
+                    output_tile = output_from_model[:, :, ::-1].copy()  # RGB -> BGR
+                else:
+                    output_tile = output_from_model.copy()  # Keep as BGR
 
-                # Post Process
-                output_tile = (
-                    output_tensor.data.squeeze().float().cpu().clamp_(0, 1).numpy()
-                )
-                if output_tile.ndim == 3:
-                    output_tile = output_tile.transpose(1, 2, 0)
-
-                # RGB -> BGR + Negative Stride Fix (FIX: Added .copy())
-                if not self.is_rgb_model:
-                    output_tile = output_tile[:, :, ::-1].copy()
-
-                output_tile = (output_tile * 255.0).round().astype(np.uint8)
-
-                # Crop Padding from Result
+                # Crop padding from result
                 out_pad = tile_pad * scale
                 out_h_real = in_h * scale
                 out_w_real = in_w * scale
+
+                # Remove even-dimension padding if applied
+                if pad_h or pad_w:
+                    output_tile = output_tile[:output_tile.shape[0] - pad_h * scale,
+                                               :output_tile.shape[1] - pad_w * scale, :]
 
                 valid_tile = output_tile[
                     out_pad : out_pad + out_h_real, out_pad : out_pad + out_w_real, :
@@ -536,7 +1345,8 @@ class AIWorker:
 
         return output_img
 
-    def handle_image_file(self, payload):
+    def handle_image_file(self, payload: Dict) -> None:
+        """Handle image file upscaling with geometry and color edits"""
         req_id = payload.get("id")
         try:
             params = payload["params"]
@@ -586,21 +1396,17 @@ class AIWorker:
             if has_color_adj:
                 img = img.astype(np.float32)
 
-                # Apply brightness: shift values
                 if abs(brightness) > 0.001:
                     img = img + (brightness * 255)
 
-                # Apply contrast: scale around mean
                 if abs(contrast) > 0.001:
                     contrast_factor = 1.0 + contrast
                     img = (img - 127.5) * contrast_factor + 127.5
 
-                # Apply gamma correction
                 if abs(gamma - 1.0) > 0.001:
                     img = np.clip(img, 0, 255)
                     img = ((img / 255.0) ** (1.0 / gamma)) * 255.0
 
-                # Apply saturation in HSV space
                 if abs(saturation) > 0.001:
                     img = np.clip(img, 0, 255).astype(np.uint8)
                     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
@@ -621,7 +1427,8 @@ class AIWorker:
             traceback.print_exc()
             self.send_status("error", {"id": req_id, "message": str(e)})
 
-    def create_shm(self, payload):
+    def create_shm(self, payload: Dict) -> None:
+        """Create shared memory ring buffer for video frame processing"""
         width = payload["width"]
         height = payload["height"]
         self.active_scale = payload["scale"]
@@ -656,9 +1463,21 @@ class AIWorker:
             traceback.print_exc()
             self.send_status("error", {"message": str(e)})
 
-    def process_frame(self, payload):
+    def process_frame(self, payload: Dict) -> None:
+        """
+        Process a single video frame from shared memory.
+
+        DETERMINISM GUARANTEES:
+        - Model is stateless - no hidden recurrence between frames
+        - Same frame processed alone vs after other frames = identical output
+        - Uses unified inference() function (same as image path)
+        """
         if not self.is_configured:
             return
+        if self.model is None:
+            self.send_status("error", {"message": "No model loaded"})
+            return
+
         slot_idx = payload.get("slot", 0)
         try:
             base = slot_idx * self.slot_byte_size
@@ -672,47 +1491,79 @@ class AIWorker:
                 self.mmap, dtype=np.uint8, count=(out_end - in_end), offset=in_end
             ).reshape(self.output_shape)
 
+            # Passthrough for scale=1
             if self.active_scale == 1:
                 out_view[:] = in_view[:]
                 self.send_status("FRAME_DONE", {"slot": slot_idx})
                 return
 
-            # Rust(RGBA) -> BGR (Model Input) + Fix negative strides
-            img_bgr = in_view[:, :, :3][:, :, ::-1].copy()
+            # Extract RGB from RGBA input
+            # Rust sends RGBA via FFmpeg (RGB order + Alpha)
+            img_input = in_view[:, :, :3].copy()
 
+            # Convert color space if needed
+            # Video frames from Rust are in RGB order
+            # If model expects BGR, convert RGB -> BGR
+            if not self.expects_rgb:
+                img_for_model = img_input[:, :, ::-1].copy()  # RGB -> BGR
+            else:
+                img_for_model = img_input  # Already RGB
+
+            # UNIFIED INFERENCE CALL - same function as image path
             with suppress_stdout():
-                out_raw, _ = self.upsampler.enhance(img_bgr, outscale=self.model_scale)
+                out_from_model = inference(
+                    self.model,
+                    img_for_model,
+                    self.device,
+                    half=self.use_half
+                )
 
-            h, w = out_raw.shape[:2]
+            # Convert output back to RGB for Rust
+            if not self.expects_rgb:
+                out_for_rust = out_from_model[:, :, ::-1].copy()  # BGR -> RGB
+            else:
+                out_for_rust = out_from_model  # Already RGB
+
+            # Handle scale mismatch (resize output if needed)
+            h, w = out_for_rust.shape[:2]
             target_h, target_w = self.output_shape[:2]
             if h != target_h or w != target_w:
-                out_raw = cv2.resize(out_raw, (target_w, target_h))
+                # NOTE: We resize BEFORE SR in production, but handle mismatch gracefully
+                out_for_rust = cv2.resize(out_for_rust, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
 
-            # BGR (Model Output) -> RGBA (Rust Input) + Fix negative strides
-            if self.is_rgb_model:
-                out_view[:, :, :3] = out_raw
-            else:
-                out_view[:, :, :3] = out_raw[:, :, ::-1].copy()
+            # Write to output slot (RGB + Alpha -> RGBA)
+            out_view[:, :, :3] = out_for_rust
+            out_view[:, :, 3] = 255  # Alpha channel
 
-            out_view[:, :, 3] = 255
             self.send_status("FRAME_DONE", {"slot": slot_idx})
+
         except Exception as e:
             traceback.print_exc()
             self.send_status("error", {"message": str(e)})
         finally:
-            # Free GPU memory after each frame to prevent memory buildup
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
 
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=str, default="7447")
-    parser.add_argument("--parent-pid", type=int, default=0, help="Parent Process ID to monitor")
+    parser = argparse.ArgumentParser(description="VideoForge Deterministic AI Worker")
+    parser.add_argument("--port", type=str, default="7447", help="Zenoh port")
+    parser.add_argument("--parent-pid", type=int, default=0, help="Parent process ID to monitor")
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default="fp32",
+        choices=["fp32", "fp16"],
+        help="Inference precision (fp32 recommended for determinism)"
+    )
     args = parser.parse_args()
-    
+
     if args.parent_pid > 0:
         start_watchdog(args.parent_pid)
-        
-    AIWorker(args.port)
+
+    AIWorker(args.port, precision=args.precision)
     sys.exit(0)

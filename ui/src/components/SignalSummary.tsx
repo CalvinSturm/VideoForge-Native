@@ -7,6 +7,7 @@ interface SignalSummaryProps {
   targetResolution: string;
   targetDetail?: string; // e.g. "3840x2160"
   targetFps: string;
+  modelLabel?: string; // e.g. "RCAN 4×"
   className?: string;
 }
 
@@ -17,6 +18,7 @@ export const SignalSummary: React.FC<SignalSummaryProps> = ({
   targetResolution,
   targetDetail,
   targetFps,
+  modelLabel,
   className
 }) => {
   return (
@@ -46,7 +48,7 @@ export const SignalSummary: React.FC<SignalSummaryProps> = ({
             userSelect: 'none'
           }}
         >
-          SOURCE
+          ORIGINAL
         </span>
         <div style={{ display: 'flex', alignItems: 'flex-end', gap: '6px' }}>
           <div style={{ display: 'flex', flexDirection: 'column' }}>
@@ -60,9 +62,9 @@ export const SignalSummary: React.FC<SignalSummaryProps> = ({
             )}
           </div>
           {sourceFps && (
-             <span style={{ fontSize: '10px', color: '#52525b', fontFamily: 'var(--font-mono)', marginBottom: sourceDetail ? '2px' : '1px' }}>
-               {sourceFps}
-             </span>
+            <span style={{ fontSize: '10px', color: '#52525b', fontFamily: 'var(--font-mono)', marginBottom: sourceDetail ? '2px' : '1px' }}>
+              {sourceFps}
+            </span>
           )}
         </div>
       </div>
@@ -74,23 +76,30 @@ export const SignalSummary: React.FC<SignalSummaryProps> = ({
 
       {/* TARGET: User Intent */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', alignItems: 'flex-end', textAlign: 'right' }}>
-        <span
-          style={{
-            fontSize: '9px',
-            textTransform: 'uppercase',
-            color: 'var(--brand-primary)',
-            letterSpacing: '0.05em',
-            fontWeight: 700,
-            userSelect: 'none'
-          }}
-        >
-          TARGET
-        </span>
+        <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+          <span
+            style={{
+              fontSize: '9px',
+              textTransform: 'uppercase',
+              color: 'var(--brand-primary)',
+              letterSpacing: '0.05em',
+              fontWeight: 700,
+              userSelect: 'none'
+            }}
+          >
+            FINAL
+          </span>
+          {modelLabel && (
+            <span style={{ fontSize: '9px', color: '#52525b', fontWeight: 600 }}>
+              ({modelLabel})
+            </span>
+          )}
+        </div>
         <div style={{ display: 'flex', alignItems: 'flex-end', gap: '6px' }}>
           {targetFps && (
-             <span style={{ fontSize: '10px', color: 'var(--brand-primary)', fontFamily: 'var(--font-mono)', marginBottom: targetDetail ? '2px' : '1px', opacity: 0.8 }}>
-               {targetFps}
-             </span>
+            <span style={{ fontSize: '10px', color: 'var(--brand-primary)', fontFamily: 'var(--font-mono)', marginBottom: targetDetail ? '2px' : '1px', opacity: 0.8 }}>
+              {targetFps}
+            </span>
           )}
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
             <span style={{ fontSize: '12px', color: '#ffffff', fontWeight: 800 }}>

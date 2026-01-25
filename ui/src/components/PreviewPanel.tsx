@@ -107,53 +107,45 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
             const end = editState.trimEnd;
 
             // --- A. PAUSE ON COMPLETION (No Loop) ---
-            // User requested to pause at end instead of looping to avoid sync lag
-
-            // 1. Sample Preview Limit (2s default + start)
             if (videoState.samplePreview) {
+               // Sample previews are usually short snippets starting at trimStart
                if (t >= start + 2.0) {
                   source.pause();
+                  result.pause();
                   source.currentTime = start;
-                  result.currentTime = 0; // Result is 0-based for samples
+                  result.currentTime = 0;
                   setIsPlaying(false);
                   return;
                }
-            }
-            // 2. Standard Trim Limit
-            else if (end > 0 && end < videoState.duration) {
+            } else if (end > 0 && end < videoState.duration) {
                if (t >= end) {
                   source.pause();
+                  result.pause();
                   source.currentTime = start;
                   result.currentTime = start;
                   setIsPlaying(false);
                   return;
                }
-            }
-            // 3. Natural End (Full Video)
-            else if (source.ended) {
-               source.currentTime = start;
-               if (result) result.currentTime = start;
+            } else if (source.ended) {
                setIsPlaying(false);
                return;
             }
 
             // --- B. BUFFERING / SEEK PROTECTION ---
-            // If result is struggling (seeking or buffering), pause source to wait for it.
-            // This prevents "Death Spiral" where source keeps advancing, forcing result to seek repeatedly.
-            const isResultNotReady = result.seeking || result.readyState < 3; // 3 = HAVE_FUTURE_DATA
+            // If result (ENHANCED) is struggling, we MUST pause source (ORIGINAL) to let it catch up.
+            // resultVideoRef is often much heavier (4K vs 1080p).
+            const isResultBuffering = result.readyState < 3; // HAVE_FUTURE_DATA
+            const isResultSeeking = result.seeking;
 
-            if (isResultNotReady) {
-               source.pause();
-            } else if (isPlaying && source.paused) {
-               // Only resume if we are globally "Playing" and source was paused by us (or stalled)
-               source.play();
-            }
+            if (isResultBuffering || isResultSeeking) {
+               if (!source.paused) source.pause();
+            } else {
+               if (source.paused && isPlaying) {
+                  source.play().catch(() => { });
+               }
 
-            // --- C. SYNC CORRECTION ---
-            // Only sync if result is playing normally
-            if (!isResultNotReady) {
+               // --- C. SYNC CORRECTION ---
                let targetTime = 0;
-
                if (videoState.samplePreview) {
                   targetTime = source.currentTime - start;
                   if (targetTime < 0) targetTime = 0;
@@ -162,8 +154,9 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
                }
 
                const diff = Math.abs(result.currentTime - targetTime);
-               // Threshold: 0.08s (~2-3 frames at 30fps) - Increased from 0.04 to prevent jitter
-               if (diff > 0.08) {
+               // Tightened threshold: 0.04s (approx 1 frame at 24fps)
+               // Result video usually follows source. We only seek result if it drifts.
+               if (diff > 0.04) {
                   result.currentTime = targetTime;
                }
             }

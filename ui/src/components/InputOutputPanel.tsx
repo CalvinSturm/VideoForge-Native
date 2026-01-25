@@ -3,25 +3,48 @@ import type { EditState, VideoState, UpscaleMode } from "../types";
 import { SignalSummary } from "./SignalSummary";
 
 // --- ICONS ---
-// (Icons are unchanged, keeping them brief for this output)
 const IconCamera = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" /><circle cx="12" cy="13" r="4" /></svg>;
 const IconRotateCW = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" /></svg>;
 const IconRotateCCW = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 1 0 2.12-9.36L1 10" /></svg>;
 const IconFlipH = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v18" /><path d="M16 7l4 5-4 5" /><path d="M8 7l-4 5 4 5" /></svg>;
 const IconFlipV = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12h18" /><path d="M7 8L12 4l5 4" /><path d="M7 16l5 4 5-4" /></svg>;
-const IconAnimation = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" /></svg>;
 const IconImport = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>;
 const IconSave = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" /></svg>;
 const IconPlay = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="5 3 19 12 5 21 5 3" /></svg>;
 const IconFlash = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" /></svg>;
 const IconFile = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" /><polyline points="13 2 13 9 20 9" /></svg>;
 const IconFilm = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18" /><line x1="7" y1="2" x2="7" y2="22" /><line x1="17" y1="2" x2="17" y2="22" /><line x1="2" y1="12" x2="22" y2="12" /><line x1="2" y1="7" x2="7" y2="7" /><line x1="2" y1="17" x2="7" y2="17" /><line x1="17" y1="17" x2="22" y2="17" /><line x1="17" y1="7" x2="22" y2="7" /></svg>;
+const IconShield = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /></svg>;
+const IconSparkles = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3z" /><path d="M5 19l.5 1.5L7 21l-1.5.5L5 23l-.5-1.5L3 21l1.5-.5L5 19z" /><path d="M19 12l.5 1.5L21 14l-1.5.5L19 16l-.5-1.5L17 14l1.5-.5L19 12z" /></svg>;
+const IconLock = () => <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></svg>;
+const IconInfo = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="12" y1="16" x2="12" y2="12" /><line x1="12" y1="8" x2="12.01" y2="8" /></svg>;
+const IconCheck = () => <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>;
 
 // --- CONFIGURATION ---
-const MODEL_MAP = {
-  real: { quality: "RealESRGAN_x4plus.pth", speed: "RealESRGAN_x2plus.pth" },
-  anime: { quality: "RealESRGAN_x4plus_anime_6B.pth", speed: "RealESRGAN_x2plus_anime_6B.pth" }
+type AIModel = 'RCAN' | 'EDSR';
+type CreativeModel = 'REALISTIC' | 'ANIME';
+type EnhancementMode = 'archival' | 'creative';
+type UpscaleScale = 2 | 3 | 4;
+
+// Canonical model identifiers sent to backend
+// Format: {MODEL}_x{SCALE} - backend resolves to actual weight files
+const ARCHIVAL_MAP: Record<AIModel, Record<UpscaleScale, string>> = {
+  RCAN: { 2: "RCAN_x2", 3: "RCAN_x3", 4: "RCAN_x4" },
+  EDSR: { 2: "EDSR_x2", 3: "EDSR_x3", 4: "EDSR_x4" }
 };
+
+// Creative mode uses RealESRGAN (only 2x and 4x for realistic, 4x only for anime)
+const CREATIVE_MAP: Record<CreativeModel, Partial<Record<UpscaleScale, string>>> = {
+  REALISTIC: { 2: "RealESRGAN_x2plus", 4: "RealESRGAN_x4plus" },
+  ANIME: { 4: "RealESRGAN_x4plus_anime_6B" }  // Note: No 2x anime model exists in official RealESRGAN
+};
+
+// Scale options with labels
+const SCALE_OPTIONS: { value: UpscaleScale; label: string; sub: string }[] = [
+  { value: 4, label: "4×", sub: "QUALITY" },
+  { value: 3, label: "3×", sub: "BALANCED" },
+  { value: 2, label: "2×", sub: "FAST" }
+];
 
 const ASPECT_RATIOS = [
   { label: "FREE", value: null },
@@ -39,8 +62,6 @@ const FPS_OPTIONS = [
   { value: 120, label: "120 FPS", sub: "SLOW-MO" },
 ];
 
-const getModelScale = (name: string): number => name.includes("x2") ? 2 : 4;
-
 const getSmartResInfo = (w: number, h: number) => {
   if (w === 0 || h === 0) return { label: "---", detail: "" };
   const min = Math.min(w, h);
@@ -54,21 +75,124 @@ const getSmartResInfo = (w: number, h: number) => {
   return { label: dims, detail: "" };
 };
 
-// --- NEW COMPONENT: Smart Path Truncation ---
+// --- TOOLTIP COMPONENT ---
+const Tooltip: React.FC<{ text: string; children: React.ReactNode; position?: 'top' | 'bottom' }> = ({
+  text,
+  children,
+  position = 'top'
+}) => {
+  const [isVisible, setIsVisible] = useState(false);
+  const [isMounted, setIsMounted] = useState(false);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showTooltip = () => {
+    timeoutRef.current = setTimeout(() => {
+      setIsMounted(true);
+      requestAnimationFrame(() => setIsVisible(true));
+    }, 400);
+  };
+
+  const hideTooltip = () => {
+    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    setIsVisible(false);
+    setTimeout(() => setIsMounted(false), 100);
+  };
+
+  return (
+    <div
+      style={{ position: 'relative', display: 'inline-flex' }}
+      onMouseEnter={showTooltip}
+      onMouseLeave={hideTooltip}
+      onFocus={showTooltip}
+      onBlur={hideTooltip}
+    >
+      {children}
+      {isMounted && (
+        <div style={{
+          position: 'absolute',
+          [position === 'top' ? 'bottom' : 'top']: '100%',
+          left: '50%',
+          transform: `translateX(-50%) translateY(${position === 'top' ? '-8px' : '8px'})`,
+          padding: '8px 12px',
+          background: '#1a1a1c',
+          border: '1px solid rgba(255,255,255,0.15)',
+          borderRadius: '6px',
+          fontSize: '10px',
+          color: '#e0e0e0',
+          whiteSpace: 'normal',
+          maxWidth: '240px',
+          zIndex: 1000,
+          boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+          opacity: isVisible ? 1 : 0,
+          transition: 'opacity 100ms ease, transform 100ms ease',
+          pointerEvents: 'none',
+          lineHeight: 1.4
+        }}>
+          {text}
+          <div style={{
+            position: 'absolute',
+            [position === 'top' ? 'bottom' : 'top']: '-5px',
+            left: '50%',
+            transform: 'translateX(-50%) rotate(45deg)',
+            width: '8px',
+            height: '8px',
+            background: '#1a1a1c',
+            border: position === 'top'
+              ? '1px solid rgba(255,255,255,0.15)'
+              : '1px solid rgba(255,255,255,0.15)',
+            borderTop: position === 'top' ? 'none' : '1px solid rgba(255,255,255,0.15)',
+            borderLeft: position === 'top' ? 'none' : '1px solid rgba(255,255,255,0.15)',
+            borderBottom: position === 'top' ? '1px solid rgba(255,255,255,0.15)' : 'none',
+            borderRight: position === 'top' ? '1px solid rgba(255,255,255,0.15)' : 'none',
+          }} />
+        </div>
+      )}
+    </div>
+  );
+};
+
+// --- TOAST COMPONENT ---
+const ToastNotification: React.FC<{ message: string; visible: boolean; onDismiss: () => void }> = ({ message, visible, onDismiss }) => {
+  const [render, setRender] = useState(visible);
+
+  useEffect(() => {
+    if (visible) setRender(true);
+    else setTimeout(() => setRender(false), 300); // Wait for exit animation
+  }, [visible]);
+
+  if (!render) return null;
+
+  return (
+    <div style={{
+      position: 'absolute', top: '16px', right: '16px', zIndex: 2000,
+      background: '#1a1a1c', border: '1px solid rgba(255,255,255,0.1)',
+      borderLeft: '3px solid #fbbf24', // Amber warning color
+      borderRadius: '4px', padding: '10px 12px',
+      boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+      display: 'flex', alignItems: 'center', gap: '10px',
+      transform: visible ? 'translateX(0)' : 'translateX(100%)',
+      opacity: visible ? 1 : 0,
+      transition: 'all 0.3s cubic-bezier(0.16, 1, 0.3, 1)',
+      maxWidth: '260px'
+    }}>
+      <span style={{ fontSize: '11px', color: '#ededed', fontFamily: 'var(--font-sans)', fontWeight: 500 }}>{message}</span>
+      <button onClick={onDismiss} style={{
+        background: 'transparent', border: 'none', color: '#aaa', cursor: 'pointer', padding: '0 4px', fontSize: '14px'
+      }}>×</button>
+    </div>
+  );
+};
+
+// --- SMART PATH TRUNCATION ---
 const SmartPath: React.FC<{ path: string; placeholder?: string }> = ({ path, placeholder }) => {
   if (!path) return <bdo dir="ltr">{placeholder || ""}</bdo>;
 
   const formatPath = (p: string) => {
-    // If it's reasonably short, just show it
     if (p.length < 45) return p;
-
-    // Split logic
     const parts = p.split(/[/\\]/);
-    if (parts.length < 3) return p; // Can't compact effectively
-
+    if (parts.length < 3) return p;
     const filename = parts.pop();
     const drive = parts.shift();
-    // Reconstruct with middle truncation
     return `${drive}\\...\\${filename}`;
   };
 
@@ -80,44 +204,63 @@ const SmartPath: React.FC<{ path: string; placeholder?: string }> = ({ path, pla
 };
 
 // --- SUB-COMPONENTS ---
-const SelectionCard = ({ selected, onClick, title, subtitle, icon, disabled }: any) => (
+const SelectionCard = ({ selected, onClick, title, subtitle, icon, disabled, badge }: {
+  selected: boolean;
+  onClick: () => void;
+  title: string;
+  subtitle: string;
+  icon: React.ReactNode;
+  disabled?: boolean;
+  badge?: React.ReactNode;
+}) => (
   <button onClick={onClick} disabled={disabled} style={{
     flex: 1, display: "flex", flexDirection: "column", alignItems: "flex-start", justifyContent: "center",
     height: "64px", padding: "8px 12px", minWidth: "130px",
-    background: selected ? "var(--brand-dim)" : "var(--panel-bg)",
-    border: selected ? "1px solid var(--brand-primary)" : "1px solid var(--panel-border)",
-    borderTop: selected ? "1px solid var(--brand-primary)" : "1px solid var(--panel-border)",
+    background: selected && !disabled ? "var(--brand-dim)" : "var(--panel-bg)",
+    border: selected && !disabled ? "1px solid var(--brand-primary)" : "1px solid var(--panel-border)",
     borderRadius: "6px", cursor: disabled ? "not-allowed" : "pointer",
     transition: "all 0.15s ease", position: "relative", overflow: "hidden",
-    opacity: disabled ? 0.3 : 1,
-    boxShadow: selected ? "0 0 10px rgba(0,255,136,0.1)" : "var(--shadow-sm)"
+    opacity: disabled ? 0.5 : 1,
+    boxShadow: selected && !disabled ? "0 0 10px rgba(0,255,136,0.1)" : "var(--shadow-sm)"
   }}>
-    <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px" }}>
+    <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px", width: '100%' }}>
       <div style={{ color: selected && !disabled ? "var(--brand-primary)" : "var(--text-muted)" }}>{icon}</div>
-      <span style={{ fontWeight: 700, fontSize: "11px", color: selected && !disabled ? "var(--text-primary)" : "var(--text-secondary)", fontFamily: 'var(--font-sans)', letterSpacing: '0.02em' }}>{title}</span>
+      <span style={{ fontWeight: 700, fontSize: "11px", color: selected && !disabled ? "var(--text-primary)" : "var(--text-secondary)", fontFamily: 'var(--font-sans)', letterSpacing: '0.02em', flex: 1 }}>{title}</span>
+      {badge}
     </div>
     <span style={{ fontSize: "9px", color: "var(--text-muted)", marginLeft: "24px", fontFamily: 'var(--font-sans)' }}>{subtitle}</span>
     {selected && !disabled && <div style={{ position: "absolute", top: 0, right: 0, width: 0, height: 0, borderTop: "8px solid var(--brand-primary)", borderLeft: "8px solid transparent" }} />}
   </button>
 );
 
-const ToggleGroup = ({ options, value, onChange, disabled }: any) => (
+const ToggleGroup = ({ options, value, onChange, disabled }: {
+  options: { label: string; sub?: string; value: any; disabled?: boolean }[];
+  value: any;
+  onChange: (v: any) => void;
+  disabled?: boolean;
+}) => (
   <div style={{
     display: "flex", background: "var(--input-bg)", padding: "3px", borderRadius: "6px",
     border: "1px solid rgba(255,255,255,0.08)", boxShadow: "inset 0 2px 4px rgba(0,0,0,0.05)",
     opacity: disabled ? 0.5 : 1, pointerEvents: disabled ? 'none' : 'auto'
   }}>
-    {options.map((opt: any) => {
+    {options.map((opt) => {
       const isActive = value === opt.value;
+      const isOptDisabled = opt.disabled;
       return (
-        <button key={opt.label} onClick={() => onChange(opt.value)}
-          className={isActive ? "toggle-active" : ""}
+        <button
+          key={opt.label}
+          onClick={() => !isOptDisabled && onChange(opt.value)}
+          className={isActive && !isOptDisabled ? "toggle-active" : ""}
+          disabled={isOptDisabled}
           style={{
             flex: 1, height: "30px", border: "none", borderRadius: "4px", minWidth: "60px",
-            background: "transparent", color: "var(--text-muted)",
+            background: "transparent", color: isOptDisabled ? "var(--text-muted)" : "var(--text-muted)",
             fontSize: "10px", fontWeight: 500, fontFamily: 'var(--font-sans)',
             display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', lineHeight: 1.1,
-            boxShadow: isActive ? "0 2px 4px rgba(0,0,0,0.4)" : "none"
+            boxShadow: isActive && !isOptDisabled ? "0 2px 4px rgba(0,0,0,0.4)" : "none",
+            opacity: isOptDisabled ? 0.4 : 1,
+            cursor: isOptDisabled ? 'not-allowed' : 'pointer'
           }}
         >
           <span>{opt.label}</span>
@@ -128,7 +271,13 @@ const ToggleGroup = ({ options, value, onChange, disabled }: any) => (
   </div>
 );
 
-const Section = ({ title, children, defaultOpen = true, extra }: any) => {
+const Section = ({ title, children, defaultOpen = true, extra, badge }: {
+  title: string;
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+  extra?: React.ReactNode;
+  badge?: React.ReactNode;
+}) => {
   const [isOpen, setIsOpen] = useState(defaultOpen);
   return (
     <div style={{
@@ -144,13 +293,20 @@ const Section = ({ title, children, defaultOpen = true, extra }: any) => {
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1 }}>
           <h3 style={{ margin: 0, color: "var(--text-secondary)", fontSize: "10px" }}>{title}</h3>
+          {badge}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           {extra}
-          <span style={{ fontSize: "8px", color: "var(--text-muted)", transform: isOpen ? "rotate(0deg)" : "rotate(-90deg)" }}>▼</span>
+          <span style={{ fontSize: "8px", color: "var(--text-muted)", transform: isOpen ? "rotate(0deg)" : "rotate(-90deg)", transition: 'transform 0.15s' }}>▼</span>
         </div>
       </div>
-      {isOpen && <div style={{ padding: "14px", display: "flex", flexDirection: "column", gap: "14px" }}>{children}</div>}
+      <div style={{
+        maxHeight: isOpen ? '1000px' : '0',
+        overflow: 'hidden',
+        transition: 'max-height 0.2s ease-out'
+      }}>
+        <div style={{ padding: "14px", display: "flex", flexDirection: "column", gap: "14px" }}>{children}</div>
+      </div>
     </div>
   );
 };
@@ -197,6 +353,39 @@ const ColorSlider = ({ label, value, onChange, min = -1, max = 1, step = 0.01, f
   );
 };
 
+// --- DETERMINISTIC BADGE ---
+const DeterministicBadge: React.FC<{ mode: EnhancementMode }> = ({ mode }) => {
+  if (mode === 'archival') {
+    return (
+      <Tooltip text="Frame-stable output. Identical results on every run. Recommended for professional workflows.">
+        <div style={{
+          display: 'inline-flex', alignItems: 'center', gap: '4px',
+          padding: '2px 6px', borderRadius: '3px',
+          background: 'rgba(0, 255, 136, 0.1)',
+          border: '1px solid rgba(0, 255, 136, 0.2)',
+          fontSize: '8px', fontWeight: 600, color: 'var(--brand-primary)',
+          letterSpacing: '0.03em', cursor: 'help'
+        }}>
+          <IconCheck />
+          DETERMINISTIC
+        </div>
+      </Tooltip>
+    );
+  }
+  return (
+    <div style={{
+      display: 'inline-flex', alignItems: 'center', gap: '4px',
+      padding: '2px 6px', borderRadius: '3px',
+      background: 'rgba(251, 191, 36, 0.1)',
+      border: '1px solid rgba(251, 191, 36, 0.2)',
+      fontSize: '8px', fontWeight: 600, color: '#fbbf24',
+      letterSpacing: '0.03em'
+    }}>
+      ENHANCED
+    </div>
+  );
+};
+
 interface InputOutputPanelProps {
   mode: UpscaleMode; setMode: (mode: UpscaleMode) => void;
   pickInput: () => void; inputPath: string;
@@ -218,44 +407,112 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
   const panelRef = useRef<HTMLDivElement>(null);
   const [isAIActive, setIsAIActive] = useState(true);
 
-  // Intent State: We track the user's intended scale specifically
-  // This allows us to map "Anime Speed (2x)" to an x4 model but request 2x output
-  const [scalingMode, setScalingMode] = useState<'auto' | 2 | 4>('auto');
+  // New state for deterministic upscaler UI
+  const [enhancementMode, setEnhancementMode] = useState<EnhancementMode>('archival');
+  const [aiModel, setAiModel] = useState<AIModel>('RCAN');
+  const [creativeModel, setCreativeModel] = useState<CreativeModel>('REALISTIC');
+  const [upscaleFactor, setUpscaleFactor] = useState<UpscaleScale>(4);
+  const [toastState, setToastState] = useState<{ msg: string; visible: boolean }>({ msg: '', visible: false });
 
-  // Auto-correct invalid model selection (e.g. if file was removed)
+  const showToast = (msg: string) => {
+    setToastState({ msg, visible: true });
+    setTimeout(() => setToastState(s => ({ ...s, visible: false })), 4000);
+  };
+
+  // Compute the full model identifier for the backend
+  const computedModelId = useMemo((): string => {
+    if (enhancementMode === 'archival') {
+      return ARCHIVAL_MAP[aiModel][upscaleFactor];
+    }
+    // Creative mode - fallback to 4x if 3x not available
+    const creativeId = CREATIVE_MAP[creativeModel][upscaleFactor];
+    if (!creativeId && upscaleFactor === 3) {
+      return CREATIVE_MAP[creativeModel][4] ?? CREATIVE_MAP[creativeModel][2] ?? "RealESRGAN_x4plus";
+    }
+    return creativeId ?? CREATIVE_MAP[creativeModel][4] ?? "RealESRGAN_x4plus";
+  }, [enhancementMode, aiModel, creativeModel, upscaleFactor]);
+
+  // Sync with parent when our computed model changes
   useEffect(() => {
-    if (availableModels.length > 0 && !availableModels.includes(model)) {
-      console.log(`[UI] Model ${model} not available. Attempting fallback...`);
+    if (computedModelId !== model) {
+      setModel(computedModelId);
+      loadModel(computedModelId);
+    }
+  }, [computedModelId, model, setModel, loadModel]);
 
-      const isAnime = model.toLowerCase().includes("anime");
-      const isX2 = model.toLowerCase().includes("x2");
+  // Check model availability
+  const isRCANAvailable = useMemo(() => {
+    return availableModels.some(m => m.toUpperCase().includes('RCAN'));
+  }, [availableModels]);
 
-      // Determine fallback target
-      let fallback = isAnime ? MODEL_MAP.anime.quality : MODEL_MAP.real.quality;
+  const isEDSRAvailable = useMemo(() => {
+    return availableModels.some(m => m.toUpperCase().includes('EDSR'));
+  }, [availableModels]);
 
-      // If we are specifically fixing the "Animation 2x" case:
-      if (isAnime && isX2) {
-        fallback = MODEL_MAP.anime.speed; // This now points to x4 file
-        setScalingMode(2); // Preserve 2x intent
+  const isScale4Available = useMemo(() => {
+    if (enhancementMode === 'creative') return true; // Creative always has 4x
+    const currentModelBase = aiModel;
+    return availableModels.some(m =>
+      m.toUpperCase().includes(currentModelBase) && m.includes('4')
+    );
+  }, [availableModels, aiModel, enhancementMode]);
+
+  const isScale3Available = useMemo(() => {
+    // Creative mode doesn't have 3x
+    if (enhancementMode === 'creative') return false;
+    const currentModelBase = aiModel;
+    return availableModels.some(m =>
+      m.toUpperCase().includes(currentModelBase) && m.includes('3')
+    );
+  }, [availableModels, aiModel, enhancementMode]);
+
+  const isScale2Available = useMemo(() => {
+    if (enhancementMode === 'creative') {
+      // Anime only has 4x, Realistic has 2x and 4x
+      return creativeModel === 'REALISTIC';
+    }
+    const currentModelBase = aiModel;
+    return availableModels.some(m =>
+      m.toUpperCase().includes(currentModelBase) && m.includes('2')
+    );
+  }, [availableModels, aiModel, enhancementMode, creativeModel]);
+
+  const isRealisticAvailable = useMemo(() => {
+    return availableModels.some(m => m.includes('RealESRGAN') && !m.includes('anime'));
+  }, [availableModels]);
+
+  const isAnimeAvailable = useMemo(() => {
+    return availableModels.some(m => m.includes('anime'));
+  }, [availableModels]);
+
+  // Auto-fallback if selected model isn't available
+  useEffect(() => {
+    if (enhancementMode === 'archival') {
+      if (aiModel === 'RCAN' && !isRCANAvailable && isEDSRAvailable) {
+        setAiModel('EDSR');
+        showToast("RCAN unavailable, using EDSR");
       }
-
-      if (availableModels.includes(fallback)) {
-        console.log(`[UI] Switching to fallback: ${fallback}`);
-        setModel(fallback);
-        loadModel(fallback);
-      } else if (availableModels.includes(MODEL_MAP.real.quality)) {
-        // Ultimate fallback
-        setModel(MODEL_MAP.real.quality);
-        loadModel(MODEL_MAP.real.quality);
+    } else {
+      // Creative mode fallback
+      if (creativeModel === 'REALISTIC' && !isRealisticAvailable && isAnimeAvailable) {
+        setCreativeModel('ANIME');
+        showToast("RealESRGAN unavailable, using Anime model");
+      }
+      // Creative mode doesn't support 3x - fall back to 4x
+      if (upscaleFactor === 3) {
+        setUpscaleFactor(4);
+        showToast("3x not available in Creative mode, using 4x");
+      }
+      // Anime mode only has 4x - fall back from 2x
+      if (creativeModel === 'ANIME' && upscaleFactor === 2) {
+        setUpscaleFactor(4);
+        showToast("Anime 2x not available, using 4x");
       }
     }
-  }, [availableModels, model, setModel, loadModel]);
+  }, [enhancementMode, aiModel, creativeModel, upscaleFactor, isRCANAvailable, isEDSRAvailable, isRealisticAvailable, isAnimeAvailable]);
 
   // --- DERIVED STATE ---
-  const activeScale = useMemo(() => {
-    if (scalingMode !== 'auto') return scalingMode;
-    return getModelScale(model);
-  }, [model, scalingMode]);
+  const activeScale = upscaleFactor;
   const sourceW = videoState.inputWidth || 0;
   const sourceH = videoState.inputHeight || 0;
   const sourceFps = videoState.sourceFps || 30;
@@ -273,20 +530,6 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
   const targetW = isAIActive ? finalInW * activeScale : finalInW;
   const targetH = isAIActive ? finalInH * activeScale : finalInH;
   const targetFps = editState.fps === 0 ? sourceFps : editState.fps;
-
-  const isAnime = model.toLowerCase().includes("anime");
-  // isSpeed is now determined by the active scale, not just the filename
-  const isSpeed = activeScale === 2;
-  const currentPerf = isSpeed ? 'speed' : 'quality';
-
-  const setIntent = (type: 'real' | 'anime', perf: 'quality' | 'speed') => {
-    const targetFile = MODEL_MAP[type][perf];
-    // Explicitly set scaling mode based on perf button
-    setScalingMode(perf === 'speed' ? 2 : 4);
-
-    setModel(targetFile);
-    loadModel(targetFile);
-  };
 
   const toggleCrop = () => {
     if (isCropActive) {
@@ -338,9 +581,9 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
 
   if (isAIActive) {
     if (hasEdits) {
-      mainActionLabel = `RENDER: ${activeEditNames.join(" + ")} + AI ${activeScale}×`;
+      mainActionLabel = `RENDER: ${activeEditNames.join(" + ")} + ${enhancementMode === 'archival' ? aiModel : creativeModel} ${activeScale}×`;
     } else {
-      mainActionLabel = `RENDER: AI ${activeScale}× UPSCALE`;
+      mainActionLabel = `RENDER: ${enhancementMode === 'archival' ? aiModel : creativeModel} ${activeScale}× UPSCALE`;
     }
     mainActionHandler = startUpscale;
     isHighIntensity = true;
@@ -357,8 +600,13 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
     ? { height: '44px', fontSize: '12px' }
     : { height: '44px', fontSize: '12px', background: '#ededed', color: '#000', border: 'none', boxShadow: '0 0 10px rgba(255,255,255,0.2)' };
 
+  // Model display name for SignalSummary
+  // Model display name for SignalSummary
+  const modelDisplayLabel = isAIActive ? `${enhancementMode === 'archival' ? aiModel : creativeModel} ${activeScale}×` : undefined;
+
   return (
-    <div ref={panelRef} style={{ display: "flex", flexDirection: "column", background: "transparent", height: "100%", overflow: "hidden" }}>
+    <div ref={panelRef} style={{ display: "flex", flexDirection: "column", background: "transparent", height: "100%", overflow: "hidden", position: 'relative' }}>
+      <ToastNotification message={toastState.msg} visible={toastState.visible} onDismiss={() => setToastState(s => ({ ...s, visible: false }))} />
       <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", padding: "16px" }}>
 
         <Section title="Input Assets">
@@ -389,13 +637,14 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
               flex: 1, fontSize: "11px", color: inputPath ? "var(--text-primary)" : "var(--text-muted)",
               overflow: "hidden", textAlign: "left",
             }}>
-              {/* FIX 3: Smart Path Truncation */}
               <SmartPath path={inputPath} placeholder="Select Source File..." />
             </div>
           </div>
         </Section>
 
-        <Section title="Upscaling & Enhancement"
+        <Section
+          title="AI Pipeline"
+          badge={<DeterministicBadge mode={enhancementMode} />}
           extra={
             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
               <span style={{ fontSize: '9px', color: isAIActive ? 'var(--brand-primary)' : 'var(--text-muted)', fontWeight: 700 }}>{isAIActive ? 'ON' : 'OFF'}</span>
@@ -416,18 +665,159 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             </div>
           }
         >
-          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", opacity: isAIActive ? 1 : 0.4, pointerEvents: isAIActive ? 'auto' : 'none', transition: 'opacity 0.2s' }}>
-            <SelectionCard title="REALISTIC" subtitle="PHOTO / FILM" icon={<IconCamera />} selected={!isAnime} disabled={!isAIActive} onClick={() => setIntent('real', currentPerf)} />
-            <SelectionCard title="ANIMATION" subtitle="2D / LINE ART" icon={<IconAnimation />} selected={isAnime} disabled={!isAIActive} onClick={() => setIntent('anime', currentPerf)} />
+          {/* Enhancement Mode */}
+          <div style={{ opacity: isAIActive ? 1 : 0.4, pointerEvents: isAIActive ? 'auto' : 'none', transition: 'opacity 0.2s' }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
+              <label style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.05em' }}>ENHANCEMENT MODE</label>
+            </div>
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+              <Tooltip text="Frame-stable output. Identical results on every run. Recommended for professional workflows.">
+                <SelectionCard
+                  title="ARCHIVAL"
+                  subtitle="DETERMINISTIC"
+                  icon={<IconShield />}
+                  selected={enhancementMode === 'archival'}
+                  disabled={!isAIActive}
+                  onClick={() => setEnhancementMode('archival')}
+                />
+              </Tooltip>
+              <Tooltip text="AI-enhanced output with more detail. Best for creative upscaling.">
+                <SelectionCard
+                  title="CREATIVE"
+                  subtitle="AI ENHANCED"
+                  icon={<IconSparkles />}
+                  selected={enhancementMode === 'creative'}
+                  disabled={!isAIActive}
+                  onClick={() => setEnhancementMode('creative')}
+                />
+              </Tooltip>
+            </div>
           </div>
-          <div style={{ marginTop: '12px', opacity: isAIActive ? 1 : 0.4, pointerEvents: isAIActive ? 'auto' : 'none', transition: 'opacity 0.2s' }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
-              <label className="label-text" style={{ fontSize: '10px', color: 'var(--text-muted)', fontWeight: 600, fontFamily: 'var(--font-sans)' }}>UPSCALE FACTOR</label>
+
+          {/* AI Model Selector */}
+          <div style={{
+            opacity: isAIActive ? 1 : 0,
+            maxHeight: isAIActive ? '100px' : '0',
+            overflow: 'hidden',
+            transition: 'opacity 0.15s ease-out, max-height 0.15s ease-out',
+            pointerEvents: isAIActive ? 'auto' : 'none'
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: 'center', marginBottom: "6px" }}>
+              <label style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.05em' }}>AI MODEL</label>
+              <Tooltip text={enhancementMode === 'archival'
+                ? "RCAN: Best quality, slower. EDSR: Faster. Identical results across runs."
+                : "REALISTIC: General purpose enhancement. ANIME: Optimized for animation."}>
+                <div style={{ cursor: 'help', color: 'var(--text-muted)', opacity: 0.6 }}>
+                  <IconInfo />
+                </div>
+              </Tooltip>
+            </div>
+            {enhancementMode === 'archival' ? (
+              <div style={{ display: "flex", gap: "8px" }}>
+                <Tooltip text="Residual Channel Attention Network. Best balance of speed and quality.">
+                  <button
+                    onClick={() => setAiModel('RCAN')}
+                    className={aiModel === 'RCAN' ? "toggle-active" : ""}
+                    disabled={!isRCANAvailable}
+                    style={{
+                      flex: 1, height: '52px', borderRadius: '6px',
+                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '2px',
+                      background: aiModel === 'RCAN' ? "var(--brand-dim)" : "var(--input-bg)",
+                      border: aiModel === 'RCAN' ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
+                      color: aiModel === 'RCAN' ? "var(--text-primary)" : "var(--text-secondary)",
+                      opacity: !isRCANAvailable ? 0.4 : 1,
+                      cursor: !isRCANAvailable ? 'not-allowed' : 'pointer',
+                      transition: 'all 0.1s ease'
+                    }}
+                  >
+                    <span style={{ fontWeight: 700, fontSize: '11px' }}>RCAN</span>
+                    <span style={{ fontSize: '8px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>BALANCED</span>
+                  </button>
+                </Tooltip>
+                <Tooltip text="Enhanced Deep Residual Network. Faster processing, slightly less detail recovery.">
+                  <button
+                    onClick={() => setAiModel('EDSR')}
+                    className={aiModel === 'EDSR' ? "toggle-active" : ""}
+                    disabled={!isEDSRAvailable}
+                    style={{
+                      flex: 1, height: '52px', borderRadius: '6px',
+                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '2px',
+                      background: aiModel === 'EDSR' ? "var(--brand-dim)" : "var(--input-bg)",
+                      border: aiModel === 'EDSR' ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
+                      color: aiModel === 'EDSR' ? "var(--text-primary)" : "var(--text-secondary)",
+                      opacity: !isEDSRAvailable ? 0.4 : 1,
+                      cursor: !isEDSRAvailable ? 'not-allowed' : 'pointer',
+                      transition: 'all 0.1s ease'
+                    }}
+                  >
+                    <span style={{ fontWeight: 700, fontSize: '11px' }}>EDSR</span>
+                    <span style={{ fontSize: '8px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>LIGHTWEIGHT</span>
+                  </button>
+                </Tooltip>
+              </div>
+            ) : (
+              <div style={{ display: "flex", gap: "8px" }}>
+                <Tooltip text="RealESRGAN General. hallucinating texture details for sharper look.">
+                  <button
+                    onClick={() => setCreativeModel('REALISTIC')}
+                    className={creativeModel === 'REALISTIC' ? "toggle-active" : ""}
+                    disabled={!isRealisticAvailable}
+                    style={{
+                      flex: 1, height: '52px', borderRadius: '6px',
+                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '2px',
+                      background: creativeModel === 'REALISTIC' ? "var(--brand-dim)" : "var(--input-bg)",
+                      border: creativeModel === 'REALISTIC' ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
+                      color: creativeModel === 'REALISTIC' ? "var(--text-primary)" : "var(--text-secondary)",
+                      opacity: !isRealisticAvailable ? 0.4 : 1,
+                      cursor: !isRealisticAvailable ? 'not-allowed' : 'pointer',
+                      transition: 'all 0.1s ease'
+                    }}
+                  >
+                    <span style={{ fontWeight: 700, fontSize: '11px' }}>REALISTIC</span>
+                    <span style={{ fontSize: '8px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>DETAIL</span>
+                  </button>
+                </Tooltip>
+                <Tooltip text="RealESRGAN Anime. Optimized for illustrations and flat colors.">
+                  <button
+                    onClick={() => setCreativeModel('ANIME')}
+                    className={creativeModel === 'ANIME' ? "toggle-active" : ""}
+                    disabled={!isAnimeAvailable}
+                    style={{
+                      flex: 1, height: '52px', borderRadius: '6px',
+                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '2px',
+                      background: creativeModel === 'ANIME' ? "var(--brand-dim)" : "var(--input-bg)",
+                      border: creativeModel === 'ANIME' ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
+                      color: creativeModel === 'ANIME' ? "var(--text-primary)" : "var(--text-secondary)",
+                      opacity: !isAnimeAvailable ? 0.4 : 1,
+                      cursor: !isAnimeAvailable ? 'not-allowed' : 'pointer',
+                      transition: 'all 0.1s ease'
+                    }}
+                  >
+                    <span style={{ fontWeight: 700, fontSize: '11px' }}>ANIME</span>
+                    <span style={{ fontSize: '8px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>FLAT</span>
+                  </button>
+                </Tooltip>
+              </div>
+            )}
+          </div>
+
+          {/* Upscale Factor */}
+          <div style={{ opacity: isAIActive ? 1 : 0.4, pointerEvents: isAIActive ? 'auto' : 'none', transition: 'opacity 0.2s' }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
+              <label style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.05em' }}>UPSCALE FACTOR</label>
+              <span style={{ fontSize: '9px', color: 'var(--brand-primary)', fontWeight: 600, fontFamily: 'var(--font-mono)' }}>
+                {activeScale}× ENLARGEMENT
+              </span>
             </div>
             <ToggleGroup
-              value={currentPerf}
-              onChange={(v: any) => setIntent(isAnime ? 'anime' : 'real', v)}
-              options={[{ label: "QUALITY", sub: "4x", value: "quality" }, { label: "SPEED", sub: "2x", value: "speed" }]}
+              value={upscaleFactor}
+              onChange={(v: UpscaleScale) => setUpscaleFactor(v)}
+              options={[
+                { label: "4×", sub: "QUALITY", value: 4, disabled: !isScale4Available },
+                { label: "3×", sub: "BALANCED", value: 3, disabled: !isScale3Available },
+                { label: "2×", sub: "FAST", value: 2, disabled: !isScale2Available }
+              ]}
+              disabled={!isAIActive}
             />
           </div>
         </Section>
@@ -638,6 +1028,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
           <SignalSummary
             sourceResolution={sourceInfo.label} sourceDetail={sourceInfo.detail} sourceFps={strSourceFps}
             targetResolution={targetInfo.label} targetDetail={targetInfo.detail} targetFps={strTargetFps}
+            modelLabel={modelDisplayLabel || ""}
           />
 
           {/* Active Edits Display */}
@@ -683,7 +1074,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
                   fontSize: '9px', padding: '3px 8px', borderRadius: '3px',
                   background: 'rgba(0, 255, 136, 0.15)', color: 'var(--brand-primary)', fontWeight: 600,
                   border: '1px solid rgba(0, 255, 136, 0.3)'
-                }}>AI {activeScale}×</span>
+                }}>{enhancementMode === 'archival' ? aiModel : creativeModel} {activeScale}×</span>
               )}
             </div>
           )}
@@ -711,7 +1102,6 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
                 flex: 1, fontSize: "10px", color: "var(--text-secondary)",
                 overflow: "hidden", textAlign: "left",
               }}>
-                {/* FIX 3: Smart Path Truncation */}
                 <SmartPath path={outputPath} placeholder="Auto-Generated" />
               </div>
             </div>

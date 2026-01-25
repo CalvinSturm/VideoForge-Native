@@ -26,11 +26,19 @@ import { PanelHeader } from "./components/PanelHeader";
 
 import type { Toast, UpscaleMode, Job, VideoState, EditState } from './types';
 
+// Canonical model identifiers supported by the application
+// RCAN/EDSR use canonical format: {MODEL}_x{SCALE}
+// RealESRGAN uses descriptive names (no .pth extension in canonical form)
 const SUPPORTED_MODELS = [
-  "RealESRGAN_x4plus.pth",
-  "RealESRGAN_x4plus_anime_6B.pth",
-  "RealESRGAN_x2plus.pth",
-  "RealESRGAN_x2plus_anime_6B.pth"
+  // Deterministic (Archival) models
+  "RCAN_x2", "RCAN_x3", "RCAN_x4", "RCAN_x8",
+  "EDSR_x2", "EDSR_x3", "EDSR_x4",
+  // Creative (GAN) models - Note: No official 2x anime model exists
+  "RealESRGAN_x4plus", "RealESRGAN_x2plus",
+  "RealESRGAN_x4plus_anime_6B",
+  // Legacy support (in case old weight files exist)
+  "RealESRGAN_x4plus.pth", "RealESRGAN_x2plus.pth",
+  "RealESRGAN_x4plus_anime_6B.pth"
 ];
 
 const DEFAULT_LAYOUT: MosaicNode<PanelId> = {
@@ -229,7 +237,7 @@ const App: React.FC = () => {
     }
   }, [isEngineReady]);
 
-  const handleNewInput = (path: string) => {
+  const handleNewInput = useCallback((path: string) => {
     setInputPath(path);
     if (/\.(mp4|mkv|mov|avi|webm)$/i.test(path)) {
       setMode('video');
@@ -243,7 +251,23 @@ const App: React.FC = () => {
     setVideoTime(0); setVideoDuration(0); setInputDims({ w: 0, h: 0 });
     setViewMode('edit'); setOutputPath(""); setPreviewFile(null); setActiveJob(null);
     setRenderedRange(null); // Reset rendered range
-  };
+  }, []);
+
+  // --- Global File Drop Listener (Tauri v2) ---
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    const setupListener = async () => {
+      // In Tauri v2, the event is 'tauri://drag-drop' and the payload is { paths: string[], position: { x: number, y: number } }
+      unlisten = await listen<{ paths: string[] }>('tauri://drag-drop', (event) => {
+        const { paths } = event.payload;
+        if (paths && paths.length > 0 && paths[0]) {
+          handleNewInput(paths[0]);
+        }
+      });
+    };
+    setupListener();
+    return () => { if (unlisten) unlisten(); };
+  }, [handleNewInput]);
 
   const [videoTime, setVideoTime] = useState(0);
   const [videoDuration, setVideoDuration] = useState(0);
