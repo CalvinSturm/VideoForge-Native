@@ -11,6 +11,7 @@ interface ViewLayoutState {
   openPanel: (id: PanelId) => void;
   closePanel: (id: PanelId) => void;
   setAllPanels: (panels: Record<PanelId, boolean>) => void;
+  showAllPanels: () => void;
   resetLayout: () => void;
 }
 
@@ -46,6 +47,10 @@ export const useViewLayoutStore = create<ViewLayoutState>((set) => ({
   })),
 
   setAllPanels: (newPanels) => set({ panels: newPanels }),
+
+  showAllPanels: () => set({
+    panels: { SETTINGS: true, PREVIEW: true, QUEUE: true, ACTIVITY: true }
+  }),
 
   resetLayout: () => set({
     panels: { ...DEFAULT_PANELS }

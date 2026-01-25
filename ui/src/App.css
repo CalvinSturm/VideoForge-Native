@@ -439,3 +439,38 @@ button.toggle-active {
   background: #52525b;
   /* Lighter on hover */
 }
+
+/* ============================================================
+   5. ANIMATIONS
+   ============================================================ */
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* Panel header accent glow on hover */
+.mosaic-window:hover .mosaic-window-toolbar {
+  border-bottom-color: rgba(255, 255, 255, 0.1);
+}
+
+/* Enhanced focus states for accessibility */
+.mosaic-window:focus-within {
+  outline: none;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.1);
+}

@@ -58,41 +58,93 @@ const DEFAULT_LAYOUT: MosaicNode<PanelId> = {
   splitPercentage: 24
 };
 
-const DockStrip = ({ position, onClick, label, icon }: { position: 'right' | 'bottom' | 'left', onClick: () => void, label: string, icon: React.ReactNode }) => {
+// Panel accent colors for dock strips
+const DOCK_COLORS: Record<string, string> = {
+  SETTINGS: '#3b82f6',
+  PREVIEW: '#00ff88',
+  QUEUE: '#f59e0b',
+  ACTIVITY: '#a855f7'
+};
+
+const DockStrip = ({ position, onClick, label, icon, panelId }: {
+  position: 'right' | 'bottom' | 'left',
+  onClick: () => void,
+  label: string,
+  icon: React.ReactNode,
+  panelId?: string
+}) => {
+  const [isHovered, setIsHovered] = React.useState(false);
   const isVertical = position === 'right' || position === 'left';
+  const accentColor = panelId ? DOCK_COLORS[panelId] || '#00ff88' : '#00ff88';
+
   return (
     <div
       onClick={onClick}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
       title={`Open ${label}`}
-      className="dock-strip"
       style={{
         position: 'absolute',
         [position]: 0,
         [isVertical ? 'top' : 'left']: '50%',
-        transform: isVertical ? 'translateY(-50%)' : 'translateX(-50%)',
-        [isVertical ? 'width' : 'height']: '24px',
-        borderRadius: position === 'right' ? '4px 0 0 4px' : position === 'left' ? '0 4px 4px 0' : '4px 4px 0 0',
+        transform: `${isVertical ? 'translateY(-50%)' : 'translateX(-50%)'} ${isHovered ? 'scale(1.02)' : 'scale(1)'}`,
+        [isVertical ? 'width' : 'height']: '28px',
+        borderRadius: position === 'right' ? '6px 0 0 6px' : position === 'left' ? '0 6px 6px 0' : '6px 6px 0 0',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
         cursor: 'pointer',
         zIndex: 50,
-        padding: isVertical ? '12px 0' : '0 12px',
-        boxShadow: 'var(--shadow-md)'
+        padding: isVertical ? '14px 0' : '0 14px',
+        background: isHovered
+          ? `linear-gradient(135deg, ${accentColor}20, rgba(17,17,19,0.95))`
+          : 'rgba(17,17,19,0.9)',
+        backdropFilter: 'blur(8px)',
+        border: isHovered
+          ? `1px solid ${accentColor}60`
+          : '1px solid rgba(255,255,255,0.1)',
+        boxShadow: isHovered
+          ? `0 4px 20px ${accentColor}30, 0 2px 8px rgba(0,0,0,0.4)`
+          : '0 4px 12px rgba(0,0,0,0.4)',
+        transition: 'all 0.2s cubic-bezier(0.16, 1, 0.3, 1)'
       }}
     >
+      {/* Accent indicator line */}
+      <div style={{
+        position: 'absolute',
+        [position === 'right' ? 'right' : position === 'left' ? 'left' : 'bottom']: 0,
+        [isVertical ? 'top' : 'left']: '20%',
+        [isVertical ? 'bottom' : 'right']: '20%',
+        [isVertical ? 'width' : 'height']: '2px',
+        background: `linear-gradient(${isVertical ? '180deg' : '90deg'}, transparent, ${accentColor}, transparent)`,
+        opacity: isHovered ? 1 : 0.5,
+        transition: 'opacity 0.2s ease'
+      }} />
+
       <div style={{
         writingMode: isVertical ? 'vertical-rl' : 'horizontal-tb',
         transform: position === 'right' ? 'rotate(180deg)' : 'none',
-        fontSize: '10px', fontWeight: 600, letterSpacing: '0.1em',
-        display: 'flex', alignItems: 'center', gap: '8px'
+        fontSize: '10px',
+        fontWeight: 600,
+        letterSpacing: '0.08em',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '8px',
+        color: isHovered ? '#fff' : 'var(--text-secondary)',
+        transition: 'color 0.15s ease'
       }}>
-        {icon}
+        <span style={{
+          color: isHovered ? accentColor : 'inherit',
+          transition: 'color 0.15s ease'
+        }}>
+          {icon}
+        </span>
         {label}
       </div>
     </div>
   );
 };
+
 
 const App: React.FC = () => {
   const [mode, setMode] = useState<UpscaleMode>("image");
@@ -420,7 +472,7 @@ const App: React.FC = () => {
           <DockStrip
             position="left"
             label="SETTINGS"
-            // Use a settings/sliders icon
+            panelId="SETTINGS"
             icon={<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>}
             onClick={() => openPanel('SETTINGS')}
           />
@@ -429,6 +481,7 @@ const App: React.FC = () => {
           <DockStrip
             position="right"
             label="QUEUE"
+            panelId="QUEUE"
             icon={<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 6h16M4 12h16M4 18h16" /></svg>}
             onClick={() => openPanel('QUEUE')}
           />
@@ -437,6 +490,7 @@ const App: React.FC = () => {
           <DockStrip
             position="bottom"
             label="ACTIVITY"
+            panelId="ACTIVITY"
             icon={<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12" /></svg>}
             onClick={() => openPanel('ACTIVITY')}
           />
