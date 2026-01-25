@@ -10,6 +10,10 @@ interface JobStoreState {
   framesProcessed: number;
   totalFrames: number;
 
+  // Last completed output path (for "reveal in folder")
+  lastOutputPath: string;
+  setLastOutputPath: (path: string) => void;
+
   // Setters
   setProgress: (percent: number, current: number, total: number) => void;
 
@@ -27,6 +31,7 @@ export const useJobStore = create<JobStoreState>((set) => ({
   progressPercent: 0,
   framesProcessed: 0,
   totalFrames: 0,
+  lastOutputPath: "",
   isModelLoading: false,
   stats: { cpu: 0, ramUsed: 0, ramTotal: 0, gpuName: "DETECTING..." },
 
@@ -38,6 +43,7 @@ export const useJobStore = create<JobStoreState>((set) => ({
     totalFrames: total
   }),
 
+  setLastOutputPath: (path) => set({ lastOutputPath: path }),
   setIsModelLoading: (loading) => set({ isModelLoading: loading }),
   setStats: (stats) => set({ stats }),
 
@@ -47,5 +53,6 @@ export const useJobStore = create<JobStoreState>((set) => ({
     framesProcessed: 0,
     totalFrames: 0,
     isModelLoading: false
+    // Note: lastOutputPath is NOT reset - we want to keep it
   }),
 }));

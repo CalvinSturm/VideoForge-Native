@@ -357,6 +357,8 @@ button.toggle-active {
   box-shadow: none !important;
   border: none !important;
   margin: 0 !important;
+  min-width: 200px;
+  min-height: 100px;
 }
 
 /* 2. The Panels (Windows) */

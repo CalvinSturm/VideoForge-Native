@@ -1,4 +1,5 @@
-import React, { useMemo, useState, useRef, useEffect } from "react";
+import React, { useMemo, useState, useRef, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 import type { EditState, VideoState, UpscaleMode } from "../types";
 import { SignalSummary } from "./SignalSummary";
 
@@ -39,11 +40,11 @@ const CREATIVE_MAP: Record<CreativeModel, Partial<Record<UpscaleScale, string>>>
   ANIME: { 4: "RealESRGAN_x4plus_anime_6B" }  // Note: No 2x anime model exists in official RealESRGAN
 };
 
-// Scale options with labels
+// Scale options with labels (ascending order for intuitive progression)
 const SCALE_OPTIONS: { value: UpscaleScale; label: string; sub: string }[] = [
-  { value: 4, label: "4×", sub: "QUALITY" },
+  { value: 2, label: "2×", sub: "FAST" },
   { value: 3, label: "3×", sub: "BALANCED" },
-  { value: 2, label: "2×", sub: "FAST" }
+  { value: 4, label: "4×", sub: "QUALITY" }
 ];
 
 const ASPECT_RATIOS = [
@@ -75,7 +76,10 @@ const getSmartResInfo = (w: number, h: number) => {
   return { label: dims, detail: "" };
 };
 
-// --- TOOLTIP COMPONENT ---
+// --- TOOLTIP COMPONENT (Portal-based with viewport boundary detection) ---
+const TOOLTIP_WIDTH = 200;
+const TOOLTIP_PADDING = 8;
+
 const Tooltip: React.FC<{ text: string; children: React.ReactNode; position?: 'top' | 'bottom' }> = ({
   text,
   children,
@@ -83,10 +87,83 @@ const Tooltip: React.FC<{ text: string; children: React.ReactNode; position?: 't
 }) => {
   const [isVisible, setIsVisible] = useState(false);
   const [isMounted, setIsMounted] = useState(false);
+  const [style, setStyle] = useState<React.CSSProperties>({});
+  const [arrowStyle, setArrowStyle] = useState<React.CSSProperties>({});
+  const triggerRef = useRef<HTMLDivElement>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const updatePosition = useCallback(() => {
+    if (!triggerRef.current) return;
+
+    const rect = triggerRef.current.getBoundingClientRect();
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+
+    // Calculate ideal center position
+    let x = rect.left + rect.width / 2;
+    let y = position === 'top' ? rect.top - 8 : rect.bottom + 8;
+
+    // Calculate tooltip bounds
+    const tooltipLeft = x - TOOLTIP_WIDTH / 2;
+    const tooltipRight = x + TOOLTIP_WIDTH / 2;
+
+    // Adjust horizontal position to stay in viewport
+    let offsetX = 0;
+    if (tooltipLeft < TOOLTIP_PADDING) {
+      offsetX = TOOLTIP_PADDING - tooltipLeft;
+    } else if (tooltipRight > viewportWidth - TOOLTIP_PADDING) {
+      offsetX = (viewportWidth - TOOLTIP_PADDING) - tooltipRight;
+    }
+
+    // Flip to bottom if not enough space on top
+    let actualPosition = position;
+    if (position === 'top' && y < 60) {
+      actualPosition = 'bottom';
+      y = rect.bottom + 8;
+    } else if (position === 'bottom' && y + 60 > viewportHeight) {
+      actualPosition = 'top';
+      y = rect.top - 8;
+    }
+
+    setStyle({
+      position: 'fixed',
+      left: x + offsetX,
+      top: y,
+      transform: `translateX(-50%) translateY(${actualPosition === 'top' ? '-100%' : '0'})`,
+      width: TOOLTIP_WIDTH,
+      padding: '8px 12px',
+      background: '#1a1a1c',
+      border: '1px solid rgba(255,255,255,0.15)',
+      borderRadius: '6px',
+      fontSize: '10px',
+      color: '#e0e0e0',
+      whiteSpace: 'normal' as const,
+      zIndex: 99999,
+      boxShadow: '0 4px 12px rgba(0,0,0,0.6)',
+      pointerEvents: 'none' as const,
+      lineHeight: 1.4
+    });
+
+    // Arrow points to trigger, offset if tooltip was shifted
+    setArrowStyle({
+      position: 'absolute',
+      [actualPosition === 'top' ? 'bottom' : 'top']: '-5px',
+      left: `calc(50% - ${offsetX}px)`,
+      transform: 'translateX(-50%) rotate(45deg)',
+      width: '8px',
+      height: '8px',
+      background: '#1a1a1c',
+      border: '1px solid rgba(255,255,255,0.15)',
+      borderTop: actualPosition === 'top' ? 'none' : '1px solid rgba(255,255,255,0.15)',
+      borderLeft: actualPosition === 'top' ? 'none' : '1px solid rgba(255,255,255,0.15)',
+      borderBottom: actualPosition === 'top' ? '1px solid rgba(255,255,255,0.15)' : 'none',
+      borderRight: actualPosition === 'top' ? '1px solid rgba(255,255,255,0.15)' : 'none',
+    });
+  }, [position]);
 
   const showTooltip = () => {
     timeoutRef.current = setTimeout(() => {
+      updatePosition();
       setIsMounted(true);
       requestAnimationFrame(() => setIsVisible(true));
     }, 400);
@@ -98,55 +175,25 @@ const Tooltip: React.FC<{ text: string; children: React.ReactNode; position?: 't
     setTimeout(() => setIsMounted(false), 100);
   };
 
+  const tooltipContent = isMounted && createPortal(
+    <div style={{ ...style, opacity: isVisible ? 1 : 0, transition: 'opacity 100ms ease' }}>
+      {text}
+      <div style={arrowStyle} />
+    </div>,
+    document.body
+  );
+
   return (
     <div
-      style={{ position: 'relative', display: 'inline-flex' }}
+      ref={triggerRef}
+      style={{ display: 'inline-flex' }}
       onMouseEnter={showTooltip}
       onMouseLeave={hideTooltip}
       onFocus={showTooltip}
       onBlur={hideTooltip}
     >
       {children}
-      {isMounted && (
-        <div style={{
-          position: 'absolute',
-          [position === 'top' ? 'bottom' : 'top']: '100%',
-          left: '50%',
-          transform: `translateX(-50%) translateY(${position === 'top' ? '-8px' : '8px'})`,
-          padding: '8px 12px',
-          background: '#1a1a1c',
-          border: '1px solid rgba(255,255,255,0.15)',
-          borderRadius: '6px',
-          fontSize: '10px',
-          color: '#e0e0e0',
-          whiteSpace: 'normal',
-          maxWidth: '240px',
-          zIndex: 1000,
-          boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
-          opacity: isVisible ? 1 : 0,
-          transition: 'opacity 100ms ease, transform 100ms ease',
-          pointerEvents: 'none',
-          lineHeight: 1.4
-        }}>
-          {text}
-          <div style={{
-            position: 'absolute',
-            [position === 'top' ? 'bottom' : 'top']: '-5px',
-            left: '50%',
-            transform: 'translateX(-50%) rotate(45deg)',
-            width: '8px',
-            height: '8px',
-            background: '#1a1a1c',
-            border: position === 'top'
-              ? '1px solid rgba(255,255,255,0.15)'
-              : '1px solid rgba(255,255,255,0.15)',
-            borderTop: position === 'top' ? 'none' : '1px solid rgba(255,255,255,0.15)',
-            borderLeft: position === 'top' ? 'none' : '1px solid rgba(255,255,255,0.15)',
-            borderBottom: position === 'top' ? '1px solid rgba(255,255,255,0.15)' : 'none',
-            borderRight: position === 'top' ? '1px solid rgba(255,255,255,0.15)' : 'none',
-          }} />
-        </div>
-      )}
+      {tooltipContent}
     </div>
   );
 };
@@ -215,7 +262,7 @@ const SelectionCard = ({ selected, onClick, title, subtitle, icon, disabled, bad
 }) => (
   <button onClick={onClick} disabled={disabled} style={{
     flex: 1, display: "flex", flexDirection: "column", alignItems: "flex-start", justifyContent: "center",
-    height: "64px", padding: "8px 12px", minWidth: "130px",
+    height: "56px", padding: "8px 10px", minWidth: "90px",
     background: selected && !disabled ? "var(--brand-dim)" : "var(--panel-bg)",
     border: selected && !disabled ? "1px solid var(--brand-primary)" : "1px solid var(--panel-border)",
     borderRadius: "6px", cursor: disabled ? "not-allowed" : "pointer",
@@ -240,7 +287,7 @@ const ToggleGroup = ({ options, value, onChange, disabled }: {
   disabled?: boolean;
 }) => (
   <div style={{
-    display: "flex", background: "var(--input-bg)", padding: "3px", borderRadius: "6px",
+    display: "flex", background: "var(--input-bg)", padding: "2px", borderRadius: "5px",
     border: "1px solid rgba(255,255,255,0.08)", boxShadow: "inset 0 2px 4px rgba(0,0,0,0.05)",
     opacity: disabled ? 0.5 : 1, pointerEvents: disabled ? 'none' : 'auto'
   }}>
@@ -254,17 +301,18 @@ const ToggleGroup = ({ options, value, onChange, disabled }: {
           className={isActive && !isOptDisabled ? "toggle-active" : ""}
           disabled={isOptDisabled}
           style={{
-            flex: 1, height: "30px", border: "none", borderRadius: "4px", minWidth: "60px",
+            flex: 1, height: "28px", border: "none", borderRadius: "4px", minWidth: 0,
             background: "transparent", color: isOptDisabled ? "var(--text-muted)" : "var(--text-muted)",
-            fontSize: "10px", fontWeight: 500, fontFamily: 'var(--font-sans)',
+            fontSize: "9px", fontWeight: 500, fontFamily: 'var(--font-sans)',
             display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', lineHeight: 1.1,
             boxShadow: isActive && !isOptDisabled ? "0 2px 4px rgba(0,0,0,0.4)" : "none",
             opacity: isOptDisabled ? 0.4 : 1,
-            cursor: isOptDisabled ? 'not-allowed' : 'pointer'
+            cursor: isOptDisabled ? 'not-allowed' : 'pointer',
+            padding: '0 4px'
           }}
         >
           <span>{opt.label}</span>
-          {opt.sub && <span style={{ fontSize: '8px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>{opt.sub}</span>}
+          {opt.sub && <span style={{ fontSize: '7px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>{opt.sub}</span>}
         </button>
       );
     })}
@@ -281,21 +329,22 @@ const Section = ({ title, children, defaultOpen = true, extra, badge }: {
   const [isOpen, setIsOpen] = useState(defaultOpen);
   return (
     <div style={{
-      marginBottom: "16px", background: "var(--panel-bg)", border: "1px solid var(--panel-border)",
+      marginBottom: "12px", background: "var(--panel-bg)", border: "1px solid var(--panel-border)",
       borderTop: "1px solid var(--panel-border)", borderRadius: "6px", overflow: "hidden", flexShrink: 0,
       boxShadow: "var(--shadow-md)"
     }}>
       <div onClick={() => setIsOpen(!isOpen)} style={{
         display: "flex", alignItems: "center", justifyContent: "space-between",
-        cursor: "pointer", padding: "10px 12px", background: "var(--section-bg)",
+        cursor: "pointer", padding: "8px 10px", background: "var(--section-bg)",
         userSelect: "none", transition: "background 0.2s",
-        borderBottom: isOpen ? "1px solid var(--panel-border)" : "none", height: "36px"
+        borderBottom: isOpen ? "1px solid var(--panel-border)" : "none", minHeight: "32px",
+        gap: "6px"
       }}>
-        <div style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1 }}>
-          <h3 style={{ margin: 0, color: "var(--text-secondary)", fontSize: "10px" }}>{title}</h3>
+        <div style={{ display: "flex", alignItems: "center", gap: "6px", flex: 1, minWidth: 0, overflow: "hidden" }}>
+          <h3 style={{ margin: 0, color: "var(--text-secondary)", fontSize: "9px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{title}</h3>
           {badge}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
           {extra}
           <span style={{ fontSize: "8px", color: "var(--text-muted)", transform: isOpen ? "rotate(0deg)" : "rotate(-90deg)", transition: 'transform 0.15s' }}>▼</span>
         </div>
@@ -305,7 +354,7 @@ const Section = ({ title, children, defaultOpen = true, extra, badge }: {
         overflow: 'hidden',
         transition: 'max-height 0.2s ease-out'
       }}>
-        <div style={{ padding: "14px", display: "flex", flexDirection: "column", gap: "14px" }}>{children}</div>
+        <div style={{ padding: "12px", display: "flex", flexDirection: "column", gap: "12px" }}>{children}</div>
       </div>
     </div>
   );
@@ -359,29 +408,29 @@ const DeterministicBadge: React.FC<{ mode: EnhancementMode }> = ({ mode }) => {
     return (
       <Tooltip text="Frame-stable output. Identical results on every run. Recommended for professional workflows.">
         <div style={{
-          display: 'inline-flex', alignItems: 'center', gap: '4px',
-          padding: '2px 6px', borderRadius: '3px',
+          display: 'inline-flex', alignItems: 'center', gap: '3px',
+          padding: '2px 5px', borderRadius: '3px',
           background: 'rgba(0, 255, 136, 0.1)',
           border: '1px solid rgba(0, 255, 136, 0.2)',
-          fontSize: '8px', fontWeight: 600, color: 'var(--brand-primary)',
-          letterSpacing: '0.03em', cursor: 'help'
+          fontSize: '7px', fontWeight: 600, color: 'var(--brand-primary)',
+          letterSpacing: '0.03em', cursor: 'help', whiteSpace: 'nowrap', flexShrink: 0
         }}>
           <IconCheck />
-          DETERMINISTIC
+          STABLE
         </div>
       </Tooltip>
     );
   }
   return (
     <div style={{
-      display: 'inline-flex', alignItems: 'center', gap: '4px',
-      padding: '2px 6px', borderRadius: '3px',
+      display: 'inline-flex', alignItems: 'center', gap: '3px',
+      padding: '2px 5px', borderRadius: '3px',
       background: 'rgba(251, 191, 36, 0.1)',
       border: '1px solid rgba(251, 191, 36, 0.2)',
-      fontSize: '8px', fontWeight: 600, color: '#fbbf24',
-      letterSpacing: '0.03em'
+      fontSize: '7px', fontWeight: 600, color: '#fbbf24',
+      letterSpacing: '0.03em', whiteSpace: 'nowrap', flexShrink: 0
     }}>
-      ENHANCED
+      GAN
     </div>
   );
 };
@@ -648,13 +697,20 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
           extra={
             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
               <span style={{ fontSize: '9px', color: isAIActive ? 'var(--brand-primary)' : 'var(--text-muted)', fontWeight: 700 }}>{isAIActive ? 'ON' : 'OFF'}</span>
-              <div onClick={(e) => { e.stopPropagation(); setIsAIActive(!isAIActive); }}
+              <div
+                role="switch"
+                aria-checked={isAIActive}
+                aria-label="Toggle AI Pipeline"
+                tabIndex={0}
+                onClick={(e) => { e.stopPropagation(); setIsAIActive(!isAIActive); }}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); setIsAIActive(!isAIActive); } }}
                 style={{
                   width: '28px', height: '16px', borderRadius: '10px',
                   background: isAIActive ? 'var(--brand-primary)' : '#1a1a1c',
                   border: '1px solid rgba(255,255,255,0.1)',
                   position: 'relative', cursor: 'pointer', transition: 'all 0.2s',
-                  boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.5)'
+                  boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.5)',
+                  outline: 'none'
                 }}>
                 <div style={{
                   width: '12px', height: '12px', borderRadius: '50%', background: isAIActive ? 'black' : '#555',
@@ -670,11 +726,11 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
               <label style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.05em' }}>ENHANCEMENT MODE</label>
             </div>
-            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+            <div style={{ display: "flex", gap: "6px" }}>
               <Tooltip text="Frame-stable output. Identical results on every run. Recommended for professional workflows.">
                 <SelectionCard
                   title="ARCHIVAL"
-                  subtitle="DETERMINISTIC"
+                  subtitle="STABLE"
                   icon={<IconShield />}
                   selected={enhancementMode === 'archival'}
                   disabled={!isAIActive}
@@ -684,7 +740,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
               <Tooltip text="AI-enhanced output with more detail. Best for creative upscaling.">
                 <SelectionCard
                   title="CREATIVE"
-                  subtitle="AI ENHANCED"
+                  subtitle="GAN"
                   icon={<IconSparkles />}
                   selected={enhancementMode === 'creative'}
                   disabled={!isAIActive}
@@ -694,34 +750,30 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             </div>
           </div>
 
-          {/* AI Model Selector */}
-          <div style={{
-            opacity: isAIActive ? 1 : 0,
-            maxHeight: isAIActive ? '100px' : '0',
-            overflow: 'hidden',
-            transition: 'opacity 0.15s ease-out, max-height 0.15s ease-out',
-            pointerEvents: isAIActive ? 'auto' : 'none'
-          }}>
+          {/* AI Model / Style Selector */}
+          <div style={{ opacity: isAIActive ? 1 : 0.4, pointerEvents: isAIActive ? 'auto' : 'none', transition: 'opacity 0.2s' }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: 'center', marginBottom: "6px" }}>
-              <label style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.05em' }}>AI MODEL</label>
+              <label style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.05em' }}>
+                {enhancementMode === 'archival' ? 'AI MODEL' : 'STYLE'}
+              </label>
               <Tooltip text={enhancementMode === 'archival'
-                ? "RCAN: Best quality, slower. EDSR: Faster. Identical results across runs."
-                : "REALISTIC: General purpose enhancement. ANIME: Optimized for animation."}>
+                ? "RCAN: Best quality, slower. EDSR: Faster, lighter. Both produce identical results across runs."
+                : "REALISTIC: General photos & video (2× or 4×). ANIME: Illustrations & cel animation (4× only)."}>
                 <div style={{ cursor: 'help', color: 'var(--text-muted)', opacity: 0.6 }}>
                   <IconInfo />
                 </div>
               </Tooltip>
             </div>
             {enhancementMode === 'archival' ? (
-              <div style={{ display: "flex", gap: "8px" }}>
+              <div style={{ display: "flex", gap: "6px" }}>
                 <Tooltip text="Residual Channel Attention Network. Best balance of speed and quality.">
                   <button
                     onClick={() => setAiModel('RCAN')}
                     className={aiModel === 'RCAN' ? "toggle-active" : ""}
                     disabled={!isRCANAvailable}
                     style={{
-                      flex: 1, height: '52px', borderRadius: '6px',
-                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '2px',
+                      flex: 1, height: '44px', borderRadius: '5px', minWidth: 0,
+                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px',
                       background: aiModel === 'RCAN' ? "var(--brand-dim)" : "var(--input-bg)",
                       border: aiModel === 'RCAN' ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
                       color: aiModel === 'RCAN' ? "var(--text-primary)" : "var(--text-secondary)",
@@ -730,8 +782,8 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
                       transition: 'all 0.1s ease'
                     }}
                   >
-                    <span style={{ fontWeight: 700, fontSize: '11px' }}>RCAN</span>
-                    <span style={{ fontSize: '8px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>BALANCED</span>
+                    <span style={{ fontWeight: 700, fontSize: '10px' }}>RCAN</span>
+                    <span style={{ fontSize: '7px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>BALANCED</span>
                   </button>
                 </Tooltip>
                 <Tooltip text="Enhanced Deep Residual Network. Faster processing, slightly less detail recovery.">
@@ -740,8 +792,8 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
                     className={aiModel === 'EDSR' ? "toggle-active" : ""}
                     disabled={!isEDSRAvailable}
                     style={{
-                      flex: 1, height: '52px', borderRadius: '6px',
-                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '2px',
+                      flex: 1, height: '44px', borderRadius: '5px', minWidth: 0,
+                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px',
                       background: aiModel === 'EDSR' ? "var(--brand-dim)" : "var(--input-bg)",
                       border: aiModel === 'EDSR' ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
                       color: aiModel === 'EDSR' ? "var(--text-primary)" : "var(--text-secondary)",
@@ -750,21 +802,21 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
                       transition: 'all 0.1s ease'
                     }}
                   >
-                    <span style={{ fontWeight: 700, fontSize: '11px' }}>EDSR</span>
-                    <span style={{ fontSize: '8px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>LIGHTWEIGHT</span>
+                    <span style={{ fontWeight: 700, fontSize: '10px' }}>EDSR</span>
+                    <span style={{ fontSize: '7px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>FAST</span>
                   </button>
                 </Tooltip>
               </div>
             ) : (
-              <div style={{ display: "flex", gap: "8px" }}>
-                <Tooltip text="RealESRGAN General. hallucinating texture details for sharper look.">
+              <div style={{ display: "flex", gap: "6px" }}>
+                <Tooltip text="RealESRGAN General. Generates texture details for a sharper, more detailed look.">
                   <button
                     onClick={() => setCreativeModel('REALISTIC')}
                     className={creativeModel === 'REALISTIC' ? "toggle-active" : ""}
                     disabled={!isRealisticAvailable}
                     style={{
-                      flex: 1, height: '52px', borderRadius: '6px',
-                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '2px',
+                      flex: 1, height: '44px', borderRadius: '5px', minWidth: 0,
+                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px',
                       background: creativeModel === 'REALISTIC' ? "var(--brand-dim)" : "var(--input-bg)",
                       border: creativeModel === 'REALISTIC' ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
                       color: creativeModel === 'REALISTIC' ? "var(--text-primary)" : "var(--text-secondary)",
@@ -773,8 +825,8 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
                       transition: 'all 0.1s ease'
                     }}
                   >
-                    <span style={{ fontWeight: 700, fontSize: '11px' }}>REALISTIC</span>
-                    <span style={{ fontSize: '8px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>DETAIL</span>
+                    <span style={{ fontWeight: 700, fontSize: '10px' }}>PHOTO</span>
+                    <span style={{ fontSize: '7px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>DETAIL</span>
                   </button>
                 </Tooltip>
                 <Tooltip text="RealESRGAN Anime. Optimized for illustrations and flat colors.">
@@ -783,8 +835,8 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
                     className={creativeModel === 'ANIME' ? "toggle-active" : ""}
                     disabled={!isAnimeAvailable}
                     style={{
-                      flex: 1, height: '52px', borderRadius: '6px',
-                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '2px',
+                      flex: 1, height: '44px', borderRadius: '5px', minWidth: 0,
+                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px',
                       background: creativeModel === 'ANIME' ? "var(--brand-dim)" : "var(--input-bg)",
                       border: creativeModel === 'ANIME' ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
                       color: creativeModel === 'ANIME' ? "var(--text-primary)" : "var(--text-secondary)",
@@ -793,8 +845,8 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
                       transition: 'all 0.1s ease'
                     }}
                   >
-                    <span style={{ fontWeight: 700, fontSize: '11px' }}>ANIME</span>
-                    <span style={{ fontSize: '8px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>FLAT</span>
+                    <span style={{ fontWeight: 700, fontSize: '10px' }}>ANIME</span>
+                    <span style={{ fontSize: '7px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>2D ART</span>
                   </button>
                 </Tooltip>
               </div>
@@ -813,9 +865,9 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
               value={upscaleFactor}
               onChange={(v: UpscaleScale) => setUpscaleFactor(v)}
               options={[
-                { label: "4×", sub: "QUALITY", value: 4, disabled: !isScale4Available },
+                { label: "2×", sub: "FAST", value: 2, disabled: !isScale2Available },
                 { label: "3×", sub: "BALANCED", value: 3, disabled: !isScale3Available },
-                { label: "2×", sub: "FAST", value: 2, disabled: !isScale2Available }
+                { label: "4×", sub: "QUALITY", value: 4, disabled: !isScale4Available }
               ]}
               disabled={!isAIActive}
             />

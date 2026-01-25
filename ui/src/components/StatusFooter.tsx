@@ -22,16 +22,15 @@ interface StatusFooterProps {
   darkMode: boolean;
   showTechSpecs: boolean;
   setShowTechSpecs: (show: boolean) => void;
-  outputPath: string;
 }
 
 export const StatusFooter: React.FC<StatusFooterProps> = ({
-  toggleTheme, darkMode, showTechSpecs, setShowTechSpecs, outputPath
+  toggleTheme, darkMode, showTechSpecs, setShowTechSpecs
 }) => {
-  const { isProcessing, framesProcessed, totalFrames, progressPercent, stats } = useJobStore();
+  const { isProcessing, framesProcessed, totalFrames, progressPercent, stats, lastOutputPath } = useJobStore();
 
   const handleOpenFolder = () => {
-    if (outputPath) invoke('show_in_folder', { path: outputPath });
+    if (lastOutputPath) invoke('show_in_folder', { path: lastOutputPath });
   };
 
   const statItemStyle: React.CSSProperties = {
@@ -100,20 +99,20 @@ export const StatusFooter: React.FC<StatusFooterProps> = ({
 
         <button
           onClick={handleOpenFolder}
-          disabled={!outputPath}
+          disabled={!lastOutputPath}
           title="Reveal Output Folder"
           style={{
             background: 'transparent',
             border: 'none',
-            color: outputPath ? 'var(--text-secondary)' : 'var(--text-muted)',
-            cursor: outputPath ? 'pointer' : 'default',
+            color: lastOutputPath ? 'var(--text-secondary)' : 'var(--text-muted)',
+            cursor: lastOutputPath ? 'pointer' : 'default',
             padding: '4px',
             borderRadius: '4px',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             transition: 'color 0.1s'
           }}
-          onMouseEnter={(e) => outputPath && (e.currentTarget.style.color = 'var(--text-primary)')}
-          onMouseLeave={(e) => outputPath && (e.currentTarget.style.color = 'var(--text-secondary)')}
+          onMouseEnter={(e) => lastOutputPath && (e.currentTarget.style.color = 'var(--text-primary)')}
+          onMouseLeave={(e) => lastOutputPath && (e.currentTarget.style.color = 'var(--text-secondary)')}
         >
           <IconFolder />
         </button>
@@ -142,7 +141,7 @@ export const StatusFooter: React.FC<StatusFooterProps> = ({
           </div>
         ) : (
           <span style={{ color: 'var(--text-muted)', cursor: 'default' }}>
-            {outputPath ? "READY" : "IDLE"}
+            {lastOutputPath ? "READY" : "IDLE"}
           </span>
         )}
       </div>

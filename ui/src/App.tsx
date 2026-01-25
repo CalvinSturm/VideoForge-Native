@@ -55,7 +55,7 @@ const DEFAULT_LAYOUT: MosaicNode<PanelId> = {
     second: "QUEUE",
     splitPercentage: 80,
   },
-  splitPercentage: 20
+  splitPercentage: 24
 };
 
 const DockStrip = ({ position, onClick, label, icon }: { position: 'right' | 'bottom' | 'left', onClick: () => void, label: string, icon: React.ReactNode }) => {
@@ -123,7 +123,7 @@ const App: React.FC = () => {
     color: { brightness: 0, contrast: 0, saturation: 0, gamma: 1.0 }
   });
   const [inputDims, setInputDims] = useState({ w: 0, h: 0 });
-  const { setIsProcessing, setCurrentFrame } = useJobStore();
+  const { setIsProcessing, setLastOutputPath } = useJobStore();
 
   // --- Keybinds ---
   useEffect(() => {
@@ -168,7 +168,7 @@ const App: React.FC = () => {
     }
   };
 
-  useTauriEvents({ setJobs, setLogs, setActiveJob, setLoadingModel, setCurrentFrame, addToast: (msg: string, type: string) => addToast(msg, type as any) });
+  useTauriEvents({ setJobs, setLogs, setActiveJob, setLoadingModel, addToast: (msg: string, type: string) => addToast(msg, type as any) });
 
   const handleMosaicChange = (newNode: MosaicNode<PanelId> | null) => {
     setMosaicValue(newNode);
@@ -315,6 +315,7 @@ const App: React.FC = () => {
       const finishedJob: Job = { ...newJob, status: 'done', progress: 100, outputPath: resultPath, eta: 0 };
       setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
       setActiveJob(finishedJob);
+      setLastOutputPath(resultPath);
     } catch (err) {
       addToast(`Error: ${err}`, "error");
       setLogs(prev => [...prev, `[ERROR] Job ${jobId} failed: ${err}`]);
@@ -336,6 +337,7 @@ const App: React.FC = () => {
       const finishedJob: Job = { ...newJob, status: 'done', progress: 100, outputPath: resultPath, eta: 0 };
       setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
       setActiveJob(finishedJob);
+      setLastOutputPath(resultPath);
     } catch (err) {
       addToast(`Error: ${err}`, "error");
       setLogs(prev => [...prev, `[ERROR] Export ${jobId} failed: ${err}`]);
@@ -445,7 +447,6 @@ const App: React.FC = () => {
         darkMode={darkMode}
         showTechSpecs={showTechSpecs}
         setShowTechSpecs={setShowTechSpecs}
-        outputPath={outputPath}
       />
     </div>
   );
