@@ -93,8 +93,8 @@ export const PanelHeader: React.FC<PanelHeaderProps> = ({
         width: '100%',
         height: '100%',
         padding: '0 8px 0 12px',
-        backgroundColor: 'var(--mosaic-title-bg, #000000)',
-        borderBottom: '1px solid var(--mosaic-title-border, rgba(255, 255, 255, 0.06))',
+        backgroundColor: 'var(--mosaic-title-bg)',
+        borderBottom: '1px solid var(--mosaic-title-border)',
         userSelect: 'none',
         position: 'relative'
       }}
@@ -132,20 +132,6 @@ export const PanelHeader: React.FC<PanelHeaderProps> = ({
           }}
         >
           {config.label}
-        </span>
-
-        {/* Keyboard shortcut badge */}
-        <span style={{
-          fontSize: '8px',
-          fontFamily: 'var(--font-mono, monospace)',
-          color: 'var(--text-muted)',
-          background: 'rgba(255,255,255,0.04)',
-          padding: '2px 5px',
-          borderRadius: '3px',
-          border: '1px solid rgba(255,255,255,0.06)',
-          letterSpacing: '0.02em'
-        }}>
-          {config.shortcut}
         </span>
       </div>
 

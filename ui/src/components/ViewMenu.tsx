@@ -162,10 +162,10 @@ export const ViewMenu: React.FC = () => {
               position: 'absolute',
               top: 'calc(100% + 4px)',
               left: 0,
-              backgroundColor: '#111113',
-              border: '1px solid rgba(255,255,255,0.1)',
+              backgroundColor: 'var(--panel-bg)',
+              border: '1px solid var(--panel-border)',
               borderRadius: '8px',
-              boxShadow: '0 8px 24px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.03) inset',
+              boxShadow: 'var(--shadow-md)',
               minWidth: '220px',
               zIndex: 10001,
               padding: '8px 0',
@@ -179,7 +179,7 @@ export const ViewMenu: React.FC = () => {
             <div style={{
               padding: '6px 14px 10px',
               fontSize: '9px',
-              color: '#52525b',
+              color: 'var(--text-muted)',
               fontWeight: 700,
               letterSpacing: '0.08em',
               display: 'flex',
@@ -205,7 +205,7 @@ export const ViewMenu: React.FC = () => {
                     width: '100%',
                     background: 'transparent',
                     border: 'none',
-                    color: isActive ? '#ededed' : '#71717a',
+                    color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
                     fontSize: '11px',
                     padding: '8px 14px',
                     cursor: 'pointer',
@@ -215,12 +215,12 @@ export const ViewMenu: React.FC = () => {
                     gap: '10px'
                   }}
                   onMouseEnter={(e) => {
-                    e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.04)';
-                    e.currentTarget.style.color = '#ededed';
+                    e.currentTarget.style.backgroundColor = 'var(--button-hover-bg)';
+                    e.currentTarget.style.color = 'var(--text-primary)';
                   }}
                   onMouseLeave={(e) => {
                     e.currentTarget.style.backgroundColor = 'transparent';
-                    e.currentTarget.style.color = isActive ? '#ededed' : '#71717a';
+                    e.currentTarget.style.color = isActive ? 'var(--text-primary)' : 'var(--text-secondary)';
                   }}
                 >
                   {/* Icon */}
@@ -241,7 +241,7 @@ export const ViewMenu: React.FC = () => {
                   {/* Shortcut */}
                   <span style={{
                     fontSize: '9px',
-                    color: '#52525b',
+                    color: 'var(--text-muted)',
                     fontFamily: 'var(--font-mono, monospace)',
                     marginRight: '8px'
                   }}>
@@ -254,7 +254,7 @@ export const ViewMenu: React.FC = () => {
               );
             })}
 
-            <div style={{ height: '1px', background: 'rgba(255,255,255,0.06)', margin: '8px 0' }} />
+            <div style={{ height: '1px', background: 'var(--panel-border)', margin: '8px 0' }} />
 
             {/* Show All / Reset Actions */}
             <button

@@ -380,8 +380,8 @@ export const Timeline: React.FC<any> = ({ duration, currentTime, trimStart, trim
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
         marginBottom: '6px', padding: '6px 8px', minHeight: '36px',
-        borderBottom: '1px solid rgba(255,255,255,0.06)',
-        background: 'linear-gradient(to bottom, #0d0d0f, #09090b)',
+        borderBottom: '1px solid var(--panel-border)',
+        background: 'var(--timeline-toolbar-bg)',
         borderRadius: '6px 6px 0 0'
       }}>
         {/* LEFT: TRIM RANGE + FRAME NAV */}
@@ -443,7 +443,7 @@ export const Timeline: React.FC<any> = ({ duration, currentTime, trimStart, trim
           width: '100%', overflowX: 'auto', overflowY: 'hidden', position: 'relative',
           paddingTop: '32px', paddingBottom: '14px', paddingLeft: '16px', paddingRight: '16px',
           boxSizing: 'border-box',
-          background: 'linear-gradient(to bottom, #0a0a0c 0%, #0d0d0f 100%)',
+          background: 'var(--timeline-bg)',
           borderRadius: '0 0 6px 6px'
         }}>
 
@@ -490,9 +490,9 @@ export const Timeline: React.FC<any> = ({ duration, currentTime, trimStart, trim
           {/* GROOVE / TRACK BED */}
           <div className="bg-layer" style={{
             position: 'absolute', top: 6, bottom: 6, left: 0, right: 0,
-            background: 'linear-gradient(to bottom, #0f0f11, #141416)',
+            background: 'var(--timeline-track-bg)',
             borderRadius: '6px', overflow: 'hidden',
-            border: '1px solid rgba(255,255,255,0.06)',
+            border: '1px solid var(--panel-border)',
             zIndex: 2,
             boxShadow: 'inset 0 2px 4px rgba(0,0,0,0.6), inset 0 -1px 2px rgba(255,255,255,0.02)'
           }}>

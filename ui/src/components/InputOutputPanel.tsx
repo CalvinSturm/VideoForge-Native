@@ -2,6 +2,7 @@ import React, { useMemo, useState, useRef, useEffect, useCallback } from "react"
 import { createPortal } from "react-dom";
 import type { EditState, VideoState, UpscaleMode } from "../types";
 import { SignalSummary } from "./SignalSummary";
+import { useJobStore, type EnhancementMode, type ArchivalModel, type CreativeModel, type UpscaleScale } from "../Store/useJobStore";
 
 // --- ICONS ---
 const IconCamera = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" /><circle cx="12" cy="13" r="4" /></svg>;
@@ -31,10 +32,9 @@ const IconPlus = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="non
 const IconX = () => <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>;
 
 // --- CONFIGURATION ---
-type AIModel = 'RCAN' | 'EDSR';
-type CreativeModel = 'REALISTIC' | 'ANIME';
-type EnhancementMode = 'archival' | 'creative';
-type UpscaleScale = 2 | 3 | 4;
+type AIModel = ArchivalModel;
+type CreativeModelType = CreativeModel;
+type UpscaleScaleType = UpscaleScale;
 
 // Canonical model identifiers sent to backend
 // Format: {MODEL}_x{SCALE} - backend resolves to actual weight files
@@ -141,14 +141,14 @@ const Tooltip: React.FC<{ text: string; children: React.ReactNode; position?: 't
       transform: `translateX(-50%) translateY(${actualPosition === 'top' ? '-100%' : '0'})`,
       width: TOOLTIP_WIDTH,
       padding: '8px 12px',
-      background: '#1a1a1c',
-      border: '1px solid rgba(255,255,255,0.15)',
+      background: 'var(--panel-bg)',
+      border: '1px solid var(--panel-border)',
       borderRadius: '6px',
       fontSize: '10px',
-      color: '#e0e0e0',
+      color: 'var(--text-primary)',
       whiteSpace: 'normal' as const,
       zIndex: 99999,
-      boxShadow: '0 4px 12px rgba(0,0,0,0.6)',
+      boxShadow: 'var(--shadow-md)',
       pointerEvents: 'none' as const,
       lineHeight: 1.4
     });
@@ -161,12 +161,12 @@ const Tooltip: React.FC<{ text: string; children: React.ReactNode; position?: 't
       transform: 'translateX(-50%) rotate(45deg)',
       width: '8px',
       height: '8px',
-      background: '#1a1a1c',
-      border: '1px solid rgba(255,255,255,0.15)',
-      borderTop: actualPosition === 'top' ? 'none' : '1px solid rgba(255,255,255,0.15)',
-      borderLeft: actualPosition === 'top' ? 'none' : '1px solid rgba(255,255,255,0.15)',
-      borderBottom: actualPosition === 'top' ? '1px solid rgba(255,255,255,0.15)' : 'none',
-      borderRight: actualPosition === 'top' ? '1px solid rgba(255,255,255,0.15)' : 'none',
+      background: 'var(--panel-bg)',
+      border: '1px solid var(--panel-border)',
+      borderTop: actualPosition === 'top' ? 'none' : '1px solid var(--panel-border)',
+      borderLeft: actualPosition === 'top' ? 'none' : '1px solid var(--panel-border)',
+      borderBottom: actualPosition === 'top' ? '1px solid var(--panel-border)' : 'none',
+      borderRight: actualPosition === 'top' ? '1px solid var(--panel-border)' : 'none',
     });
   }, [position]);
 
@@ -208,32 +208,41 @@ const Tooltip: React.FC<{ text: string; children: React.ReactNode; position?: 't
 };
 
 // --- TOAST COMPONENT ---
-const ToastNotification: React.FC<{ message: string; visible: boolean; onDismiss: () => void }> = ({ message, visible, onDismiss }) => {
+const ToastNotification: React.FC<{ message: string; visible: boolean; onDismiss: () => void; duration?: number }> = ({
+  message, visible, onDismiss, duration = 3000
+}) => {
   const [render, setRender] = useState(visible);
 
   useEffect(() => {
-    if (visible) setRender(true);
-    else setTimeout(() => setRender(false), 300); // Wait for exit animation
-  }, [visible]);
+    if (visible) {
+      setRender(true);
+      // Auto-dismiss after duration
+      const timer = setTimeout(() => onDismiss(), duration);
+      return () => clearTimeout(timer);
+    } else {
+      const hideTimer = setTimeout(() => setRender(false), 300);
+      return () => clearTimeout(hideTimer);
+    }
+  }, [visible, duration, onDismiss]);
 
   if (!render) return null;
 
   return (
     <div style={{
       position: 'absolute', top: '16px', right: '16px', zIndex: 2000,
-      background: '#1a1a1c', border: '1px solid rgba(255,255,255,0.1)',
-      borderLeft: '3px solid #fbbf24', // Amber warning color
+      background: 'var(--toast-bg)', border: '1px solid var(--toast-border)',
+      borderLeft: '3px solid var(--brand-primary)',
       borderRadius: '4px', padding: '10px 12px',
-      boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+      boxShadow: 'var(--shadow-md)',
       display: 'flex', alignItems: 'center', gap: '10px',
       transform: visible ? 'translateX(0)' : 'translateX(100%)',
       opacity: visible ? 1 : 0,
       transition: 'all 0.3s cubic-bezier(0.16, 1, 0.3, 1)',
       maxWidth: '260px'
     }}>
-      <span style={{ fontSize: '11px', color: '#ededed', fontFamily: 'var(--font-sans)', fontWeight: 500 }}>{message}</span>
+      <span style={{ fontSize: '11px', color: 'var(--toast-text)', fontFamily: 'var(--font-sans)', fontWeight: 500 }}>{message}</span>
       <button onClick={onDismiss} style={{
-        background: 'transparent', border: 'none', color: '#aaa', cursor: 'pointer', padding: '0 4px', fontSize: '14px'
+        background: 'transparent', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: '0 4px', fontSize: '14px'
       }}>×</button>
     </div>
   );
@@ -505,17 +514,17 @@ const PipelineNode = ({
       style={{
         marginBottom: "8px",
         background: isActive
-          ? `linear-gradient(135deg, ${accentColor}08, transparent 60%)`
-          : "linear-gradient(180deg, #141416, #111113)",
+          ? `linear-gradient(135deg, rgba(0,255,136,0.03), transparent 60%)`
+          : "var(--node-bg)",
         border: isActive
-          ? `1px solid ${accentColor}40`
-          : "1px solid rgba(255,255,255,0.06)",
+          ? `1px solid rgba(0,255,136,0.35)`
+          : "1px solid var(--node-border)",
         borderRadius: "10px",
         overflow: "hidden",
         flexShrink: 0,
         boxShadow: isActive
-          ? `0 4px 20px ${accentColor}15, inset 0 1px 0 rgba(255,255,255,0.04)`
-          : "0 2px 8px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.04)",
+          ? `0 4px 20px rgba(0,255,136,0.12), inset 0 1px 0 rgba(255,255,255,0.04)`
+          : "var(--shadow-md)",
         transition: "all 0.2s ease",
         position: "relative"
       }}
@@ -545,7 +554,7 @@ const PipelineNode = ({
           cursor: "pointer",
           padding: "10px 12px",
           paddingLeft: isActive ? "15px" : "12px",
-          background: isHovered ? "rgba(255,255,255,0.02)" : "transparent",
+          background: isHovered ? "var(--node-bg-hover)" : "transparent",
           userSelect: "none",
           transition: "background 0.15s",
           borderBottom: isOpen ? "1px solid rgba(255,255,255,0.04)" : "none",
@@ -848,13 +857,27 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
 }) => {
 
   const panelRef = useRef<HTMLDivElement>(null);
-  const [isAIActive, setIsAIActive] = useState(true);
 
-  // New state for deterministic upscaler UI
-  const [enhancementMode, setEnhancementMode] = useState<EnhancementMode>('archival');
-  const [aiModel, setAiModel] = useState<AIModel>('RCAN');
-  const [creativeModel, setCreativeModel] = useState<CreativeModel>('REALISTIC');
-  const [upscaleFactor, setUpscaleFactor] = useState<UpscaleScale>(4);
+  // ==========================================
+  // UPSCALE CONFIG FROM STORE (Centralized State)
+  // ==========================================
+  const { upscaleConfig, setUpscaleConfig } = useJobStore();
+
+  // Destructure for convenience - these are now from the store, not local state
+  const isAIActive = upscaleConfig.isEnabled;
+  const enhancementMode = upscaleConfig.mode;
+  const aiModel = upscaleConfig.archivalModel;
+  const creativeModel = upscaleConfig.creativeModel;
+  const upscaleFactor = upscaleConfig.scaleFactor;
+
+  // Setters that update the store
+  const setIsAIActive = (enabled: boolean) => setUpscaleConfig({ isEnabled: enabled });
+  const setEnhancementMode = (mode: EnhancementMode) => setUpscaleConfig({ mode });
+  const setAiModel = (model: ArchivalModel) => setUpscaleConfig({ archivalModel: model });
+  const setCreativeModel = (model: CreativeModel) => setUpscaleConfig({ creativeModel: model });
+  const setUpscaleFactor = (scale: UpscaleScale) => setUpscaleConfig({ scaleFactor: scale });
+
+  // Local UI state (not persisted)
   const [toastState, setToastState] = useState<{ msg: string; visible: boolean }>({ msg: '', visible: false });
 
   const showToast = (msg: string) => {
@@ -953,6 +976,26 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
       }
     }
   }, [enhancementMode, aiModel, creativeModel, upscaleFactor, isRCANAvailable, isEDSRAvailable, isRealisticAvailable, isAnimeAvailable]);
+
+  // ==========================================
+  // INPUT CHANGE REVALIDATION
+  // Revalidate upscale config when input changes
+  // ==========================================
+  useEffect(() => {
+    if (!inputPath) return;
+
+    // Auto-fix 3x in creative mode
+    if (enhancementMode === 'creative' && upscaleFactor === 3) {
+      setUpscaleFactor(4);
+      showToast("Creative mode: Switched to 4× (3× unavailable)");
+    }
+
+    // Auto-fix anime 2x
+    if (enhancementMode === 'creative' && creativeModel === 'ANIME' && upscaleFactor === 2) {
+      setUpscaleFactor(4);
+      showToast("Anime mode: Switched to 4× (2× unavailable)");
+    }
+  }, [inputPath]); // Only trigger on input change
 
   // --- DERIVED STATE ---
   const activeScale = upscaleFactor;
@@ -1297,7 +1340,80 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             </div>
           }
         >
-          {/* Enhancement Mode */}
+          {/* ==========================================
+              SUMMARY LINE - Current config at a glance
+              ========================================== */}
+          {isAIActive ? (
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '10px 12px',
+              background: 'linear-gradient(135deg, rgba(0,255,136,0.08), rgba(0,255,136,0.02))',
+              borderRadius: '8px',
+              border: '1px solid rgba(0,255,136,0.15)',
+              marginBottom: '8px'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                <div style={{
+                  fontSize: '13px',
+                  fontWeight: 700,
+                  color: 'var(--brand-primary)',
+                  fontFamily: 'var(--font-mono)',
+                  letterSpacing: '0.02em'
+                }}>
+                  {enhancementMode === 'archival' ? aiModel : creativeModel} {activeScale}×
+                </div>
+                <div style={{
+                  fontSize: '9px',
+                  color: 'var(--text-muted)',
+                  fontWeight: 600,
+                  letterSpacing: '0.05em',
+                  textTransform: 'uppercase'
+                }}>
+                  • {enhancementMode}
+                </div>
+              </div>
+              <div style={{
+                fontSize: '9px',
+                color: 'var(--text-secondary)',
+                fontFamily: 'var(--font-mono)'
+              }}>
+                {targetW > 0 ? `${finalInW}×${finalInH} → ${targetW}×${targetH}` : 'Ready'}
+              </div>
+            </div>
+          ) : (
+            /* BYPASS State - Explicit visual indicator */
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: '12px',
+              background: 'rgba(255,255,255,0.02)',
+              borderRadius: '8px',
+              border: '1px dashed rgba(255,255,255,0.1)',
+              marginBottom: '8px'
+            }}>
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                color: 'var(--text-muted)'
+              }}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <circle cx="12" cy="12" r="10" />
+                  <line x1="4.93" y1="4.93" x2="19.07" y2="19.07" />
+                </svg>
+                <span style={{
+                  fontSize: '10px',
+                  fontWeight: 600,
+                  letterSpacing: '0.08em'
+                }}>
+                  AI UPSCALE BYPASSED
+                </span>
+              </div>
+            </div>
+          )}
           <div style={{ opacity: isAIActive ? 1 : 0.4, pointerEvents: isAIActive ? 'auto' : 'none', transition: 'opacity 0.2s' }}>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
               <label style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.05em' }}>ENHANCEMENT MODE</label>
@@ -1732,30 +1848,66 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
           isActive={hasColorEdits}
           accentColor="#a855f7"
           extra={
-            hasColorEdits && (
+            <div style={{ display: 'flex', gap: '6px' }}>
               <button
                 onClick={(e) => {
                   e.stopPropagation();
+                  // Auto Grade: Apply conservative color corrections
+                  // These are sensible defaults that work well for most footage
                   setEditState({
                     ...editState,
-                    color: { brightness: 0, contrast: 0, saturation: 0, gamma: 1.0 }
+                    color: {
+                      brightness: 0.05,    // Slight lift
+                      contrast: 0.08,      // Gentle contrast boost
+                      saturation: 0.05,    // Subtle saturation
+                      gamma: 1.0           // Keep gamma neutral
+                    }
                   });
+                  showToast('Auto Grade applied (conservative)');
                 }}
                 style={{
                   height: '24px',
                   fontSize: '9px',
                   padding: '0 10px',
                   borderRadius: '6px',
-                  border: '1px solid rgba(168,85,247,0.3)',
-                  background: 'transparent',
-                  color: '#a855f7',
+                  border: '1px solid rgba(0,255,136,0.3)',
+                  background: 'linear-gradient(135deg, rgba(0,255,136,0.15), rgba(0,255,136,0.05))',
+                  color: 'var(--brand-primary)',
                   cursor: 'pointer',
-                  fontWeight: 600
+                  fontWeight: 600,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '4px'
                 }}
+                title="Apply automatic color grading"
               >
-                RESET ALL
+                <IconSparkles /> AUTO
               </button>
-            )
+              {hasColorEdits && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setEditState({
+                      ...editState,
+                      color: { brightness: 0, contrast: 0, saturation: 0, gamma: 1.0 }
+                    });
+                  }}
+                  style={{
+                    height: '24px',
+                    fontSize: '9px',
+                    padding: '0 10px',
+                    borderRadius: '6px',
+                    border: '1px solid rgba(168,85,247,0.3)',
+                    background: 'transparent',
+                    color: '#a855f7',
+                    cursor: 'pointer',
+                    fontWeight: 600
+                  }}
+                >
+                  RESET
+                </button>
+              )}
+            </div>
           }
         >
           <ColorSlider

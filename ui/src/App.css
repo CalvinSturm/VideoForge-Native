@@ -45,6 +45,25 @@
   /* SCROLLBARS */
   --scrollbar-thumb: #333;
   --scrollbar-thumb-hover: #555;
+
+  /* NODE/CARD BACKGROUNDS */
+  --node-bg: linear-gradient(180deg, #141416, #111113);
+  --node-bg-hover: rgba(255, 255, 255, 0.02);
+  --node-border: rgba(255, 255, 255, 0.12);
+
+  /* TIMELINE */
+  --timeline-bg: linear-gradient(to bottom, #0a0a0c 0%, #0d0d0f 100%);
+  --timeline-toolbar-bg: linear-gradient(to bottom, #0d0d0f, #09090b);
+  --timeline-track-bg: linear-gradient(to bottom, #0f0f11, #141416);
+
+  /* TOAST NOTIFICATIONS */
+  --toast-bg: #1a1a1c;
+  --toast-border: rgba(255, 255, 255, 0.1);
+  --toast-text: #ededed;
+
+  /* MOSAIC SPECIFIC (Dark Mode Defaults) */
+  --mosaic-title-bg: #111113;
+  --mosaic-title-border: rgba(255, 255, 255, 0.08);
 }
 
 /* ============================================================
@@ -59,60 +78,74 @@
    ============================================================ */
 .light-mode-container {
   /* BACKGROUNDS - Warm off-whites with subtle depth */
-  --bg-color: #f8f8f7;
-  /* Warm stone-white, not pure gray */
-  --bg-gradient: radial-gradient(circle at 50% 0%, #ffffff 0%, #f5f5f4 30%, #f0f0ee 100%);
+  --bg-color: #e5e5e5;
+  /* Stone-200: Darker desktop to reduce glare */
+  --bg-gradient: radial-gradient(circle at 50% 0%, #f3f4f6 0%, #e5e5e5 40%);
 
-  --panel-bg: #fefefe;
-  /* Near-white with cream undertone */
-  --panel-border: #e5e5e4;
-  /* Stone-200 - softer than zinc */
-  --section-bg: #fafaf9;
-  /* Stone-50 */
+  --panel-bg: #f3f4f6;
+  /* Grey-100: Distinctly "grey" panel surface */
+  --panel-border: #d1d5db;
+  /* Grey-300: Stronger definition */
+  --section-bg: #e5e7eb;
+  /* Grey-200: Very subtle contrast against panel */
 
-  /* BRAND - Deeper emerald for legibility on light */
-  --brand-primary: #047857;
-  /* Emerald-700 - richer on light backgrounds */
-  --brand-dim: rgba(4, 120, 87, 0.08);
+  /* BRAND - Vibrant but readable Green */
+  --brand-primary: #059669;
+  /* Emerald-600: Brighter, friendlier than 700 */
+  --brand-dim: rgba(5, 150, 105, 0.1);
   --brand-text-on-primary: #ffffff;
 
-  /* TEXT - Warm neutrals for eye comfort */
+  /* TEXT - High Readability */
   --text-primary: #1c1917;
-  /* Stone-900 - warm black */
+  /* Stone-900: Soft Black */
   --text-secondary: #44403c;
-  /* Stone-700 - readable secondary */
-  --text-muted: #78716c;
-  /* Stone-500 - subtle but visible */
+  /* Stone-700: High contrast secondary */
+  --text-muted: #57534e;
+  /* Stone-600: Much more legible than 500 */
 
-  /* CONTROLS - Soft shadows, warm tones */
+  /* CONTROLS - Tactile & Visible */
   --button-bg: #ffffff;
-  --button-hover-bg: #fafaf9;
+  /* Pop against stone-50 panel */
+  --button-hover-bg: #f5f5f4;
   --input-bg: #ffffff;
   --input-border: #d6d3d1;
-  /* Stone-300 */
+  /* Matches panel border for consistency */
 
-  /* SHADOWS - Warm undertones in shadows */
-  --shadow-sm: 0 1px 2px 0 rgba(28, 25, 23, 0.06);
-  --shadow-md: 0 4px 6px -1px rgba(28, 25, 23, 0.08), 0 2px 4px -1px rgba(28, 25, 23, 0.04);
-  --bevel-light: inset 0 1px 0 0 rgba(255, 255, 255, 0.9);
-  --inset-deep: inset 0 1px 2px 0 rgba(28, 25, 23, 0.06);
+  /* SHADOWS - Softer, more diffuse "Natural Light" */
+  --shadow-sm: 0 1px 2px 0 rgba(28, 25, 23, 0.08);
+  --shadow-md: 0 4px 12px -2px rgba(28, 25, 23, 0.08), 0 2px 6px -1px rgba(28, 25, 23, 0.04);
+  --bevel-light: inset 0 1px 0 0 rgba(255, 255, 255, 0.8);
+  --inset-deep: inset 0 1px 3px 0 rgba(28, 25, 23, 0.08);
 
   /* MOSAIC SPECIFIC */
-  --mosaic-title-bg: #f5f5f4;
-  /* Stone-100 - subtle header */
-  --mosaic-title-border: #e7e5e4;
-  /* Stone-200 */
+  --mosaic-title-bg: #f0f0f0;
+  /* Distinct header bg */
+  --mosaic-title-border: #d6d3d1;
 
   /* SCROLLBARS */
   --scrollbar-thumb: #d6d3d1;
-  /* Stone-300 */
   --scrollbar-thumb-hover: #a8a29e;
-  /* Stone-400 */
 
   /* DOCK/DOCK STRIPS */
-  --dock-bg: #fefefe;
-  --dock-border: #e7e5e4;
+  --dock-bg: #fafaf9;
+  --dock-border: #d6d3d1;
   --dock-hover: #f5f5f4;
+
+  /* NODE/CARD BACKGROUNDS */
+  --node-bg: #ffffff;
+  --node-bg-hover: #f9fafb;
+  --node-border: rgba(0, 0, 0, 0.12);
+  /* Slightly softer than 0.15 */
+
+  /* TIMELINE */
+  --timeline-bg: linear-gradient(to bottom, #f0f0f0 0%, #f5f5f4 100%);
+  --timeline-toolbar-bg: linear-gradient(to bottom, #f5f5f4, #f0f0f0);
+  --timeline-track-bg: linear-gradient(to bottom, #e7e5e4, #d6d3d1);
+
+  /* TOAST NOTIFICATIONS */
+  --toast-bg: #ffffff;
+  --toast-border: rgba(0, 0, 0, 0.12);
+  --toast-text: #1c1917;
 }
 
 /* FIX: Override Blueprint's default grey background */

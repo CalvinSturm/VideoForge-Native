@@ -1219,12 +1219,86 @@ class AIWorker:
                     self.load_model(new_model)
             elif cmd == "upscale_image_file":
                 self.handle_image_file(payload)
+            elif cmd == "analyze_for_auto_grade":
+                self.handle_auto_grade_analysis(payload)
             elif cmd == "shutdown":
                 self.running = False
         except Exception as e:
             print(f"[Python Error] Request failed: {e}", flush=True)
             traceback.print_exc()
             self.send_status("error", {"message": str(e)})
+
+    def handle_auto_grade_analysis(self, payload: Dict[str, Any]) -> None:
+        """
+        Analyze an image for auto color grading.
+        
+        Expected payload:
+        {
+            "command": "analyze_for_auto_grade",
+            "params": {
+                "image_path": "/path/to/image.jpg",
+                "protect_skin": true,
+                "conservative_mode": false
+            }
+        }
+        
+        Responds with auto-grade analysis results including recommended corrections.
+        """
+        try:
+            params = payload.get("params", {})
+            image_path = params.get("image_path")
+            protect_skin = params.get("protect_skin", True)
+            conservative_mode = params.get("conservative_mode", False)
+            
+            if not image_path:
+                self.send_status("error", {"message": "No image_path provided"})
+                return
+            
+            if not os.path.exists(image_path):
+                self.send_status("error", {"message": f"Image not found: {image_path}"})
+                return
+            
+            # Import auto-grade analysis module
+            from auto_grade_analysis import (
+                analyze_frame_for_auto_grade,
+                convert_corrections_to_edit_config
+            )
+            
+            # Load image
+            frame = cv2.imread(image_path)
+            if frame is None:
+                self.send_status("error", {"message": f"Could not load image: {image_path}"})
+                return
+            
+            print(f"[Python] Auto-grade analysis for: {image_path}", flush=True)
+            
+            # Run analysis
+            result = analyze_frame_for_auto_grade(frame, protect_skin, conservative_mode)
+            
+            # Convert to edit config format
+            edit_config = convert_corrections_to_edit_config(result["corrections"])
+            
+            # Send response
+            self.send_status("AUTO_GRADE_COMPLETE", {
+                "corrections": result["corrections"],
+                "edit_config": edit_config,
+                "confidence": result["confidence"],
+                "summary": result["summary"],
+                "analysis": {
+                    "scene": result["analysis"]["scene"],
+                    "skin": {
+                        "has_skin": result["analysis"]["skin"]["has_skin"],
+                        "is_face_dominant": result["analysis"]["skin"]["is_face_dominant"]
+                    }
+                }
+            })
+            
+            print(f"[Python] Auto-grade complete: confidence={result['confidence']:.2f}, summary={result['summary']}", flush=True)
+            
+        except Exception as e:
+            print(f"[Python Error] Auto-grade analysis failed: {e}", flush=True)
+            traceback.print_exc()
+            self.send_status("error", {"message": f"Auto-grade failed: {str(e)}"})
 
     # -------------------------------------------------------------------------
     # TILING LOGIC - Tile-invariant, Crop-invariant, No Seam Artifacts

@@ -106,26 +106,32 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
             const start = editState.trimStart;
             const end = editState.trimEnd;
 
-            // --- A. PAUSE ON COMPLETION (No Loop) ---
-            if (videoState.samplePreview) {
-               // Sample previews are usually short snippets starting at trimStart
-               if (t >= start + 2.0) {
-                  source.pause();
-                  result.pause();
-                  source.currentTime = start;
-                  result.currentTime = 0;
-                  setIsPlaying(false);
-                  return;
-               }
+            // --- A. PAUSE/LOOP ON COMPLETION ---
+            // Use result video duration as the authoritative source of truth for length if comparing
+            let effectiveEnd = 0;
+
+            if (hasResult && result.duration > 0 && result.duration !== Infinity) {
+               // If comparing, stop when the result video ends (account for floating point precision)
+               effectiveEnd = start + result.duration - 0.05;
+            } else if (videoState.samplePreview) {
+               effectiveEnd = start + 2.0;
             } else if (end > 0 && end < videoState.duration) {
-               if (t >= end) {
-                  source.pause();
-                  result.pause();
-                  source.currentTime = start;
-                  result.currentTime = start;
-                  setIsPlaying(false);
-                  return;
-               }
+               effectiveEnd = end;
+            } else {
+               effectiveEnd = videoState.duration;
+            }
+
+            // Check loop condition
+            if (effectiveEnd > start && t >= effectiveEnd) {
+               source.pause();
+               result.pause();
+               source.currentTime = start;
+               result.currentTime = 0;
+               // Optional: Auto-play loop? User asked for "restart" or "pause". 
+               // For now, pause and reset is safer default, user can just click play or we can loop if desired.
+               // Existing behavior was "pause".
+               setIsPlaying(false);
+               return;
             } else if (source.ended) {
                setIsPlaying(false);
                return;
@@ -145,13 +151,10 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
                }
 
                // --- C. SYNC CORRECTION ---
-               let targetTime = 0;
-               if (videoState.samplePreview) {
-                  targetTime = source.currentTime - start;
-                  if (targetTime < 0) targetTime = 0;
-               } else {
-                  targetTime = source.currentTime;
-               }
+               // Result video is always a new file starting at 0.0, corresponding to 'start' in source.
+               // We must subtract trimStart to align them.
+               let targetTime = source.currentTime - start;
+               if (targetTime < 0) targetTime = 0;
 
                const diff = Math.abs(result.currentTime - targetTime);
                // Tightened threshold: 0.04s (approx 1 frame at 24fps)

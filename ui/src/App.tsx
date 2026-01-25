@@ -98,12 +98,12 @@ const DockStrip = ({ position, onClick, label, icon, panelId }: {
         zIndex: 50,
         padding: isVertical ? '14px 0' : '0 14px',
         background: isHovered
-          ? `linear-gradient(135deg, ${accentColor}20, rgba(17,17,19,0.95))`
-          : 'rgba(17,17,19,0.9)',
+          ? `linear-gradient(135deg, ${accentColor}20, var(--dock-bg))`
+          : 'var(--dock-bg)',
         backdropFilter: 'blur(8px)',
         border: isHovered
           ? `1px solid ${accentColor}60`
-          : '1px solid rgba(255,255,255,0.1)',
+          : '1px solid var(--dock-border)',
         boxShadow: isHovered
           ? `0 4px 20px ${accentColor}30, 0 2px 8px rgba(0,0,0,0.4)`
           : '0 4px 12px rgba(0,0,0,0.4)',
@@ -176,7 +176,13 @@ const App: React.FC = () => {
     color: { brightness: 0, contrast: 0, saturation: 0, gamma: 1.0 }
   });
   const [inputDims, setInputDims] = useState({ w: 0, h: 0 });
-  const { setIsProcessing, setLastOutputPath } = useJobStore();
+  const { setIsProcessing, setLastOutputPath, upscaleConfig } = useJobStore();
+
+  // Helper: Extract scale factor from model string (robust fallback)
+  const getScaleFromModel = (modelId: string): number => {
+    const match = modelId.match(/x(\d)/);
+    return match ? parseInt(match[1], 10) : 4;
+  };
 
   // --- Keybinds ---
   useEffect(() => {
@@ -354,13 +360,19 @@ const App: React.FC = () => {
 
   const startUpscale = async () => {
     if (!inputPath) return addToast("Select an input file first!", "error");
+
+    // Guard: If AI upscale is disabled, this shouldn't be called
+    if (!upscaleConfig.isEnabled) {
+      return addToast("AI Upscale is bypassed. Enable it to upscale.", "warning");
+    }
+
     const jobId = Date.now().toString();
     const newJob: Job = { id: jobId, command: `Upscale: ${inputPath.split(/[\\/]/).pop()}`, status: "running", progress: 0, statusMessage: "Initializing...", paused: false, eta: 0 };
     setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
     if (!panels.QUEUE) openPanel('QUEUE');
 
-    let activeScale = 4;
-    if (model.includes("x2")) activeScale = 2;
+    // Use store's scaleFactor as source of truth, with model string as fallback
+    const activeScale = upscaleConfig.scaleFactor || getScaleFromModel(model);
 
     try {
       const resultPath = await invoke<string>("upscale_request", { inputPath, outputPath, model, editConfig: getRustEditConfig(), scale: activeScale });
@@ -403,7 +415,7 @@ const App: React.FC = () => {
     addToast("Rendering 2s Sample...", "info"); setPreviewFile(null);
     const start = Math.max(0, videoTime); const safeDuration = videoDuration > 0 ? videoDuration : 1000; const end = Math.min(safeDuration, start + 2.0);
     const previewConfig = { ...getRustEditConfig(), trim_start: start, trim_end: end };
-    let activeScale = 4; if (model.includes("x2")) activeScale = 2;
+    let activeScale = upscaleConfig.scaleFactor || getScaleFromModel(model);
     const jobId = "preview_" + Date.now().toString().slice(-6);
     const newJob: Job = { id: jobId, command: `PREVIEW SAMPLE`, status: "running", progress: 0, statusMessage: "Rendering...", paused: false, eta: 0 };
     setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
@@ -424,6 +436,30 @@ const App: React.FC = () => {
     setJobs(prev => prev.filter(j => j.status === 'running' || j.status === 'queued' || j.status === 'paused'));
   };
 
+  // --- Cancel / Dismiss Job Logic ---
+  const handleCancelJob = async (id: string) => {
+    const job = jobs.find(j => j.id === id);
+    if (!job) return;
+
+    if (job.status === 'running' || job.status === 'paused') {
+      try {
+        // Assume backend has a cancellation command, or just mark as cancelled in UI if backend is fire-and-forget
+        // For now, we'll mark as cancelled. If backend support exists, invoke it here.
+        // await invoke('cancel_job', { jobId: id }); 
+        setJobs(prev => prev.map(j => j.id === id ? { ...j, status: 'cancelled', progress: 0, eta: 0 } : j));
+        setLogs(prev => [...prev, `[SYSTEM] Job ${id} cancelled by user.`]);
+        if (activeJob?.id === id) setActiveJob(null);
+        setIsProcessing(false);
+      } catch (err) {
+        addToast("Failed to cancel job", "error");
+      }
+    } else {
+      // Dismiss (Delete from list)
+      setJobs(prev => prev.filter(j => j.id !== id));
+      if (activeJob?.id === id) setActiveJob(null);
+    }
+  };
+
   const isValidPaths = !!inputPath;
 
   const tileComponents = useMemo(() => {
@@ -432,7 +468,7 @@ const App: React.FC = () => {
       SETTINGS: <InputOutputPanel mode={mode} setMode={setMode} pickInput={pickInput} inputPath={inputPath} pickOutput={pickOutput} outputPath={outputPath} model={model} setModel={setModel} availableModels={availableModels} loadingModel={loadingModel} loadModel={() => { }} startUpscale={startUpscale} isValidPaths={isValidPaths} showTech={showTechSpecs} videoState={completeVideoState} editState={editState} setEditState={setEditState} onExportEdited={onExportEdited} viewMode={viewMode} setViewMode={setViewMode} />,
       PREVIEW: <PreviewPanel inputPreview={inputPath} activeJob={activeJob} videoState={completeVideoState} onFileDrop={handleNewInput} mode={mode} editState={editState} setEditState={setEditState} viewMode={viewMode} setViewMode={setViewMode} showTech={showTechSpecs} />,
       // Updated to pass clearCompleted
-      QUEUE: <JobsPanel jobs={jobs} pauseJob={() => { }} cancelJob={() => { }} resumeJob={() => { }} clearCompleted={clearCompletedJobs} showTech={showTechSpecs} />,
+      QUEUE: <JobsPanel jobs={jobs} pauseJob={() => { }} cancelJob={handleCancelJob} resumeJob={() => { }} clearCompleted={clearCompletedJobs} showTech={showTechSpecs} />,
       ACTIVITY: <LogsPanel logs={logs} setLogs={setLogs} darkMode={darkMode} logsEndRef={logsEndRef} />
     };
   }, [mode, inputPath, outputPath, model, availableModels, loadingModel, isValidPaths, showTechSpecs, videoState, editState, viewMode, jobs, activeJob, logs]);
