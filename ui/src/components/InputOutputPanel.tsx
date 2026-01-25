@@ -646,7 +646,7 @@ const Section = ({ title, children, defaultOpen = true, extra, badge }: {
   </PipelineNode>
 );
 
-const ColorSlider = ({ label, value, onChange, min = -1, max = 1, step = 0.01, formatValue, icon }: {
+const ColorSlider = ({ label, value, onChange, min = -1, max = 1, step = 0.01, formatValue, icon, accentColor = 'var(--brand-primary)' }: {
   label: string;
   value: number;
   onChange: (v: number) => void;
@@ -655,6 +655,7 @@ const ColorSlider = ({ label, value, onChange, min = -1, max = 1, step = 0.01, f
   step?: number;
   formatValue?: (v: number) => string;
   icon?: React.ReactNode;
+  accentColor?: string;
 }) => {
   const [isDragging, setIsDragging] = useState(false);
 
@@ -674,7 +675,7 @@ const ColorSlider = ({ label, value, onChange, min = -1, max = 1, step = 0.01, f
       padding: '10px 12px',
       background: isDragging ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.2)',
       borderRadius: '8px',
-      border: isDragging ? '1px solid rgba(0,255,136,0.2)' : '1px solid rgba(255,255,255,0.04)',
+      border: isDragging ? `1px solid ${accentColor}40` : '1px solid rgba(255,255,255,0.04)',
       transition: 'all 0.15s ease'
     }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -697,7 +698,7 @@ const ColorSlider = ({ label, value, onChange, min = -1, max = 1, step = 0.01, f
           <span style={{
             fontSize: '11px',
             fontFamily: 'var(--font-mono)',
-            color: isDefault ? 'var(--text-muted)' : 'var(--brand-primary)',
+            color: isDefault ? 'var(--text-muted)' : accentColor,
             fontWeight: 600,
             minWidth: '48px',
             textAlign: 'right'
@@ -745,7 +746,7 @@ const ColorSlider = ({ label, value, onChange, min = -1, max = 1, step = 0.01, f
             width: `${percentage}%`,
             background: isDefault
               ? 'rgba(255,255,255,0.15)'
-              : 'linear-gradient(90deg, var(--brand-primary)80, var(--brand-primary))',
+              : `linear-gradient(90deg, ${accentColor}80, ${accentColor})`,
             borderRadius: '3px',
             transition: isDragging ? 'none' : 'width 0.1s ease'
           }} />
@@ -782,10 +783,10 @@ const ColorSlider = ({ label, value, onChange, min = -1, max = 1, step = 0.01, f
           width: isDragging ? '14px' : '12px',
           height: isDragging ? '14px' : '12px',
           borderRadius: '50%',
-          background: isDefault ? '#666' : 'var(--brand-primary)',
+          background: isDefault ? '#666' : accentColor,
           border: '2px solid #fff',
           boxShadow: isDragging
-            ? '0 0 12px rgba(0,255,136,0.5), 0 2px 6px rgba(0,0,0,0.4)'
+            ? `0 0 12px ${accentColor}80, 0 2px 6px rgba(0,0,0,0.4)`
             : '0 2px 4px rgba(0,0,0,0.3)',
           pointerEvents: 'none',
           transition: isDragging ? 'none' : 'all 0.1s ease'
@@ -1761,16 +1762,19 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             label="BRIGHTNESS"
             value={editState.color.brightness}
             onChange={(v) => setEditState({ ...editState, color: { ...editState.color, brightness: v } })}
+            accentColor="#fbbf24"
           />
           <ColorSlider
             label="CONTRAST"
             value={editState.color.contrast}
             onChange={(v) => setEditState({ ...editState, color: { ...editState.color, contrast: v } })}
+            accentColor="#22d3ee"
           />
           <ColorSlider
             label="SATURATION"
             value={editState.color.saturation}
             onChange={(v) => setEditState({ ...editState, color: { ...editState.color, saturation: v } })}
+            accentColor="#f472b6"
           />
           <ColorSlider
             label="GAMMA"
@@ -1780,30 +1784,67 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             step={0.01}
             onChange={(v) => setEditState({ ...editState, color: { ...editState.color, gamma: v } })}
             formatValue={(v) => v.toFixed(2)}
+            accentColor="#a78bfa"
           />
         </PipelineNode>
 
+        <PipelineConnector isActive={hasColorEdits} />
+
+        {/* TEMPORAL NODE - Video only */}
         {mode === 'video' && (
-          <Section title="Temporal Processing">
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '6px' }}>
-              {FPS_OPTIONS.map(opt => (
-                <button key={opt.value} onClick={() => setEditState({ ...editState, fps: opt.value })}
-                  className={editState.fps === opt.value ? "toggle-active" : ""}
+          <PipelineNode
+            title="Frame Rate"
+            icon={<IconClock />}
+            nodeNumber={6}
+            isActive={hasMotionEdits}
+            accentColor="#eab308"
+            extra={
+              hasMotionEdits && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setEditState({ ...editState, fps: 0 });
+                  }}
                   style={{
-                    height: '48px', borderRadius: '6px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px',
-                    background: "var(--input-bg)", color: "var(--text-secondary)", border: "1px solid var(--input-border)",
-                    boxShadow: "inset 0 1px 3px rgba(0,0,0,0.3)"
+                    height: '24px',
+                    fontSize: '9px',
+                    padding: '0 10px',
+                    borderRadius: '6px',
+                    border: '1px solid rgba(234,179,8,0.3)',
+                    background: 'transparent',
+                    color: '#eab308',
+                    cursor: 'pointer',
+                    fontWeight: 600
                   }}
                 >
-                  <span style={{ fontWeight: 700, fontSize: '10px' }}>{opt.label}</span>
-                  <span style={{ fontSize: '7px', opacity: 0.6, letterSpacing: '0.05em', fontFamily: 'var(--font-mono)' }}>{opt.sub}</span>
+                  RESET
                 </button>
-              ))}
-            </div>
-          </Section>
+              )
+            }
+          >
+            <ToggleGroup
+              value={editState.fps}
+              onChange={(v: number) => setEditState({ ...editState, fps: v })}
+              options={[
+                { label: "NATIVE", sub: "SOURCE", value: 0 },
+                { label: "30", sub: "FPS", value: 30 },
+                { label: "60", sub: "FPS", value: 60 },
+                { label: "120", sub: "FPS", value: 120 }
+              ]}
+            />
+          </PipelineNode>
         )}
 
-        <Section title="Render Targets">
+        <PipelineConnector isActive={mode === 'video' ? hasMotionEdits : hasColorEdits} />
+
+        {/* OUTPUT NODE */}
+        <PipelineNode
+          title="Export Output"
+          icon={<IconExport />}
+          nodeNumber={mode === 'video' ? 7 : 6}
+          isActive={!!outputPath}
+          accentColor="#10b981"
+        >
           <SignalSummary
             sourceResolution={sourceInfo.label} sourceDetail={sourceInfo.detail} sourceFps={strSourceFps}
             targetResolution={targetInfo.label} targetDetail={targetInfo.detail} targetFps={strTargetFps}
@@ -1813,47 +1854,50 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
           {/* Active Edits Display */}
           {(hasEdits || isAIActive) && (
             <div style={{
-              display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '12px',
-              padding: '8px 10px', background: 'rgba(0,0,0,0.3)', borderRadius: '4px',
-              border: '1px solid rgba(255,255,255,0.05)'
+              display: 'flex', flexWrap: 'wrap', gap: '6px',
+              padding: '10px 12px', background: 'rgba(0,0,0,0.25)', borderRadius: '8px',
+              border: '1px solid rgba(255,255,255,0.06)'
             }}>
-              <span style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 600, width: '100%', marginBottom: '4px', letterSpacing: '0.05em' }}>
-                ACTIVE EDITS:
+              <span style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, width: '100%', marginBottom: '4px', letterSpacing: '0.05em' }}>
+                PIPELINE STAGES:
               </span>
+              {isAIActive && (
+                <span style={{
+                  fontSize: '9px', padding: '4px 10px', borderRadius: '4px',
+                  background: 'rgba(0, 255, 136, 0.12)', color: 'var(--brand-primary)', fontWeight: 600,
+                  border: '1px solid rgba(0, 255, 136, 0.25)',
+                  display: 'flex', alignItems: 'center', gap: '4px'
+                }}>
+                  <IconSparkles /> {enhancementMode === 'archival' ? aiModel : creativeModel} {activeScale}×
+                </span>
+              )}
               {isCropActive && (
                 <span style={{
-                  fontSize: '9px', padding: '3px 8px', borderRadius: '3px',
-                  background: 'rgba(59, 130, 246, 0.2)', color: '#60a5fa', fontWeight: 600,
-                  border: '1px solid rgba(59, 130, 246, 0.3)'
+                  fontSize: '9px', padding: '4px 10px', borderRadius: '4px',
+                  background: 'rgba(59, 130, 246, 0.12)', color: '#60a5fa', fontWeight: 600,
+                  border: '1px solid rgba(59, 130, 246, 0.25)'
                 }}>CROP</span>
-              )}
-              {hasColorEdits && (
-                <span style={{
-                  fontSize: '9px', padding: '3px 8px', borderRadius: '3px',
-                  background: 'rgba(168, 85, 247, 0.2)', color: '#c084fc', fontWeight: 600,
-                  border: '1px solid rgba(168, 85, 247, 0.3)'
-                }}>COLOR</span>
               )}
               {(editState.rotation !== 0 || editState.flipH || editState.flipV) && (
                 <span style={{
-                  fontSize: '9px', padding: '3px 8px', borderRadius: '3px',
-                  background: 'rgba(236, 72, 153, 0.2)', color: '#f472b6', fontWeight: 600,
-                  border: '1px solid rgba(236, 72, 153, 0.3)'
+                  fontSize: '9px', padding: '4px 10px', borderRadius: '4px',
+                  background: 'rgba(236, 72, 153, 0.12)', color: '#f472b6', fontWeight: 600,
+                  border: '1px solid rgba(236, 72, 153, 0.25)'
                 }}>TRANSFORM</span>
+              )}
+              {hasColorEdits && (
+                <span style={{
+                  fontSize: '9px', padding: '4px 10px', borderRadius: '4px',
+                  background: 'rgba(168, 85, 247, 0.12)', color: '#c084fc', fontWeight: 600,
+                  border: '1px solid rgba(168, 85, 247, 0.25)'
+                }}>COLOR</span>
               )}
               {hasMotionEdits && (
                 <span style={{
-                  fontSize: '9px', padding: '3px 8px', borderRadius: '3px',
-                  background: 'rgba(234, 179, 8, 0.2)', color: '#fbbf24', fontWeight: 600,
-                  border: '1px solid rgba(234, 179, 8, 0.3)'
-                }}>FPS: {targetFps}</span>
-              )}
-              {isAIActive && (
-                <span style={{
-                  fontSize: '9px', padding: '3px 8px', borderRadius: '3px',
-                  background: 'rgba(0, 255, 136, 0.15)', color: 'var(--brand-primary)', fontWeight: 600,
-                  border: '1px solid rgba(0, 255, 136, 0.3)'
-                }}>{enhancementMode === 'archival' ? aiModel : creativeModel} {activeScale}×</span>
+                  fontSize: '9px', padding: '4px 10px', borderRadius: '4px',
+                  background: 'rgba(234, 179, 8, 0.12)', color: '#fbbf24', fontWeight: 600,
+                  border: '1px solid rgba(234, 179, 8, 0.25)'
+                }}>{targetFps} FPS</span>
               )}
             </div>
           )}
@@ -1862,30 +1906,66 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
           {!hasEdits && !isAIActive && (
             <div style={{
               fontSize: '10px', color: 'var(--text-muted)', textAlign: 'center',
-              padding: '8px', background: 'rgba(0,0,0,0.2)', borderRadius: '4px',
-              marginBottom: '12px', fontStyle: 'italic'
+              padding: '12px', background: 'rgba(0,0,0,0.2)', borderRadius: '6px',
+              border: '1px dashed rgba(255,255,255,0.08)',
+              fontStyle: 'italic'
             }}>
-              No edits active — enable a tool above
+              No pipeline stages active — enable a tool above
             </div>
           )}
 
-          <div>
-            <label className="label-text" style={{ marginBottom: '6px', display: 'block', fontSize: '10px', color: 'var(--text-muted)', fontWeight: 600, fontFamily: 'var(--font-sans)' }}>EXPORT PATH</label>
-            <div onClick={pickOutput} title={outputPath} style={{
-              background: "var(--input-bg)", border: "1px solid var(--input-border)", borderRadius: "4px",
-              height: "36px", display: "flex", alignItems: "center", cursor: "pointer", padding: "0 10px", gap: "10px",
-              boxShadow: "inset 0 2px 4px rgba(0,0,0,0.5)"
+          {/* Export Path */}
+          <div
+            onClick={pickOutput}
+            title={outputPath}
+            style={{
+              background: "linear-gradient(135deg, rgba(16,185,129,0.1), transparent)",
+              border: outputPath ? "1px solid rgba(16,185,129,0.3)" : "1px dashed rgba(255,255,255,0.15)",
+              borderRadius: "8px",
+              height: "48px",
+              display: "flex",
+              alignItems: "center",
+              cursor: "pointer",
+              padding: "0 14px",
+              gap: "12px",
+              transition: "all 0.2s ease"
+            }}
+          >
+            <div style={{
+              width: "32px",
+              height: "32px",
+              borderRadius: "6px",
+              background: outputPath ? "rgba(16,185,129,0.2)" : "rgba(255,255,255,0.05)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: outputPath ? "#10b981" : "var(--text-muted)"
             }}>
-              <div style={{ color: "var(--text-muted)" }}><IconSave /></div>
-              <div style={{
-                flex: 1, fontSize: "10px", color: "var(--text-secondary)",
-                overflow: "hidden", textAlign: "left",
-              }}>
-                <SmartPath path={outputPath} placeholder="Auto-Generated" />
-              </div>
+              <IconSave />
             </div>
+            <div style={{
+              flex: 1,
+              fontSize: "11px",
+              color: outputPath ? "var(--text-primary)" : "var(--text-muted)",
+              overflow: "hidden",
+              textAlign: "left",
+            }}>
+              <SmartPath path={outputPath} placeholder="Click to set export location..." />
+            </div>
+            {outputPath && (
+              <div style={{
+                fontSize: "9px",
+                color: "#10b981",
+                fontWeight: 600,
+                padding: "3px 8px",
+                background: "rgba(16,185,129,0.15)",
+                borderRadius: "4px"
+              }}>
+                SET
+              </div>
+            )}
           </div>
-        </Section>
+        </PipelineNode>
 
       </div>
 
