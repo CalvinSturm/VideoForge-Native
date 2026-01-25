@@ -23,6 +23,7 @@ import { PreviewPanel } from "./components/PreviewPanel";
 import { StatusFooter } from "./components/StatusFooter";
 import { TitleBar } from "./components/TitleBar";
 import { PanelHeader } from "./components/PanelHeader";
+import { EmptyState } from "./components/EmptyState";
 
 import type { Toast, UpscaleMode, Job, VideoState, EditState } from './types';
 
@@ -464,7 +465,7 @@ const App: React.FC = () => {
           value={mosaicValue}
           onChange={handleMosaicChange}
           className={darkMode ? "mosaic-blueprint-theme" : "mosaic-light-theme"}
-          zeroStateView={<div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#555', fontSize: '12px' }}>All panels closed. Use View menu to restore.</div>}
+          zeroStateView={<EmptyState />}
         />
 
         {/* DOCK STRIPS */}
