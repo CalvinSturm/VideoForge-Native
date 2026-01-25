@@ -20,6 +20,15 @@ const IconSparkles = () => <svg width="12" height="12" viewBox="0 0 24 24" fill=
 const IconLock = () => <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></svg>;
 const IconInfo = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="12" y1="16" x2="12" y2="12" /><line x1="12" y1="8" x2="12.01" y2="8" /></svg>;
 const IconCheck = () => <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>;
+const IconCrop = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M6 2v14a2 2 0 0 0 2 2h14" /><path d="M18 22V8a2 2 0 0 0-2-2H2" /></svg>;
+const IconPalette = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor" /><circle cx="17.5" cy="10.5" r=".5" fill="currentColor" /><circle cx="8.5" cy="7.5" r=".5" fill="currentColor" /><circle cx="6.5" cy="12.5" r=".5" fill="currentColor" /><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.555C21.965 6.012 17.461 2 12 2z" /></svg>;
+const IconMove = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="5 9 2 12 5 15" /><polyline points="9 5 12 2 15 5" /><polyline points="15 19 12 22 9 19" /><polyline points="19 9 22 12 19 15" /><line x1="2" y1="12" x2="22" y2="12" /><line x1="12" y1="2" x2="12" y2="22" /></svg>;
+const IconClock = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>;
+const IconCpu = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="4" width="16" height="16" rx="2" ry="2" /><rect x="9" y="9" width="6" height="6" /><line x1="9" y1="1" x2="9" y2="4" /><line x1="15" y1="1" x2="15" y2="4" /><line x1="9" y1="20" x2="9" y2="23" /><line x1="15" y1="20" x2="15" y2="23" /><line x1="20" y1="9" x2="23" y2="9" /><line x1="20" y1="14" x2="23" y2="14" /><line x1="1" y1="9" x2="4" y2="9" /><line x1="1" y1="14" x2="4" y2="14" /></svg>;
+const IconExport = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></svg>;
+const IconChevronDown = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9" /></svg>;
+const IconPlus = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>;
+const IconX = () => <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>;
 
 // --- CONFIGURATION ---
 type AIModel = 'RCAN' | 'EDSR';
@@ -251,6 +260,40 @@ const SmartPath: React.FC<{ path: string; placeholder?: string }> = ({ path, pla
 };
 
 // --- SUB-COMPONENTS ---
+
+// Connection line between pipeline nodes
+const PipelineConnector = ({ isActive = false }: { isActive?: boolean }) => (
+  <div style={{
+    display: "flex",
+    justifyContent: "center",
+    padding: "2px 0",
+    position: "relative"
+  }}>
+    <div style={{
+      width: "2px",
+      height: "12px",
+      background: isActive
+        ? "linear-gradient(180deg, var(--brand-primary)60, var(--brand-primary)30)"
+        : "linear-gradient(180deg, rgba(255,255,255,0.1), rgba(255,255,255,0.05))",
+      borderRadius: "1px"
+    }} />
+    {isActive && (
+      <div style={{
+        position: "absolute",
+        top: "50%",
+        left: "50%",
+        transform: "translate(-50%, -50%)",
+        width: "6px",
+        height: "6px",
+        borderRadius: "50%",
+        background: "var(--brand-primary)",
+        boxShadow: "0 0 8px var(--brand-primary)",
+        animation: "pulse 2s infinite"
+      }} />
+    )}
+  </div>
+);
+
 const SelectionCard = ({ selected, onClick, title, subtitle, icon, disabled, badge }: {
   selected: boolean;
   onClick: () => void;
@@ -259,26 +302,104 @@ const SelectionCard = ({ selected, onClick, title, subtitle, icon, disabled, bad
   icon: React.ReactNode;
   disabled?: boolean;
   badge?: React.ReactNode;
-}) => (
-  <button onClick={onClick} disabled={disabled} style={{
-    flex: 1, display: "flex", flexDirection: "column", alignItems: "flex-start", justifyContent: "center",
-    height: "56px", padding: "8px 10px", minWidth: "90px",
-    background: selected && !disabled ? "var(--brand-dim)" : "var(--panel-bg)",
-    border: selected && !disabled ? "1px solid var(--brand-primary)" : "1px solid var(--panel-border)",
-    borderRadius: "6px", cursor: disabled ? "not-allowed" : "pointer",
-    transition: "all 0.15s ease", position: "relative", overflow: "hidden",
-    opacity: disabled ? 0.5 : 1,
-    boxShadow: selected && !disabled ? "0 0 10px rgba(0,255,136,0.1)" : "var(--shadow-sm)"
-  }}>
-    <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px", width: '100%' }}>
-      <div style={{ color: selected && !disabled ? "var(--brand-primary)" : "var(--text-muted)" }}>{icon}</div>
-      <span style={{ fontWeight: 700, fontSize: "11px", color: selected && !disabled ? "var(--text-primary)" : "var(--text-secondary)", fontFamily: 'var(--font-sans)', letterSpacing: '0.02em', flex: 1 }}>{title}</span>
-      {badge}
-    </div>
-    <span style={{ fontSize: "9px", color: "var(--text-muted)", marginLeft: "24px", fontFamily: 'var(--font-sans)' }}>{subtitle}</span>
-    {selected && !disabled && <div style={{ position: "absolute", top: 0, right: 0, width: 0, height: 0, borderTop: "8px solid var(--brand-primary)", borderLeft: "8px solid transparent" }} />}
-  </button>
-);
+}) => {
+  const [isHovered, setIsHovered] = useState(false);
+
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+      style={{
+        flex: 1,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "flex-start",
+        justifyContent: "center",
+        height: "60px",
+        padding: "10px 12px",
+        minWidth: "90px",
+        background: selected && !disabled
+          ? "linear-gradient(135deg, rgba(0,255,136,0.15), rgba(0,255,136,0.05))"
+          : isHovered && !disabled
+            ? "rgba(255,255,255,0.04)"
+            : "rgba(255,255,255,0.02)",
+        border: selected && !disabled
+          ? "1px solid rgba(0,255,136,0.5)"
+          : "1px solid rgba(255,255,255,0.08)",
+        borderRadius: "8px",
+        cursor: disabled ? "not-allowed" : "pointer",
+        transition: "all 0.2s ease",
+        position: "relative",
+        overflow: "hidden",
+        opacity: disabled ? 0.4 : 1,
+        boxShadow: selected && !disabled
+          ? "0 4px 16px rgba(0,255,136,0.15), inset 0 1px 0 rgba(255,255,255,0.05)"
+          : "inset 0 1px 0 rgba(255,255,255,0.03)"
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px", width: '100%' }}>
+        <div style={{
+          color: selected && !disabled ? "var(--brand-primary)" : "var(--text-muted)",
+          transition: "color 0.15s"
+        }}>
+          {icon}
+        </div>
+        <span style={{
+          fontWeight: 700,
+          fontSize: "11px",
+          color: selected && !disabled ? "var(--text-primary)" : "var(--text-secondary)",
+          fontFamily: 'var(--font-sans)',
+          letterSpacing: '0.02em',
+          flex: 1
+        }}>
+          {title}
+        </span>
+        {badge}
+      </div>
+      <span style={{
+        fontSize: "9px",
+        color: selected && !disabled ? "var(--brand-primary)" : "var(--text-muted)",
+        marginLeft: "24px",
+        fontFamily: 'var(--font-mono)',
+        letterSpacing: "0.05em",
+        opacity: 0.8
+      }}>
+        {subtitle}
+      </span>
+
+      {/* Selection indicator */}
+      {selected && !disabled && (
+        <>
+          <div style={{
+            position: "absolute",
+            top: "6px",
+            right: "6px",
+            width: "16px",
+            height: "16px",
+            borderRadius: "50%",
+            background: "var(--brand-primary)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "#000",
+            boxShadow: "0 2px 6px rgba(0,255,136,0.3)"
+          }}>
+            <IconCheck />
+          </div>
+          {/* Glow effect */}
+          <div style={{
+            position: "absolute",
+            inset: 0,
+            background: "radial-gradient(circle at 50% 100%, rgba(0,255,136,0.1), transparent 60%)",
+            pointerEvents: "none"
+          }} />
+        </>
+      )}
+    </button>
+  );
+};
 
 const ToggleGroup = ({ options, value, onChange, disabled }: {
   options: { label: string; sub?: string; value: any; disabled?: boolean }[];
@@ -287,9 +408,15 @@ const ToggleGroup = ({ options, value, onChange, disabled }: {
   disabled?: boolean;
 }) => (
   <div style={{
-    display: "flex", background: "var(--input-bg)", padding: "2px", borderRadius: "5px",
-    border: "1px solid rgba(255,255,255,0.08)", boxShadow: "inset 0 2px 4px rgba(0,0,0,0.05)",
-    opacity: disabled ? 0.5 : 1, pointerEvents: disabled ? 'none' : 'auto'
+    display: "flex",
+    gap: "4px",
+    background: "rgba(0,0,0,0.3)",
+    padding: "4px",
+    borderRadius: "8px",
+    border: "1px solid rgba(255,255,255,0.06)",
+    boxShadow: "inset 0 2px 4px rgba(0,0,0,0.3)",
+    opacity: disabled ? 0.5 : 1,
+    pointerEvents: disabled ? 'none' : 'auto'
   }}>
     {options.map((opt) => {
       const isActive = value === opt.value;
@@ -298,69 +425,228 @@ const ToggleGroup = ({ options, value, onChange, disabled }: {
         <button
           key={opt.label}
           onClick={() => !isOptDisabled && onChange(opt.value)}
-          className={isActive && !isOptDisabled ? "toggle-active" : ""}
           disabled={isOptDisabled}
           style={{
-            flex: 1, height: "28px", border: "none", borderRadius: "4px", minWidth: 0,
-            background: "transparent", color: isOptDisabled ? "var(--text-muted)" : "var(--text-muted)",
-            fontSize: "9px", fontWeight: 500, fontFamily: 'var(--font-sans)',
-            display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', lineHeight: 1.1,
-            boxShadow: isActive && !isOptDisabled ? "0 2px 4px rgba(0,0,0,0.4)" : "none",
-            opacity: isOptDisabled ? 0.4 : 1,
+            flex: 1,
+            height: "36px",
+            border: "none",
+            borderRadius: "6px",
+            minWidth: 0,
+            background: isActive && !isOptDisabled
+              ? "linear-gradient(135deg, var(--brand-primary), rgba(0,255,136,0.8))"
+              : "transparent",
+            color: isActive && !isOptDisabled
+              ? "#000"
+              : isOptDisabled
+                ? "var(--text-muted)"
+                : "var(--text-secondary)",
+            fontSize: "10px",
+            fontWeight: isActive ? 800 : 600,
+            fontFamily: 'var(--font-sans)',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            lineHeight: 1.2,
+            boxShadow: isActive && !isOptDisabled
+              ? "0 2px 8px rgba(0,255,136,0.4)"
+              : "none",
+            opacity: isOptDisabled ? 0.3 : 1,
             cursor: isOptDisabled ? 'not-allowed' : 'pointer',
-            padding: '0 4px'
+            padding: '0 8px',
+            transition: "all 0.15s ease"
           }}
         >
           <span>{opt.label}</span>
-          {opt.sub && <span style={{ fontSize: '7px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>{opt.sub}</span>}
+          {opt.sub && (
+            <span style={{
+              fontSize: '8px',
+              opacity: isActive ? 0.7 : 0.5,
+              fontFamily: 'var(--font-mono)',
+              marginTop: '1px'
+            }}>
+              {opt.sub}
+            </span>
+          )}
         </button>
       );
     })}
   </div>
 );
 
+// --- PIPELINE NODE COMPONENT ---
+// A visual node card for the processing pipeline with status indicator
+const PipelineNode = ({
+  title,
+  icon,
+  children,
+  defaultOpen = true,
+  extra,
+  badge,
+  isActive = false,
+  accentColor = 'var(--brand-primary)',
+  nodeNumber
+}: {
+  title: string;
+  icon: React.ReactNode;
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+  extra?: React.ReactNode;
+  badge?: React.ReactNode;
+  isActive?: boolean;
+  accentColor?: string;
+  nodeNumber?: number;
+}) => {
+  const [isOpen, setIsOpen] = useState(defaultOpen);
+  const [isHovered, setIsHovered] = useState(false);
+
+  return (
+    <div
+      style={{
+        marginBottom: "8px",
+        background: isActive
+          ? `linear-gradient(135deg, ${accentColor}08, transparent 60%)`
+          : "linear-gradient(180deg, #141416, #111113)",
+        border: isActive
+          ? `1px solid ${accentColor}40`
+          : "1px solid rgba(255,255,255,0.06)",
+        borderRadius: "10px",
+        overflow: "hidden",
+        flexShrink: 0,
+        boxShadow: isActive
+          ? `0 4px 20px ${accentColor}15, inset 0 1px 0 rgba(255,255,255,0.04)`
+          : "0 2px 8px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.04)",
+        transition: "all 0.2s ease",
+        position: "relative"
+      }}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+    >
+      {/* Active indicator line */}
+      {isActive && (
+        <div style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          bottom: 0,
+          width: "3px",
+          background: `linear-gradient(180deg, ${accentColor}, ${accentColor}60)`,
+          borderRadius: "3px 0 0 3px"
+        }} />
+      )}
+
+      {/* Header */}
+      <div
+        onClick={() => setIsOpen(!isOpen)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          cursor: "pointer",
+          padding: "10px 12px",
+          paddingLeft: isActive ? "15px" : "12px",
+          background: isHovered ? "rgba(255,255,255,0.02)" : "transparent",
+          userSelect: "none",
+          transition: "background 0.15s",
+          borderBottom: isOpen ? "1px solid rgba(255,255,255,0.04)" : "none",
+          minHeight: "40px",
+          gap: "8px"
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", flex: 1, minWidth: 0 }}>
+          {/* Node number indicator */}
+          {nodeNumber !== undefined && (
+            <div style={{
+              width: "20px",
+              height: "20px",
+              borderRadius: "6px",
+              background: isActive ? accentColor : "rgba(255,255,255,0.08)",
+              color: isActive ? "#000" : "var(--text-muted)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: "10px",
+              fontWeight: 700,
+              fontFamily: "var(--font-mono)",
+              flexShrink: 0
+            }}>
+              {nodeNumber}
+            </div>
+          )}
+
+          {/* Icon */}
+          <div style={{
+            color: isActive ? accentColor : "var(--text-muted)",
+            opacity: isActive ? 1 : 0.7,
+            transition: "all 0.15s"
+          }}>
+            {icon}
+          </div>
+
+          {/* Title */}
+          <h3 style={{
+            margin: 0,
+            color: isActive ? "var(--text-primary)" : "var(--text-secondary)",
+            fontSize: "11px",
+            fontWeight: 600,
+            letterSpacing: "0.02em",
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis"
+          }}>
+            {title}
+          </h3>
+
+          {badge}
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+          {extra}
+          <div style={{
+            color: "var(--text-muted)",
+            transform: isOpen ? "rotate(0deg)" : "rotate(-90deg)",
+            transition: 'transform 0.2s ease',
+            opacity: 0.5
+          }}>
+            <IconChevronDown />
+          </div>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div style={{
+        maxHeight: isOpen ? '2000px' : '0',
+        overflow: 'hidden',
+        transition: 'max-height 0.3s ease-out'
+      }}>
+        <div style={{ padding: "14px", display: "flex", flexDirection: "column", gap: "14px" }}>
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Legacy Section wrapper for backwards compatibility
 const Section = ({ title, children, defaultOpen = true, extra, badge }: {
   title: string;
   children: React.ReactNode;
   defaultOpen?: boolean;
   extra?: React.ReactNode;
   badge?: React.ReactNode;
-}) => {
-  const [isOpen, setIsOpen] = useState(defaultOpen);
-  return (
-    <div style={{
-      marginBottom: "12px", background: "var(--panel-bg)", border: "1px solid var(--panel-border)",
-      borderTop: "1px solid var(--panel-border)", borderRadius: "6px", overflow: "hidden", flexShrink: 0,
-      boxShadow: "var(--shadow-md)"
-    }}>
-      <div onClick={() => setIsOpen(!isOpen)} style={{
-        display: "flex", alignItems: "center", justifyContent: "space-between",
-        cursor: "pointer", padding: "8px 10px", background: "var(--section-bg)",
-        userSelect: "none", transition: "background 0.2s",
-        borderBottom: isOpen ? "1px solid var(--panel-border)" : "none", minHeight: "32px",
-        gap: "6px"
-      }}>
-        <div style={{ display: "flex", alignItems: "center", gap: "6px", flex: 1, minWidth: 0, overflow: "hidden" }}>
-          <h3 style={{ margin: 0, color: "var(--text-secondary)", fontSize: "9px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{title}</h3>
-          {badge}
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
-          {extra}
-          <span style={{ fontSize: "8px", color: "var(--text-muted)", transform: isOpen ? "rotate(0deg)" : "rotate(-90deg)", transition: 'transform 0.15s' }}>▼</span>
-        </div>
-      </div>
-      <div style={{
-        maxHeight: isOpen ? '1000px' : '0',
-        overflow: 'hidden',
-        transition: 'max-height 0.2s ease-out'
-      }}>
-        <div style={{ padding: "12px", display: "flex", flexDirection: "column", gap: "12px" }}>{children}</div>
-      </div>
-    </div>
-  );
-};
+}) => (
+  <PipelineNode
+    title={title}
+    icon={null}
+    defaultOpen={defaultOpen}
+    extra={extra}
+    badge={badge}
+  >
+    {children}
+  </PipelineNode>
+);
 
-const ColorSlider = ({ label, value, onChange, min = -1, max = 1, step = 0.01, formatValue }: {
+const ColorSlider = ({ label, value, onChange, min = -1, max = 1, step = 0.01, formatValue, icon }: {
   label: string;
   value: number;
   onChange: (v: number) => void;
@@ -368,36 +654,143 @@ const ColorSlider = ({ label, value, onChange, min = -1, max = 1, step = 0.01, f
   max?: number;
   step?: number;
   formatValue?: (v: number) => string;
+  icon?: React.ReactNode;
 }) => {
+  const [isDragging, setIsDragging] = useState(false);
+
   const defaultFormat = (v: number) => {
     if (min === -1 && max === 1) return `${v >= 0 ? '+' : ''}${Math.round(v * 100)}%`;
     return v.toFixed(2);
   };
   const displayValue = formatValue ? formatValue(value) : defaultFormat(value);
   const isDefault = min === -1 && max === 1 ? Math.abs(value) < 0.01 : Math.abs(value - 1) < 0.01;
+  const percentage = ((value - min) / (max - min)) * 100;
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+    <div style={{
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '8px',
+      padding: '10px 12px',
+      background: isDragging ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.2)',
+      borderRadius: '8px',
+      border: isDragging ? '1px solid rgba(0,255,136,0.2)' : '1px solid rgba(255,255,255,0.04)',
+      transition: 'all 0.15s ease'
+    }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <label style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.05em' }}>{label}</label>
-        <span style={{
-          fontSize: '10px', fontFamily: 'var(--font-mono)',
-          color: isDefault ? 'var(--text-muted)' : 'var(--brand-primary)', fontWeight: 500
-        }}>{displayValue}</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          {icon && <span style={{ color: 'var(--text-muted)', opacity: 0.6 }}>{icon}</span>}
+          <label style={{
+            fontSize: '10px',
+            color: 'var(--text-secondary)',
+            fontWeight: 600,
+            letterSpacing: '0.03em'
+          }}>
+            {label}
+          </label>
+        </div>
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '6px'
+        }}>
+          <span style={{
+            fontSize: '11px',
+            fontFamily: 'var(--font-mono)',
+            color: isDefault ? 'var(--text-muted)' : 'var(--brand-primary)',
+            fontWeight: 600,
+            minWidth: '48px',
+            textAlign: 'right'
+          }}>
+            {displayValue}
+          </span>
+          {!isDefault && (
+            <button
+              onClick={() => onChange(min === -1 ? 0 : 1)}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: 'var(--text-muted)',
+                cursor: 'pointer',
+                padding: '2px',
+                display: 'flex',
+                alignItems: 'center',
+                opacity: 0.6,
+                transition: 'opacity 0.15s'
+              }}
+              title="Reset to default"
+            >
+              <IconX />
+            </button>
+          )}
+        </div>
       </div>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(e) => onChange(parseFloat(e.target.value))}
-        style={{
-          width: '100%', height: '4px', WebkitAppearance: 'none', appearance: 'none',
-          background: `linear-gradient(to right, var(--brand-primary) 0%, var(--brand-primary) ${((value - min) / (max - min)) * 100}%, #333 ${((value - min) / (max - min)) * 100}%, #333 100%)`,
-          borderRadius: '2px', cursor: 'pointer', outline: 'none'
-        }}
-      />
+
+      {/* Custom slider track */}
+      <div style={{ position: 'relative', height: '6px' }}>
+        {/* Track background */}
+        <div style={{
+          position: 'absolute',
+          inset: 0,
+          background: 'rgba(255,255,255,0.08)',
+          borderRadius: '3px',
+          overflow: 'hidden'
+        }}>
+          {/* Fill */}
+          <div style={{
+            position: 'absolute',
+            left: 0,
+            top: 0,
+            bottom: 0,
+            width: `${percentage}%`,
+            background: isDefault
+              ? 'rgba(255,255,255,0.15)'
+              : 'linear-gradient(90deg, var(--brand-primary)80, var(--brand-primary))',
+            borderRadius: '3px',
+            transition: isDragging ? 'none' : 'width 0.1s ease'
+          }} />
+        </div>
+
+        {/* Native input (invisible but functional) */}
+        <input
+          type="range"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          onChange={(e) => onChange(parseFloat(e.target.value))}
+          onMouseDown={() => setIsDragging(true)}
+          onMouseUp={() => setIsDragging(false)}
+          onMouseLeave={() => setIsDragging(false)}
+          style={{
+            position: 'absolute',
+            inset: 0,
+            width: '100%',
+            height: '100%',
+            opacity: 0,
+            cursor: 'pointer',
+            margin: 0
+          }}
+        />
+
+        {/* Custom thumb */}
+        <div style={{
+          position: 'absolute',
+          left: `${percentage}%`,
+          top: '50%',
+          transform: 'translate(-50%, -50%)',
+          width: isDragging ? '14px' : '12px',
+          height: isDragging ? '14px' : '12px',
+          borderRadius: '50%',
+          background: isDefault ? '#666' : 'var(--brand-primary)',
+          border: '2px solid #fff',
+          boxShadow: isDragging
+            ? '0 0 12px rgba(0,255,136,0.5), 0 2px 6px rgba(0,0,0,0.4)'
+            : '0 2px 4px rgba(0,0,0,0.3)',
+          pointerEvents: 'none',
+          transition: isDragging ? 'none' : 'all 0.1s ease'
+        }} />
+      </div>
     </div>
   );
 };
@@ -654,49 +1047,214 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
   const modelDisplayLabel = isAIActive ? `${enhancementMode === 'archival' ? aiModel : creativeModel} ${activeScale}×` : undefined;
 
   return (
-    <div ref={panelRef} style={{ display: "flex", flexDirection: "column", background: "transparent", height: "100%", overflow: "hidden", position: 'relative' }}>
+    <div ref={panelRef} style={{
+      display: "flex",
+      flexDirection: "column",
+      background: "linear-gradient(180deg, #0c0c0e 0%, #0a0a0c 100%)",
+      height: "100%",
+      overflow: "hidden",
+      position: 'relative'
+    }}>
+      {/* Global Styles */}
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+          50% { opacity: 0.6; transform: translate(-50%, -50%) scale(1.2); }
+        }
+        .pipeline-scroll::-webkit-scrollbar { width: 6px; }
+        .pipeline-scroll::-webkit-scrollbar-track { background: transparent; }
+        .pipeline-scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
+        .pipeline-scroll::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+      `}</style>
+
       <ToastNotification message={toastState.msg} visible={toastState.visible} onDismiss={() => setToastState(s => ({ ...s, visible: false }))} />
-      <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", padding: "16px" }}>
 
-        <Section title="Input Assets">
-          <div style={{ marginBottom: "8px", display: 'flex', alignItems: 'center' }}>
-            <div style={{
-              display: 'inline-flex', alignItems: 'center', gap: '8px',
-              padding: '4px 8px', borderRadius: '4px',
-              backgroundColor: 'rgba(255, 255, 255, 0.03)',
-              border: '1px solid rgba(255, 255, 255, 0.08)',
-              fontSize: '10px', fontWeight: 600, color: 'var(--text-secondary)',
-              fontFamily: 'var(--font-sans)', letterSpacing: '0.05em'
-            }}>
-              <span style={{ opacity: 0.5, fontSize: '9px' }}>ASSET TYPE:</span>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: 'var(--brand-primary)' }}>
-                {mode === 'video' ? <IconFilm /> : <IconFile />}
-                <span>{mode.toUpperCase()}</span>
-              </div>
-            </div>
-          </div>
-
-          <div onClick={pickInput} title={inputPath} style={{
-            background: "var(--input-bg)", border: "1px solid var(--input-border)", borderRadius: "4px",
-            height: "40px", display: "flex", alignItems: "center", cursor: "pointer", padding: "0 12px", gap: "10px",
-            boxShadow: "inset 0 2px 4px rgba(0,0,0,0.5)"
+      {/* Pipeline Header */}
+      <div style={{
+        padding: "12px 16px",
+        borderBottom: "1px solid rgba(255,255,255,0.06)",
+        background: "linear-gradient(180deg, rgba(255,255,255,0.02), transparent)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        flexShrink: 0
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+          <div style={{
+            width: "28px",
+            height: "28px",
+            borderRadius: "8px",
+            background: "linear-gradient(135deg, var(--brand-primary)30, var(--brand-primary)10)",
+            border: "1px solid var(--brand-primary)40",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "var(--brand-primary)"
           }}>
-            <div style={{ color: "var(--text-muted)" }}><IconImport /></div>
-            <div style={{
-              flex: 1, fontSize: "11px", color: inputPath ? "var(--text-primary)" : "var(--text-muted)",
-              overflow: "hidden", textAlign: "left",
-            }}>
-              <SmartPath path={inputPath} placeholder="Select Source File..." />
-            </div>
+            <IconCpu />
           </div>
-        </Section>
+          <div>
+            <h2 style={{
+              margin: 0,
+              fontSize: "12px",
+              fontWeight: 700,
+              color: "var(--text-primary)",
+              letterSpacing: "0.02em"
+            }}>
+              Processing Pipeline
+            </h2>
+            <p style={{
+              margin: 0,
+              fontSize: "9px",
+              color: "var(--text-muted)",
+              marginTop: "2px"
+            }}>
+              {hasEdits || isAIActive
+                ? `${activeEditNames.length + (isAIActive ? 1 : 0)} stage${(activeEditNames.length + (isAIActive ? 1 : 0)) > 1 ? 's' : ''} active`
+                : 'No processing stages active'}
+            </p>
+          </div>
+        </div>
 
-        <Section
-          title="AI Pipeline"
+        {/* Asset type badge */}
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '6px',
+          padding: '6px 10px',
+          borderRadius: '6px',
+          background: 'rgba(255,255,255,0.03)',
+          border: '1px solid rgba(255,255,255,0.08)'
+        }}>
+          <div style={{ color: 'var(--brand-primary)' }}>
+            {mode === 'video' ? <IconFilm /> : <IconFile />}
+          </div>
+          <span style={{
+            fontSize: '10px',
+            fontWeight: 600,
+            color: 'var(--text-secondary)',
+            letterSpacing: '0.05em'
+          }}>
+            {mode.toUpperCase()}
+          </span>
+        </div>
+      </div>
+
+      <div className="pipeline-scroll" style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", padding: "12px" }}>
+
+        {/* INPUT NODE */}
+        <PipelineNode
+          title="Source Input"
+          icon={<IconImport />}
+          nodeNumber={1}
+          isActive={!!inputPath}
+          accentColor="#3b82f6"
+        >
+          <div
+            onClick={pickInput}
+            title={inputPath}
+            style={{
+              background: "linear-gradient(135deg, rgba(59,130,246,0.1), transparent)",
+              border: inputPath ? "1px solid rgba(59,130,246,0.3)" : "1px dashed rgba(255,255,255,0.15)",
+              borderRadius: "8px",
+              height: "48px",
+              display: "flex",
+              alignItems: "center",
+              cursor: "pointer",
+              padding: "0 14px",
+              gap: "12px",
+              transition: "all 0.2s ease"
+            }}
+          >
+            <div style={{
+              width: "32px",
+              height: "32px",
+              borderRadius: "6px",
+              background: inputPath ? "rgba(59,130,246,0.2)" : "rgba(255,255,255,0.05)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: inputPath ? "#3b82f6" : "var(--text-muted)"
+            }}>
+              {inputPath ? (mode === 'video' ? <IconFilm /> : <IconFile />) : <IconPlus />}
+            </div>
+            <div style={{
+              flex: 1,
+              fontSize: "11px",
+              color: inputPath ? "var(--text-primary)" : "var(--text-muted)",
+              overflow: "hidden",
+              textAlign: "left",
+            }}>
+              <SmartPath path={inputPath} placeholder="Click to select source file..." />
+            </div>
+            {inputPath && (
+              <div style={{
+                fontSize: "9px",
+                color: "#3b82f6",
+                fontWeight: 600,
+                padding: "3px 8px",
+                background: "rgba(59,130,246,0.15)",
+                borderRadius: "4px"
+              }}>
+                LOADED
+              </div>
+            )}
+          </div>
+
+          {/* Source info */}
+          {sourceW > 0 && (
+            <div style={{
+              display: "flex",
+              gap: "8px",
+              marginTop: "4px"
+            }}>
+              <div style={{
+                flex: 1,
+                padding: "8px 10px",
+                background: "rgba(0,0,0,0.2)",
+                borderRadius: "6px",
+                border: "1px solid rgba(255,255,255,0.04)"
+              }}>
+                <div style={{ fontSize: "8px", color: "var(--text-muted)", marginBottom: "2px" }}>RESOLUTION</div>
+                <div style={{ fontSize: "11px", color: "var(--text-primary)", fontWeight: 600 }}>{sourceInfo.label}</div>
+                <div style={{ fontSize: "9px", color: "var(--text-muted)", fontFamily: "var(--font-mono)" }}>{sourceInfo.detail}</div>
+              </div>
+              {mode === 'video' && (
+                <div style={{
+                  flex: 1,
+                  padding: "8px 10px",
+                  background: "rgba(0,0,0,0.2)",
+                  borderRadius: "6px",
+                  border: "1px solid rgba(255,255,255,0.04)"
+                }}>
+                  <div style={{ fontSize: "8px", color: "var(--text-muted)", marginBottom: "2px" }}>FRAME RATE</div>
+                  <div style={{ fontSize: "11px", color: "var(--text-primary)", fontWeight: 600 }}>{sourceFps} FPS</div>
+                </div>
+              )}
+            </div>
+          )}
+        </PipelineNode>
+
+        <PipelineConnector isActive={!!inputPath} />
+
+        {/* AI UPSCALE NODE */}
+        <PipelineNode
+          title="AI Upscale"
+          icon={<IconSparkles />}
+          nodeNumber={2}
+          isActive={isAIActive}
+          accentColor="var(--brand-primary)"
           badge={<DeterministicBadge mode={enhancementMode} />}
           extra={
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-              <span style={{ fontSize: '9px', color: isAIActive ? 'var(--brand-primary)' : 'var(--text-muted)', fontWeight: 700 }}>{isAIActive ? 'ON' : 'OFF'}</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{
+                fontSize: '9px',
+                color: isAIActive ? 'var(--brand-primary)' : 'var(--text-muted)',
+                fontWeight: 700,
+                letterSpacing: '0.05em'
+              }}>
+                {isAIActive ? 'ENABLED' : 'BYPASS'}
+              </span>
               <div
                 role="switch"
                 aria-checked={isAIActive}
@@ -705,17 +1263,34 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
                 onClick={(e) => { e.stopPropagation(); setIsAIActive(!isAIActive); }}
                 onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); setIsAIActive(!isAIActive); } }}
                 style={{
-                  width: '28px', height: '16px', borderRadius: '10px',
-                  background: isAIActive ? 'var(--brand-primary)' : '#1a1a1c',
-                  border: '1px solid rgba(255,255,255,0.1)',
-                  position: 'relative', cursor: 'pointer', transition: 'all 0.2s',
-                  boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.5)',
+                  width: '36px',
+                  height: '20px',
+                  borderRadius: '10px',
+                  background: isAIActive
+                    ? 'linear-gradient(135deg, var(--brand-primary), rgba(0,255,136,0.7))'
+                    : 'rgba(255,255,255,0.08)',
+                  border: isAIActive
+                    ? '1px solid var(--brand-primary)'
+                    : '1px solid rgba(255,255,255,0.1)',
+                  position: 'relative',
+                  cursor: 'pointer',
+                  transition: 'all 0.2s ease',
+                  boxShadow: isAIActive
+                    ? '0 2px 8px rgba(0,255,136,0.3)'
+                    : 'inset 0 1px 3px rgba(0,0,0,0.3)',
                   outline: 'none'
-                }}>
+                }}
+              >
                 <div style={{
-                  width: '12px', height: '12px', borderRadius: '50%', background: isAIActive ? 'black' : '#555',
-                  position: 'absolute', top: '1px', left: isAIActive ? '13px' : '1px', transition: 'left 0.2s',
-                  boxShadow: '0 1px 2px rgba(0,0,0,0.5)'
+                  width: '16px',
+                  height: '16px',
+                  borderRadius: '50%',
+                  background: isAIActive ? '#000' : '#555',
+                  position: 'absolute',
+                  top: '1px',
+                  left: isAIActive ? '17px' : '1px',
+                  transition: 'left 0.2s ease',
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.3)'
                 }} />
               </div>
             </div>
@@ -872,66 +1447,148 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
               disabled={!isAIActive}
             />
           </div>
-        </Section>
+        </PipelineNode>
 
-        <Section title="Crop Tool"
+        <PipelineConnector isActive={isAIActive} />
+
+        {/* CROP NODE */}
+        <PipelineNode
+          title="Crop & Frame"
+          icon={<IconCrop />}
+          nodeNumber={3}
+          isActive={isCropActive}
+          accentColor="#3b82f6"
           extra={
             isCropActive && (
-              <button onClick={(e) => { e.stopPropagation(); applyCrop(); }}
-                className={!isCropApplied ? "toggle-active" : ""}
+              <button
+                onClick={(e) => { e.stopPropagation(); applyCrop(); }}
                 style={{
-                  height: '22px', fontSize: '9px', padding: '0 10px', borderRadius: '4px',
-                  border: '1px solid var(--panel-border)', background: isCropApplied ? 'transparent' : 'var(--brand-primary)',
-                  color: isCropApplied ? 'var(--brand-primary)' : 'black'
+                  height: '24px',
+                  fontSize: '9px',
+                  padding: '0 12px',
+                  borderRadius: '6px',
+                  border: isCropApplied ? '1px solid rgba(59,130,246,0.3)' : 'none',
+                  background: isCropApplied ? 'transparent' : 'linear-gradient(135deg, #3b82f6, #2563eb)',
+                  color: isCropApplied ? '#3b82f6' : 'white',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  transition: 'all 0.15s ease',
+                  boxShadow: !isCropApplied ? '0 2px 8px rgba(59,130,246,0.3)' : 'none'
                 }}
               >
-                {isCropApplied ? "EDIT" : "DONE"}
+                {isCropApplied ? "EDIT" : "APPLY"}
               </button>
             )
           }
         >
           {!isCropActive ? (
-            <button onClick={toggleCrop} style={{ width: '100%', height: '32px', border: '1px dashed var(--panel-border)', color: 'var(--text-secondary)', fontSize: '10px', background: 'rgba(255,255,255,0.02)' }}>
-              + ENABLE CROP
+            <button
+              onClick={toggleCrop}
+              style={{
+                width: '100%',
+                height: '44px',
+                border: '1px dashed rgba(59,130,246,0.3)',
+                color: '#3b82f6',
+                fontSize: '10px',
+                fontWeight: 600,
+                background: 'rgba(59,130,246,0.05)',
+                borderRadius: '8px',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '8px',
+                transition: 'all 0.15s ease'
+              }}
+            >
+              <IconPlus /> ENABLE CROP TOOL
             </button>
           ) : (
             <>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '4px' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '6px' }}>
                 {ASPECT_RATIOS.map(ar => (
-                  <button key={ar.label} onClick={() => applyAspectRatio(ar.value)}
-                    className={editState.aspectRatio === ar.value ? "toggle-active" : ""}
+                  <button
+                    key={ar.label}
+                    onClick={() => applyAspectRatio(ar.value)}
                     style={{
-                      fontSize: '9px', height: '26px', borderRadius: '4px',
-                      background: "var(--input-bg)", border: "1px solid var(--input-border)", color: "var(--text-muted)",
-                      boxShadow: "0 1px 2px rgba(0,0,0,0.2)"
+                      fontSize: '10px',
+                      height: '34px',
+                      borderRadius: '6px',
+                      background: editState.aspectRatio === ar.value
+                        ? 'linear-gradient(135deg, rgba(59,130,246,0.3), rgba(59,130,246,0.1))'
+                        : 'rgba(255,255,255,0.03)',
+                      border: editState.aspectRatio === ar.value
+                        ? '1px solid rgba(59,130,246,0.5)'
+                        : '1px solid rgba(255,255,255,0.08)',
+                      color: editState.aspectRatio === ar.value ? '#60a5fa' : 'var(--text-muted)',
+                      fontWeight: editState.aspectRatio === ar.value ? 700 : 500,
+                      cursor: 'pointer',
+                      transition: 'all 0.15s ease'
                     }}
-                  >{ar.label}</button>
+                  >
+                    {ar.label}
+                  </button>
                 ))}
               </div>
               <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '4px' }}>
-                <button onClick={toggleCrop} style={{ color: '#ef4444', background: 'transparent', fontSize: '9px', border: 'none', cursor: 'pointer' }}>REMOVE</button>
+                <button
+                  onClick={toggleCrop}
+                  style={{
+                    color: '#ef4444',
+                    background: 'rgba(239,68,68,0.1)',
+                    fontSize: '9px',
+                    border: '1px solid rgba(239,68,68,0.2)',
+                    borderRadius: '4px',
+                    padding: '4px 10px',
+                    cursor: 'pointer',
+                    fontWeight: 600,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '4px'
+                  }}
+                >
+                  <IconX /> REMOVE
+                </button>
               </div>
             </>
           )}
-        </Section>
+        </PipelineNode>
 
-        <Section title="Transform"
+        <PipelineConnector isActive={isCropActive} />
+
+        {/* TRANSFORM NODE */}
+        <PipelineNode
+          title="Transform"
+          icon={<IconMove />}
+          nodeNumber={4}
+          isActive={editState.rotation !== 0 || editState.flipH || editState.flipV}
+          accentColor="#ec4899"
           extra={
             (editState.rotation !== 0 || editState.flipH || editState.flipV) && (
-              <button onClick={(e) => {
-                e.stopPropagation();
-                setEditState({ ...editState, rotation: 0, flipH: false, flipV: false });
-              }}
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setEditState({ ...editState, rotation: 0, flipH: false, flipV: false });
+                }}
                 style={{
-                  height: '22px', fontSize: '9px', padding: '0 10px', borderRadius: '4px',
-                  border: '1px solid var(--panel-border)', background: 'transparent',
-                  color: 'var(--text-muted)', cursor: 'pointer'
-                }}>RESET</button>
+                  height: '24px',
+                  fontSize: '9px',
+                  padding: '0 10px',
+                  borderRadius: '6px',
+                  border: '1px solid rgba(236,72,153,0.3)',
+                  background: 'transparent',
+                  color: '#ec4899',
+                  cursor: 'pointer',
+                  fontWeight: 600
+                }}
+              >
+                RESET
+              </button>
             )
           }
         >
           <div>
-            <label style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.05em', marginBottom: '6px', display: 'block' }}>ROTATION</label>
+            <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em', marginBottom: '8px', display: 'block' }}>ROTATION</label>
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
               <button onClick={() => {
                 const rotations: (0 | 90 | 180 | 270)[] = [0, 90, 180, 270];
@@ -940,10 +1597,17 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
                 setEditState({ ...editState, rotation: newRotation });
               }}
                 style={{
-                  fontSize: '9px', height: '32px', width: '40px', borderRadius: '4px',
-                  background: "var(--input-bg)", border: "1px solid var(--input-border)", color: "var(--text-muted)",
-                  boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
-                  display: 'flex', alignItems: 'center', justifyContent: 'center'
+                  height: '38px',
+                  width: '44px',
+                  borderRadius: '6px',
+                  background: 'rgba(255,255,255,0.03)',
+                  border: '1px solid rgba(255,255,255,0.08)',
+                  color: 'var(--text-muted)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: 'pointer',
+                  transition: 'all 0.15s ease'
                 }}
                 title="Rotate Counter-Clockwise"
               >
@@ -951,16 +1615,29 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
               </button>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '4px', flex: 1 }}>
                 {([0, 90, 180, 270] as const).map(deg => (
-                  <button key={deg} onClick={() => setEditState({ ...editState, rotation: deg })}
-                    className={editState.rotation === deg ? "toggle-active" : ""}
+                  <button
+                    key={deg}
+                    onClick={() => setEditState({ ...editState, rotation: deg })}
                     style={{
-                      fontSize: '9px', height: '32px', borderRadius: '4px',
-                      background: "var(--input-bg)", border: "1px solid var(--input-border)", color: "var(--text-muted)",
-                      boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
-                      display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px'
+                      fontSize: '10px',
+                      height: '38px',
+                      borderRadius: '6px',
+                      background: editState.rotation === deg
+                        ? 'linear-gradient(135deg, rgba(236,72,153,0.3), rgba(236,72,153,0.1))'
+                        : 'rgba(255,255,255,0.03)',
+                      border: editState.rotation === deg
+                        ? '1px solid rgba(236,72,153,0.5)'
+                        : '1px solid rgba(255,255,255,0.08)',
+                      color: editState.rotation === deg ? '#f472b6' : 'var(--text-muted)',
+                      fontWeight: editState.rotation === deg ? 700 : 500,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      cursor: 'pointer',
+                      transition: 'all 0.15s ease'
                     }}
                   >
-                    {deg === 0 ? '0°' : deg === 90 ? '90°' : deg === 180 ? '180°' : '270°'}
+                    {deg}°
                   </button>
                 ))}
               </div>
@@ -971,10 +1648,17 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
                 setEditState({ ...editState, rotation: newRotation });
               }}
                 style={{
-                  fontSize: '9px', height: '32px', width: '40px', borderRadius: '4px',
-                  background: "var(--input-bg)", border: "1px solid var(--input-border)", color: "var(--text-muted)",
-                  boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
-                  display: 'flex', alignItems: 'center', justifyContent: 'center'
+                  height: '38px',
+                  width: '44px',
+                  borderRadius: '6px',
+                  background: 'rgba(255,255,255,0.03)',
+                  border: '1px solid rgba(255,255,255,0.08)',
+                  color: 'var(--text-muted)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: 'pointer',
+                  transition: 'all 0.15s ease'
                 }}
                 title="Rotate Clockwise"
               >
@@ -983,50 +1667,93 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             </div>
           </div>
           <div>
-            <label style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.05em', marginBottom: '6px', display: 'block' }}>FLIP / MIRROR</label>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '4px' }}>
-              <button onClick={() => setEditState({ ...editState, flipH: !editState.flipH })}
-                className={editState.flipH ? "toggle-active" : ""}
+            <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em', marginBottom: '8px', display: 'block' }}>FLIP / MIRROR</label>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '6px' }}>
+              <button
+                onClick={() => setEditState({ ...editState, flipH: !editState.flipH })}
                 style={{
-                  fontSize: '9px', height: '32px', borderRadius: '4px',
-                  background: "var(--input-bg)", border: "1px solid var(--input-border)", color: "var(--text-muted)",
-                  boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
-                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px'
+                  fontSize: '10px',
+                  height: '40px',
+                  borderRadius: '6px',
+                  background: editState.flipH
+                    ? 'linear-gradient(135deg, rgba(236,72,153,0.3), rgba(236,72,153,0.1))'
+                    : 'rgba(255,255,255,0.03)',
+                  border: editState.flipH
+                    ? '1px solid rgba(236,72,153,0.5)'
+                    : '1px solid rgba(255,255,255,0.08)',
+                  color: editState.flipH ? '#f472b6' : 'var(--text-muted)',
+                  fontWeight: editState.flipH ? 700 : 500,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '8px',
+                  cursor: 'pointer',
+                  transition: 'all 0.15s ease'
                 }}
               >
                 <IconFlipH /> HORIZONTAL
               </button>
-              <button onClick={() => setEditState({ ...editState, flipV: !editState.flipV })}
-                className={editState.flipV ? "toggle-active" : ""}
+              <button
+                onClick={() => setEditState({ ...editState, flipV: !editState.flipV })}
                 style={{
-                  fontSize: '9px', height: '32px', borderRadius: '4px',
-                  background: "var(--input-bg)", border: "1px solid var(--input-border)", color: "var(--text-muted)",
-                  boxShadow: "0 1px 2px rgba(0,0,0,0.2)",
-                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px'
+                  fontSize: '10px',
+                  height: '40px',
+                  borderRadius: '6px',
+                  background: editState.flipV
+                    ? 'linear-gradient(135deg, rgba(236,72,153,0.3), rgba(236,72,153,0.1))'
+                    : 'rgba(255,255,255,0.03)',
+                  border: editState.flipV
+                    ? '1px solid rgba(236,72,153,0.5)'
+                    : '1px solid rgba(255,255,255,0.08)',
+                  color: editState.flipV ? '#f472b6' : 'var(--text-muted)',
+                  fontWeight: editState.flipV ? 700 : 500,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '8px',
+                  cursor: 'pointer',
+                  transition: 'all 0.15s ease'
                 }}
               >
                 <IconFlipV /> VERTICAL
               </button>
             </div>
           </div>
-        </Section>
+        </PipelineNode>
 
-        <Section title="Color Grading"
+        <PipelineConnector isActive={editState.rotation !== 0 || editState.flipH || editState.flipV} />
+
+        {/* COLOR GRADING NODE */}
+        <PipelineNode
+          title="Color Grading"
+          icon={<IconPalette />}
+          nodeNumber={5}
+          isActive={hasColorEdits}
+          accentColor="#a855f7"
           extra={
-            (editState.color.brightness !== 0 || editState.color.contrast !== 0 ||
-              editState.color.saturation !== 0 || editState.color.gamma !== 1.0) && (
-              <button onClick={(e) => {
-                e.stopPropagation();
-                setEditState({
-                  ...editState,
-                  color: { brightness: 0, contrast: 0, saturation: 0, gamma: 1.0 }
-                });
-              }}
+            hasColorEdits && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setEditState({
+                    ...editState,
+                    color: { brightness: 0, contrast: 0, saturation: 0, gamma: 1.0 }
+                  });
+                }}
                 style={{
-                  height: '22px', fontSize: '9px', padding: '0 10px', borderRadius: '4px',
-                  border: '1px solid var(--panel-border)', background: 'transparent',
-                  color: 'var(--text-muted)', cursor: 'pointer'
-                }}>RESET</button>
+                  height: '24px',
+                  fontSize: '9px',
+                  padding: '0 10px',
+                  borderRadius: '6px',
+                  border: '1px solid rgba(168,85,247,0.3)',
+                  background: 'transparent',
+                  color: '#a855f7',
+                  cursor: 'pointer',
+                  fontWeight: 600
+                }}
+              >
+                RESET ALL
+              </button>
             )
           }
         >
@@ -1054,7 +1781,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             onChange={(v) => setEditState({ ...editState, color: { ...editState.color, gamma: v } })}
             formatValue={(v) => v.toFixed(2)}
           />
-        </Section>
+        </PipelineNode>
 
         {mode === 'video' && (
           <Section title="Temporal Processing">
