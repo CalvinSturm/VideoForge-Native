@@ -1051,7 +1051,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
     <div ref={panelRef} style={{
       display: "flex",
       flexDirection: "column",
-      background: "linear-gradient(180deg, #0c0c0e 0%, #0a0a0c 100%)",
+      background: "var(--panel-bg)",
       height: "100%",
       overflow: "hidden",
       position: 'relative'
@@ -1073,8 +1073,8 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
       {/* Pipeline Header */}
       <div style={{
         padding: "12px 16px",
-        borderBottom: "1px solid rgba(255,255,255,0.06)",
-        background: "linear-gradient(180deg, rgba(255,255,255,0.02), transparent)",
+        borderBottom: "1px solid var(--panel-border)",
+        background: "var(--section-bg)",
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
@@ -1969,7 +1969,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
 
       </div>
 
-      <div style={{ padding: "16px", borderTop: "1px solid var(--panel-border)", background: "rgba(0,0,0,0.2)", display: "flex", flexDirection: "column", gap: "12px", flexShrink: 0 }}>
+      <div style={{ padding: "16px", borderTop: "1px solid var(--panel-border)", background: "var(--section-bg)", display: "flex", flexDirection: "column", gap: "12px", flexShrink: 0 }}>
         {mode === 'video' && (
           <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: "8px", alignItems: 'center' }}>
             <button
