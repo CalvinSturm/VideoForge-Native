@@ -27,20 +27,8 @@ import { EmptyState } from "./components/EmptyState";
 
 import type { Toast, UpscaleMode, Job, VideoState, EditState } from './types';
 
-// Canonical model identifiers supported by the application
-// RCAN/EDSR use canonical format: {MODEL}_x{SCALE}
-// RealESRGAN uses descriptive names (no .pth extension in canonical form)
-const SUPPORTED_MODELS = [
-  // Deterministic (Archival) models
-  "RCAN_x2", "RCAN_x3", "RCAN_x4", "RCAN_x8",
-  "EDSR_x2", "EDSR_x3", "EDSR_x4",
-  // Creative (GAN) models - Note: No official 2x anime model exists
-  "RealESRGAN_x4plus", "RealESRGAN_x2plus",
-  "RealESRGAN_x4plus_anime_6B",
-  // Legacy support (in case old weight files exist)
-  "RealESRGAN_x4plus.pth", "RealESRGAN_x2plus.pth",
-  "RealESRGAN_x4plus_anime_6B.pth"
-];
+// Fallback model list when engine discovery fails
+const DEFAULT_MODELS = ["RCAN_x4", "EDSR_x4", "RealESRGAN_x4plus"];
 
 const DEFAULT_LAYOUT: MosaicNode<PanelId> = {
   direction: "row",
@@ -288,11 +276,11 @@ const App: React.FC = () => {
   useEffect(() => {
     if (isEngineReady) {
       invoke<any[]>("get_models").then(models => {
-        const filtered = models.map(m => m.id).filter(id => SUPPORTED_MODELS.includes(id));
-        setAvailableModels(filtered.length === 0 ? SUPPORTED_MODELS : filtered);
-      }).catch(e => setAvailableModels(SUPPORTED_MODELS));
+        const ids = models.map(m => m.id);
+        setAvailableModels(ids.length > 0 ? ids : DEFAULT_MODELS);
+      }).catch(() => setAvailableModels(DEFAULT_MODELS));
     } else {
-      setAvailableModels(SUPPORTED_MODELS);
+      setAvailableModels(DEFAULT_MODELS);
     }
   }, [isEngineReady]);
 

@@ -30,10 +30,15 @@ use std::os::windows::process::CommandExt;
 mod edit_config;
 mod models;
 mod shm;
+mod shm_ring;
 mod video_pipeline;
+pub mod control;
+pub mod spatial_publisher;
+pub mod spatial_map;
 
 use crate::edit_config::{build_ffmpeg_filters, calculate_output_dimensions, EditConfig};
 use crate::models::ModelInfo;
+use crate::control::ResearchConfig;
 
 // --- CONSTANTS ---
 const ENGINE_URL: &str = "https://github.com/YourRepo/releases/download/v1.0/engine.zip";
@@ -548,6 +553,7 @@ async fn export_request(
 #[tauri::command]
 async fn upscale_request(
     app: AppHandle,
+    research_state: tauri::State<'_, Arc<Mutex<ResearchConfig>>>,
     input_path: String,
     mut output_path: String,
     model: String,
@@ -634,8 +640,24 @@ async fn upscale_request(
         return Err(format!("Failed to load model: {}", load_data));
     }
 
+    // Send initial research config to Python
+    {
+        let config = research_state.lock().await;
+        let params_req = serde_json::json!({
+            "command": "update_research_params",
+            "params": serde_json::to_value(&*config).unwrap_or_default()
+        });
+        let _ = publisher.put(params_req.to_string()).await;
+        // Consume the ack (non-blocking, don't fail if it doesn't come)
+        let _ = timeout(Duration::from_secs(2), subscriber.recv_async()).await;
+    }
+
     // --- IMAGE PIPELINE ---
     if is_img {
+        let research_params = {
+            let guard = research_state.lock().await;
+            serde_json::to_value(&*guard).unwrap_or_default()
+        };
         let req_payload = serde_json::json!({
             "command": "upscale_image_file",
             "id": "single_shot",
@@ -643,7 +665,8 @@ async fn upscale_request(
                 "input_path": input_path,
                 "output_path": output_path,
                 "config": edit_config
-            }
+            },
+            "research_params": research_params
         });
         publisher
             .put(req_payload.to_string())
@@ -785,9 +808,24 @@ async fn upscale_request(
         Ok::<(), String>(())
     };
 
+    let research_config_ref = research_state.inner().clone();
     let ai_task = async {
         while let Some(slot_idx) = ai_rx.recv().await {
-            let req = serde_json::json!({ "command": "process_frame", "slot": slot_idx });
+            // Include current research params so Python stays in sync
+            let params_val = {
+                let mut guard = research_config_ref.lock().await;
+                let val = serde_json::to_value(&*guard).unwrap_or_default();
+                // Clear transient reset flag after serialization (one-shot)
+                if guard.reset_temporal {
+                    guard.reset_temporal = false;
+                }
+                val
+            };
+            let req = serde_json::json!({
+                "command": "process_frame",
+                "slot": slot_idx,
+                "research_params": params_val
+            });
             if publisher.put(req.to_string()).await.is_err() {
                 break;
             }
@@ -914,6 +952,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .manage(Arc::new(Mutex::new(ResearchConfig::default())))
+        .manage(Arc::new(spatial_map::SpatialMapState::new()))
         .setup(|app| {
             spawn_system_monitor(app.handle().clone());
             Ok(())
@@ -926,7 +966,13 @@ pub fn run() {
             reset_engine,
             get_models,
             check_engine_status,
-            install_engine
+            install_engine,
+            control::get_research_config,
+            control::set_research_config,
+            control::update_research_param,
+            control::reset_temporal_buffer,
+            spatial_map::fetch_spatial_frame,
+            spatial_map::mark_frame_complete
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

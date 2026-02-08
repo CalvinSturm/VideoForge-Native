@@ -3,8 +3,8 @@ import type { SystemStats } from '../types';
 
 // Upscale configuration types
 export type EnhancementMode = 'archival' | 'creative';
-export type ArchivalModel = 'RCAN' | 'EDSR';
-export type CreativeModel = 'REALISTIC' | 'ANIME';
+export type ArchivalModel = string;
+export type CreativeModel = string;
 export type UpscaleScale = 2 | 3 | 4;
 
 export interface UpscaleConfig {

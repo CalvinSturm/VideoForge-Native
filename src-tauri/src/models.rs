@@ -72,7 +72,10 @@ fn get_installed_weights_dir() -> Option<PathBuf> {
 /// Check if file has a valid weight extension (.pth or .pt)
 fn is_weight_file(name: &str) -> bool {
     let lower = name.to_lowercase();
-    lower.ends_with(".pth") || lower.ends_with(".pt")
+    lower.ends_with(".pth")
+        || lower.ends_with(".pt")
+        || lower.ends_with(".safetensors")
+        || lower.ends_with(".bin")
 }
 
 /// Generate canonical model ID from filename and scale
@@ -82,9 +85,17 @@ fn generate_canonical_id(family: ModelFamily, scale: u32, filename: &str) -> Str
         ModelFamily::EDSR => format!("EDSR_x{}", scale),
         ModelFamily::RealESRGAN => {
             // Keep original name for RealESRGAN to preserve anime/plus variants
-            filename.replace(".pth", "").replace(".pt", "")
+            filename
+                .replace(".pth", "")
+                .replace(".pt", "")
+                .replace(".safetensors", "")
+                .replace(".bin", "")
         }
-        ModelFamily::Unknown => filename.replace(".pth", "").replace(".pt", ""),
+        ModelFamily::Unknown => filename
+            .replace(".pth", "")
+            .replace(".pt", "")
+            .replace(".safetensors", "")
+            .replace(".bin", ""),
     }
 }
 
@@ -175,11 +186,6 @@ pub fn list_models() -> Vec<ModelInfo> {
 fn process_weight_file(filename: &str, seen_ids: &HashSet<String>) -> Option<ModelInfo> {
     let family = parse_model_family(filename);
     let scale = extract_scale(filename)?;
-
-    // Only process known model families with valid scales
-    if family == ModelFamily::Unknown {
-        return None;
-    }
 
     // Validate scale is in supported range
     if ![2, 3, 4, 8].contains(&scale) {

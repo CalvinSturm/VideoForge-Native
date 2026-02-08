@@ -3,6 +3,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import type { EditState, VideoState, Job } from '../types';
 import { Timeline } from './Timeline';
 import { CropOverlay } from './CropOverlay';
+import { SpatialMapOverlay } from './SpatialMapOverlay';
 
 // -----------------------------------------------------------------------------
 // MAIN PREVIEW PANEL
@@ -22,7 +23,7 @@ interface PreviewPanelProps {
 }
 
 export const PreviewPanel: React.FC<PreviewPanelProps> = ({
-   inputPreview, activeJob, videoState, onFileDrop, mode, editState, setEditState, viewMode, setViewMode
+   inputPreview, activeJob, videoState, onFileDrop, mode, editState, setEditState, viewMode, setViewMode, showTech
 }) => {
    const [isPlaying, setIsPlaying] = useState(false);
    const [isScrubbing, setIsScrubbing] = useState(false);
@@ -489,7 +490,8 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
                               </div>
                            )}
                         </div>
-                        {hasResult && (
+                        {showTech && inputPreview && <SpatialMapOverlay visible={showTech} imageSrc={convertFileSrc(inputPreview)} />}
+                     {hasResult && (
                            <div style={{
                               position: 'absolute', inset: 0, overflow: 'hidden',
                               opacity: (compareMode === 'toggle' && isHoldingCompare) ? 0 : 1

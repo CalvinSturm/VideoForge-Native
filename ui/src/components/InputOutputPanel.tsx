@@ -1,8 +1,100 @@
 import React, { useMemo, useState, useRef, useEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
+import { invoke } from "@tauri-apps/api/core";
 import type { EditState, VideoState, UpscaleMode } from "../types";
 import { SignalSummary } from "./SignalSummary";
 import { useJobStore, type EnhancementMode, type ArchivalModel, type CreativeModel, type UpscaleScale } from "../Store/useJobStore";
+
+// --- RESEARCH CONFIG ---
+interface ResearchConfig {
+  alpha_structure: number;
+  alpha_texture: number;
+  alpha_perceptual: number;
+  alpha_diffusion: number;
+  low_freq_strength: number;
+  mid_freq_strength: number;
+  high_freq_strength: number;
+  h_sensitivity: number;
+  h_blend_reduction: number;
+  edge_model_bias: number;
+  texture_model_bias: number;
+  flat_region_suppression: number;
+  hf_method: string;
+  preset: string;
+  freq_low_sigma: number;
+  freq_mid_sigma: number;
+  edge_threshold: number;
+  texture_threshold: number;
+  spatial_freq_mix: number;
+  // SR Pipeline
+  adr_enabled: boolean;
+  detail_strength: number;
+  luma_only: boolean;
+  edge_strength: number;
+  sharpen_strength: number;
+  temporal_enabled: boolean;
+  temporal_alpha: number;
+  secondary_model: string;
+  return_gpu_tensor: boolean;
+}
+
+const RESEARCH_DEFAULTS: ResearchConfig = {
+  alpha_structure: 0.5,
+  alpha_texture: 0.3,
+  alpha_perceptual: 0.15,
+  alpha_diffusion: 0.05,
+  low_freq_strength: 1.0,
+  mid_freq_strength: 1.0,
+  high_freq_strength: 1.0,
+  h_sensitivity: 1.0,
+  h_blend_reduction: 0.5,
+  edge_model_bias: 0.7,
+  texture_model_bias: 0.7,
+  flat_region_suppression: 0.3,
+  hf_method: "laplacian",
+  preset: "balanced",
+  freq_low_sigma: 4.0,
+  freq_mid_sigma: 1.5,
+  edge_threshold: 0.5,
+  texture_threshold: 0.2,
+  spatial_freq_mix: 0.5,
+  // SR Pipeline
+  adr_enabled: false,
+  detail_strength: 0.5,
+  luma_only: true,
+  edge_strength: 0.3,
+  sharpen_strength: 0.0,
+  temporal_enabled: true,
+  temporal_alpha: 0.9,
+  secondary_model: "None",
+  return_gpu_tensor: true,
+};
+
+const RESEARCH_PRESETS: Record<string, Partial<ResearchConfig>> = {
+  performance: {
+    alpha_structure: 0.6, alpha_texture: 0.25, alpha_perceptual: 0.1, alpha_diffusion: 0.05,
+    low_freq_strength: 1.2, mid_freq_strength: 0.8, high_freq_strength: 0.6,
+    h_sensitivity: 0.5, h_blend_reduction: 0.3,
+    edge_model_bias: 0.5, texture_model_bias: 0.5, flat_region_suppression: 0.5,
+    preset: "performance",
+  },
+  balanced: {
+    alpha_structure: 0.5, alpha_texture: 0.3, alpha_perceptual: 0.15, alpha_diffusion: 0.05,
+    low_freq_strength: 1.0, mid_freq_strength: 1.0, high_freq_strength: 1.0,
+    h_sensitivity: 1.0, h_blend_reduction: 0.5,
+    edge_model_bias: 0.7, texture_model_bias: 0.7, flat_region_suppression: 0.3,
+    preset: "balanced",
+  },
+  quality: {
+    alpha_structure: 0.4, alpha_texture: 0.35, alpha_perceptual: 0.2, alpha_diffusion: 0.05,
+    low_freq_strength: 0.8, mid_freq_strength: 1.2, high_freq_strength: 1.4,
+    h_sensitivity: 1.5, h_blend_reduction: 0.7,
+    edge_model_bias: 0.8, texture_model_bias: 0.8, flat_region_suppression: 0.2,
+    preset: "quality",
+  },
+};
+
+const HF_METHODS = ["laplacian", "sobel", "highpass", "fft"] as const;
 
 // --- ICONS ---
 const IconCamera = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" /><circle cx="12" cy="13" r="4" /></svg>;
@@ -32,22 +124,44 @@ const IconPlus = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="non
 const IconX = () => <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>;
 
 // --- CONFIGURATION ---
-type AIModel = ArchivalModel;
-type CreativeModelType = CreativeModel;
-type UpscaleScaleType = UpscaleScale;
+// Model families and IDs are now derived dynamically from availableModels.
+// Helper: extract the family prefix from a model ID (e.g. "RCAN_x4" -> "RCAN")
+function extractFamily(modelId: string): string {
+  const match = modelId.match(/^([A-Za-z0-9]+?)(?:_x\d|$)/);
+  return match?.[1] ?? modelId;
+}
 
-// Canonical model identifiers sent to backend
-// Format: {MODEL}_x{SCALE} - backend resolves to actual weight files
-const ARCHIVAL_MAP: Record<AIModel, Record<UpscaleScale, string>> = {
-  RCAN: { 2: "RCAN_x2", 3: "RCAN_x3", 4: "RCAN_x4" },
-  EDSR: { 2: "EDSR_x2", 3: "EDSR_x3", 4: "EDSR_x4" }
-};
+// Helper: extract scale from model ID (e.g. "RCAN_x4" -> 4)
+function extractScale(modelId: string): number | null {
+  const match = modelId.match(/_x(\d)/);
+  return match?.[1] ? parseInt(match[1], 10) : null;
+}
 
-// Creative mode uses RealESRGAN (only 2x and 4x for realistic, 4x only for anime)
-const CREATIVE_MAP: Record<CreativeModel, Partial<Record<UpscaleScale, string>>> = {
-  REALISTIC: { 2: "RealESRGAN_x2plus", 4: "RealESRGAN_x4plus" },
-  ANIME: { 4: "RealESRGAN_x4plus_anime_6B" }  // Note: No 2x anime model exists in official RealESRGAN
-};
+// Helper: classify a model as creative (GAN-based) or archival
+function isCreativeModel(modelId: string): boolean {
+  const upper = modelId.toUpperCase();
+  return upper.includes('REALESRGAN') || upper.includes('ESRGAN');
+}
+
+// Helper: classify creative variant
+function getCreativeVariant(modelId: string): string {
+  if (modelId.toLowerCase().includes('anime')) return 'ANIME';
+  return 'REALISTIC';
+}
+
+// Helper: get display label for a model family
+function getFamilyLabel(family: string): string {
+  return family.toUpperCase();
+}
+
+// Helper: truncate model name for button display
+function truncateModelName(id: string, maxLen = 12): string {
+  if (id.length <= maxLen) return id;
+  // Try to shorten common prefixes
+  let short = id.replace('RealESRGAN_', 'ESRGAN-').replace('_x4plus', '').replace('_anime_6B', '-ANI');
+  if (short.length <= maxLen) return short;
+  return short.slice(0, maxLen - 1) + '\u2026';
+}
 
 // Scale options with labels (ascending order for intuitive progression)
 const SCALE_OPTIONS: { value: UpscaleScale; label: string; sub: string }[] = [
@@ -879,24 +993,103 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
 
   // Local UI state (not persisted)
   const [toastState, setToastState] = useState<{ msg: string; visible: boolean }>({ msg: '', visible: false });
+  const [researchConfig, setResearchConfigLocal] = useState<ResearchConfig>(RESEARCH_DEFAULTS);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [srPipelineOpen, setSrPipelineOpen] = useState(false);
 
   const showToast = (msg: string) => {
     setToastState({ msg, visible: true });
     setTimeout(() => setToastState(s => ({ ...s, visible: false })), 4000);
   };
 
-  // Compute the full model identifier for the backend
+  // Fetch research config from backend on mount
+  useEffect(() => {
+    invoke<ResearchConfig>("get_research_config")
+      .then(setResearchConfigLocal)
+      .catch(() => {});
+  }, []);
+
+  const updateResearchParam = useCallback((key: keyof ResearchConfig, value: number | string | boolean) => {
+    setResearchConfigLocal(prev => ({ ...prev, [key]: value }));
+    invoke("update_research_param", { key, value }).catch(() => {});
+  }, []);
+
+  const applyResearchPreset = useCallback((presetName: string) => {
+    const preset = RESEARCH_PRESETS[presetName];
+    if (!preset) return;
+    const newConfig = { ...researchConfig, ...preset };
+    setResearchConfigLocal(newConfig);
+    invoke("set_research_config", { config: newConfig }).catch(() => {});
+  }, [researchConfig]);
+
+  // --- Dynamic model groups derived from availableModels ---
+  const archivalModels = useMemo(() =>
+    availableModels.filter(m => !isCreativeModel(m)),
+  [availableModels]);
+
+  const creativeModels = useMemo(() =>
+    availableModels.filter(m => isCreativeModel(m)),
+  [availableModels]);
+
+  // Unique archival family names (e.g. ["RCAN", "EDSR", "SwinIR", "HAT"])
+  const archivalFamilies = useMemo(() =>
+    [...new Set(archivalModels.map(m => extractFamily(m)))],
+  [archivalModels]);
+
+  // Unique creative variants (e.g. ["REALISTIC", "ANIME"])
+  const creativeFamilies = useMemo(() =>
+    [...new Set(creativeModels.map(m => getCreativeVariant(m)))],
+  [creativeModels]);
+
+  // For the selected archival family, which scales are available?
+  const archivalScalesForFamily = useMemo(() => {
+    return archivalModels
+      .filter(m => extractFamily(m).toUpperCase() === aiModel.toUpperCase())
+      .map(m => extractScale(m))
+      .filter((s): s is number => s !== null)
+      .sort((a, b) => a - b);
+  }, [archivalModels, aiModel]);
+
+  // For the selected creative variant, which scales are available?
+  const creativeScalesForVariant = useMemo(() => {
+    return creativeModels
+      .filter(m => getCreativeVariant(m) === creativeModel)
+      .map(m => extractScale(m))
+      .filter((s): s is number => s !== null)
+      .sort((a, b) => a - b);
+  }, [creativeModels, creativeModel]);
+
+  // Compute the full model identifier for the backend (dynamic)
   const computedModelId = useMemo((): string => {
     if (enhancementMode === 'archival') {
-      return ARCHIVAL_MAP[aiModel][upscaleFactor];
+      // Find exact match: family + scale
+      const match = archivalModels.find(m =>
+        extractFamily(m).toUpperCase() === aiModel.toUpperCase() && extractScale(m) === upscaleFactor
+      );
+      if (match) return match;
+      // Fallback: any model from this family
+      const familyMatch = archivalModels.find(m =>
+        extractFamily(m).toUpperCase() === aiModel.toUpperCase()
+      );
+      return familyMatch ?? `${aiModel}_x${upscaleFactor}`;
     }
-    // Creative mode - fallback to 4x if 3x not available
-    const creativeId = CREATIVE_MAP[creativeModel][upscaleFactor];
-    if (!creativeId && upscaleFactor === 3) {
-      return CREATIVE_MAP[creativeModel][4] ?? CREATIVE_MAP[creativeModel][2] ?? "RealESRGAN_x4plus";
-    }
-    return creativeId ?? CREATIVE_MAP[creativeModel][4] ?? "RealESRGAN_x4plus";
-  }, [enhancementMode, aiModel, creativeModel, upscaleFactor]);
+    // Creative mode - find matching variant + scale
+    const match = creativeModels.find(m =>
+      getCreativeVariant(m) === creativeModel && extractScale(m) === upscaleFactor
+    );
+    if (match) return match;
+    // Fallback to 4x, then 2x, then any
+    const fallback4 = creativeModels.find(m =>
+      getCreativeVariant(m) === creativeModel && extractScale(m) === 4
+    );
+    if (fallback4) return fallback4;
+    const fallback2 = creativeModels.find(m =>
+      getCreativeVariant(m) === creativeModel && extractScale(m) === 2
+    );
+    if (fallback2) return fallback2;
+    const anyVariant = creativeModels.find(m => getCreativeVariant(m) === creativeModel);
+    return anyVariant ?? "RealESRGAN_x4plus";
+  }, [enhancementMode, aiModel, creativeModel, upscaleFactor, archivalModels, creativeModels]);
 
   // Sync with parent when our computed model changes
   useEffect(() => {
@@ -906,76 +1099,67 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
     }
   }, [computedModelId, model, setModel, loadModel]);
 
-  // Check model availability
-  const isRCANAvailable = useMemo(() => {
-    return availableModels.some(m => m.toUpperCase().includes('RCAN'));
-  }, [availableModels]);
+  // Dynamic availability checks
+  const isRCANAvailable = useMemo(() =>
+    archivalFamilies.some(f => f.toUpperCase() === 'RCAN'),
+  [archivalFamilies]);
 
-  const isEDSRAvailable = useMemo(() => {
-    return availableModels.some(m => m.toUpperCase().includes('EDSR'));
-  }, [availableModels]);
+  const isEDSRAvailable = useMemo(() =>
+    archivalFamilies.some(f => f.toUpperCase() === 'EDSR'),
+  [archivalFamilies]);
+
+  const isFamilyAvailable = useMemo(() => {
+    if (enhancementMode === 'archival') {
+      return archivalFamilies.some(f => f.toUpperCase() === aiModel.toUpperCase());
+    }
+    return creativeFamilies.includes(creativeModel);
+  }, [enhancementMode, aiModel, creativeModel, archivalFamilies, creativeFamilies]);
 
   const isScale4Available = useMemo(() => {
-    if (enhancementMode === 'creative') return true; // Creative always has 4x
-    const currentModelBase = aiModel;
-    return availableModels.some(m =>
-      m.toUpperCase().includes(currentModelBase) && m.includes('4')
-    );
-  }, [availableModels, aiModel, enhancementMode]);
+    if (enhancementMode === 'creative') return creativeScalesForVariant.includes(4);
+    return archivalScalesForFamily.includes(4);
+  }, [enhancementMode, archivalScalesForFamily, creativeScalesForVariant]);
 
   const isScale3Available = useMemo(() => {
-    // Creative mode doesn't have 3x
-    if (enhancementMode === 'creative') return false;
-    const currentModelBase = aiModel;
-    return availableModels.some(m =>
-      m.toUpperCase().includes(currentModelBase) && m.includes('3')
-    );
-  }, [availableModels, aiModel, enhancementMode]);
+    if (enhancementMode === 'creative') return creativeScalesForVariant.includes(3);
+    return archivalScalesForFamily.includes(3);
+  }, [enhancementMode, archivalScalesForFamily, creativeScalesForVariant]);
 
   const isScale2Available = useMemo(() => {
-    if (enhancementMode === 'creative') {
-      // Anime only has 4x, Realistic has 2x and 4x
-      return creativeModel === 'REALISTIC';
-    }
-    const currentModelBase = aiModel;
-    return availableModels.some(m =>
-      m.toUpperCase().includes(currentModelBase) && m.includes('2')
-    );
-  }, [availableModels, aiModel, enhancementMode, creativeModel]);
+    if (enhancementMode === 'creative') return creativeScalesForVariant.includes(2);
+    return archivalScalesForFamily.includes(2);
+  }, [enhancementMode, archivalScalesForFamily, creativeScalesForVariant]);
 
-  const isRealisticAvailable = useMemo(() => {
-    return availableModels.some(m => m.includes('RealESRGAN') && !m.includes('anime'));
-  }, [availableModels]);
+  const isRealisticAvailable = useMemo(() =>
+    creativeFamilies.includes('REALISTIC'),
+  [creativeFamilies]);
 
-  const isAnimeAvailable = useMemo(() => {
-    return availableModels.some(m => m.includes('anime'));
-  }, [availableModels]);
+  const isAnimeAvailable = useMemo(() =>
+    creativeFamilies.includes('ANIME'),
+  [creativeFamilies]);
 
-  // Auto-fallback if selected model isn't available
+  // Auto-fallback if selected model/family isn't available
   useEffect(() => {
     if (enhancementMode === 'archival') {
-      if (aiModel === 'RCAN' && !isRCANAvailable && isEDSRAvailable) {
-        setAiModel('EDSR');
-        showToast("RCAN unavailable, using EDSR");
+      if (!archivalFamilies.some(f => f.toUpperCase() === aiModel.toUpperCase()) && archivalFamilies.length > 0) {
+        const fallback = archivalFamilies[0]!;
+        setAiModel(fallback);
+        showToast(`${aiModel} unavailable, using ${fallback}`);
       }
     } else {
-      // Creative mode fallback
-      if (creativeModel === 'REALISTIC' && !isRealisticAvailable && isAnimeAvailable) {
-        setCreativeModel('ANIME');
-        showToast("RealESRGAN unavailable, using Anime model");
+      if (!creativeFamilies.includes(creativeModel) && creativeFamilies.length > 0) {
+        const fallback = creativeFamilies[0]!;
+        setCreativeModel(fallback);
+        showToast(`${creativeModel} unavailable, using ${fallback}`);
       }
-      // Creative mode doesn't support 3x - fall back to 4x
-      if (upscaleFactor === 3) {
-        setUpscaleFactor(4);
-        showToast("3x not available in Creative mode, using 4x");
-      }
-      // Anime mode only has 4x - fall back from 2x
-      if (creativeModel === 'ANIME' && upscaleFactor === 2) {
-        setUpscaleFactor(4);
-        showToast("Anime 2x not available, using 4x");
+      // Fall back scale if not available for this variant
+      if (creativeScalesForVariant.length > 0 && !creativeScalesForVariant.includes(upscaleFactor)) {
+        const bestScale = creativeScalesForVariant.includes(4) ? 4 : creativeScalesForVariant[0];
+        setUpscaleFactor(bestScale as UpscaleScale);
+        showToast(`${upscaleFactor}x not available, using ${bestScale}x`);
       }
     }
-  }, [enhancementMode, aiModel, creativeModel, upscaleFactor, isRCANAvailable, isEDSRAvailable, isRealisticAvailable, isAnimeAvailable]);
+  }, [enhancementMode, aiModel, creativeModel, upscaleFactor, archivalFamilies, creativeFamilies, creativeScalesForVariant]);
 
   // ==========================================
   // INPUT CHANGE REVALIDATION
@@ -984,16 +1168,11 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
   useEffect(() => {
     if (!inputPath) return;
 
-    // Auto-fix 3x in creative mode
-    if (enhancementMode === 'creative' && upscaleFactor === 3) {
-      setUpscaleFactor(4);
-      showToast("Creative mode: Switched to 4× (3× unavailable)");
-    }
-
-    // Auto-fix anime 2x
-    if (enhancementMode === 'creative' && creativeModel === 'ANIME' && upscaleFactor === 2) {
-      setUpscaleFactor(4);
-      showToast("Anime mode: Switched to 4× (2× unavailable)");
+    // Auto-fix scale if not available for current mode/variant
+    if (enhancementMode === 'creative' && creativeScalesForVariant.length > 0 && !creativeScalesForVariant.includes(upscaleFactor)) {
+      const bestScale = creativeScalesForVariant.includes(4) ? 4 : creativeScalesForVariant[0];
+      setUpscaleFactor(bestScale as UpscaleScale);
+      showToast(`Switched to ${bestScale}× (${upscaleFactor}× unavailable)`);
     }
   }, [inputPath]); // Only trigger on input change
 
@@ -1442,105 +1621,79 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             </div>
           </div>
 
-          {/* AI Model / Style Selector */}
+          {/* AI Model / Style Selector — Dynamic */}
           <div style={{ opacity: isAIActive ? 1 : 0.4, pointerEvents: isAIActive ? 'auto' : 'none', transition: 'opacity 0.2s' }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: 'center', marginBottom: "6px" }}>
               <label style={{ fontSize: '9px', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.05em' }}>
                 {enhancementMode === 'archival' ? 'AI MODEL' : 'STYLE'}
               </label>
               <Tooltip text={enhancementMode === 'archival'
-                ? "RCAN: Best quality, slower. EDSR: Faster, lighter. Both produce identical results across runs."
-                : "REALISTIC: General photos & video (2× or 4×). ANIME: Illustrations & cel animation (4× only)."}>
+                ? "Select a model family. Available models are discovered from your weights/ directory."
+                : "Select a creative style. Available variants are discovered from your weights/ directory."}>
                 <div style={{ cursor: 'help', color: 'var(--text-muted)', opacity: 0.6 }}>
                   <IconInfo />
                 </div>
               </Tooltip>
             </div>
             {enhancementMode === 'archival' ? (
-              <div style={{ display: "flex", gap: "6px" }}>
-                <Tooltip text="Residual Channel Attention Network. Best balance of speed and quality.">
+              <div style={{ display: "flex", gap: "6px", flexWrap: 'wrap' }}>
+                {archivalFamilies.map(family => (
                   <button
-                    onClick={() => setAiModel('RCAN')}
-                    className={aiModel === 'RCAN' ? "toggle-active" : ""}
-                    disabled={!isRCANAvailable}
+                    key={family}
+                    onClick={() => setAiModel(family)}
+                    className={aiModel.toUpperCase() === family.toUpperCase() ? "toggle-active" : ""}
                     style={{
-                      flex: 1, height: '44px', borderRadius: '5px', minWidth: 0,
+                      flex: archivalFamilies.length <= 3 ? 1 : '0 0 auto',
+                      minWidth: archivalFamilies.length <= 3 ? 0 : '60px',
+                      height: '44px', borderRadius: '5px',
                       display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px',
-                      background: aiModel === 'RCAN' ? "var(--brand-dim)" : "var(--input-bg)",
-                      border: aiModel === 'RCAN' ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
-                      color: aiModel === 'RCAN' ? "var(--text-primary)" : "var(--text-secondary)",
-                      opacity: !isRCANAvailable ? 0.4 : 1,
-                      cursor: !isRCANAvailable ? 'not-allowed' : 'pointer',
-                      transition: 'all 0.1s ease'
+                      background: aiModel.toUpperCase() === family.toUpperCase() ? "var(--brand-dim)" : "var(--input-bg)",
+                      border: aiModel.toUpperCase() === family.toUpperCase() ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
+                      color: aiModel.toUpperCase() === family.toUpperCase() ? "var(--text-primary)" : "var(--text-secondary)",
+                      cursor: 'pointer',
+                      transition: 'all 0.1s ease',
+                      padding: '0 8px',
                     }}
                   >
-                    <span style={{ fontWeight: 700, fontSize: '10px' }}>RCAN</span>
-                    <span style={{ fontSize: '7px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>BALANCED</span>
+                    <span style={{ fontWeight: 700, fontSize: '10px' }}>{getFamilyLabel(family)}</span>
+                    <span style={{ fontSize: '7px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>
+                      {archivalModels.filter(m => extractFamily(m) === family).map(m => extractScale(m)).filter(Boolean).sort().map(s => `${s}x`).join(' ')}
+                    </span>
                   </button>
-                </Tooltip>
-                <Tooltip text="Enhanced Deep Residual Network. Faster processing, slightly less detail recovery.">
-                  <button
-                    onClick={() => setAiModel('EDSR')}
-                    className={aiModel === 'EDSR' ? "toggle-active" : ""}
-                    disabled={!isEDSRAvailable}
-                    style={{
-                      flex: 1, height: '44px', borderRadius: '5px', minWidth: 0,
-                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px',
-                      background: aiModel === 'EDSR' ? "var(--brand-dim)" : "var(--input-bg)",
-                      border: aiModel === 'EDSR' ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
-                      color: aiModel === 'EDSR' ? "var(--text-primary)" : "var(--text-secondary)",
-                      opacity: !isEDSRAvailable ? 0.4 : 1,
-                      cursor: !isEDSRAvailable ? 'not-allowed' : 'pointer',
-                      transition: 'all 0.1s ease'
-                    }}
-                  >
-                    <span style={{ fontWeight: 700, fontSize: '10px' }}>EDSR</span>
-                    <span style={{ fontSize: '7px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>FAST</span>
-                  </button>
-                </Tooltip>
+                ))}
+                {archivalFamilies.length === 0 && (
+                  <span style={{ fontSize: '9px', color: 'var(--text-muted)', fontStyle: 'italic' }}>No archival models found</span>
+                )}
               </div>
             ) : (
-              <div style={{ display: "flex", gap: "6px" }}>
-                <Tooltip text="RealESRGAN General. Generates texture details for a sharper, more detailed look.">
+              <div style={{ display: "flex", gap: "6px", flexWrap: 'wrap' }}>
+                {creativeFamilies.map(variant => (
                   <button
-                    onClick={() => setCreativeModel('REALISTIC')}
-                    className={creativeModel === 'REALISTIC' ? "toggle-active" : ""}
-                    disabled={!isRealisticAvailable}
+                    key={variant}
+                    onClick={() => setCreativeModel(variant)}
+                    className={creativeModel === variant ? "toggle-active" : ""}
                     style={{
-                      flex: 1, height: '44px', borderRadius: '5px', minWidth: 0,
+                      flex: creativeFamilies.length <= 3 ? 1 : '0 0 auto',
+                      minWidth: creativeFamilies.length <= 3 ? 0 : '60px',
+                      height: '44px', borderRadius: '5px',
                       display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px',
-                      background: creativeModel === 'REALISTIC' ? "var(--brand-dim)" : "var(--input-bg)",
-                      border: creativeModel === 'REALISTIC' ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
-                      color: creativeModel === 'REALISTIC' ? "var(--text-primary)" : "var(--text-secondary)",
-                      opacity: !isRealisticAvailable ? 0.4 : 1,
-                      cursor: !isRealisticAvailable ? 'not-allowed' : 'pointer',
-                      transition: 'all 0.1s ease'
+                      background: creativeModel === variant ? "var(--brand-dim)" : "var(--input-bg)",
+                      border: creativeModel === variant ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
+                      color: creativeModel === variant ? "var(--text-primary)" : "var(--text-secondary)",
+                      cursor: 'pointer',
+                      transition: 'all 0.1s ease',
+                      padding: '0 8px',
                     }}
                   >
-                    <span style={{ fontWeight: 700, fontSize: '10px' }}>PHOTO</span>
-                    <span style={{ fontSize: '7px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>DETAIL</span>
+                    <span style={{ fontWeight: 700, fontSize: '10px' }}>{variant === 'REALISTIC' ? 'PHOTO' : variant}</span>
+                    <span style={{ fontSize: '7px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>
+                      {variant === 'REALISTIC' ? 'DETAIL' : '2D ART'}
+                    </span>
                   </button>
-                </Tooltip>
-                <Tooltip text="RealESRGAN Anime. Optimized for illustrations and flat colors.">
-                  <button
-                    onClick={() => setCreativeModel('ANIME')}
-                    className={creativeModel === 'ANIME' ? "toggle-active" : ""}
-                    disabled={!isAnimeAvailable}
-                    style={{
-                      flex: 1, height: '44px', borderRadius: '5px', minWidth: 0,
-                      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px',
-                      background: creativeModel === 'ANIME' ? "var(--brand-dim)" : "var(--input-bg)",
-                      border: creativeModel === 'ANIME' ? "1px solid var(--brand-primary)" : "1px solid var(--input-border)",
-                      color: creativeModel === 'ANIME' ? "var(--text-primary)" : "var(--text-secondary)",
-                      opacity: !isAnimeAvailable ? 0.4 : 1,
-                      cursor: !isAnimeAvailable ? 'not-allowed' : 'pointer',
-                      transition: 'all 0.1s ease'
-                    }}
-                  >
-                    <span style={{ fontWeight: 700, fontSize: '10px' }}>ANIME</span>
-                    <span style={{ fontSize: '7px', opacity: 0.6, fontFamily: 'var(--font-mono)' }}>2D ART</span>
-                  </button>
-                </Tooltip>
+                ))}
+                {creativeFamilies.length === 0 && (
+                  <span style={{ fontSize: '9px', color: 'var(--text-muted)', fontStyle: 'italic' }}>No creative models found</span>
+                )}
               </div>
             )}
           </div>
@@ -1566,13 +1719,415 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
           </div>
         </PipelineNode>
 
+        {/* RESEARCH PARAMETERS NODE - only when AI Upscale is active */}
+        {isAIActive && (
+          <>
+            <PipelineConnector isActive={true} />
+            <PipelineNode
+              title="Research Parameters"
+              icon={<IconCpu />}
+              nodeNumber={3}
+              isActive={true}
+              accentColor="#f59e0b"
+              defaultOpen={false}
+              extra={
+                <div style={{ display: 'flex', gap: '4px' }}>
+                  {(['performance', 'balanced', 'quality'] as const).map(p => (
+                    <button
+                      key={p}
+                      onClick={(e) => { e.stopPropagation(); applyResearchPreset(p); }}
+                      style={{
+                        height: '22px',
+                        fontSize: '8px',
+                        padding: '0 8px',
+                        borderRadius: '4px',
+                        border: researchConfig.preset === p
+                          ? '1px solid rgba(245,158,11,0.5)'
+                          : '1px solid rgba(255,255,255,0.1)',
+                        background: researchConfig.preset === p
+                          ? 'rgba(245,158,11,0.15)'
+                          : 'transparent',
+                        color: researchConfig.preset === p ? '#f59e0b' : 'var(--text-muted)',
+                        fontWeight: 700,
+                        cursor: 'pointer',
+                        letterSpacing: '0.05em',
+                        transition: 'all 0.15s ease',
+                        textTransform: 'uppercase',
+                      }}
+                    >
+                      {p === 'performance' ? 'PERF' : p === 'balanced' ? 'BAL' : 'QUAL'}
+                    </button>
+                  ))}
+                </div>
+              }
+            >
+              {/* Model Weights */}
+              <div style={{ marginBottom: '4px' }}>
+                <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                  MODEL WEIGHTS
+                </div>
+                <Tooltip text="Weight for structural fidelity (edges, geometry). Higher values preserve hard lines and shapes at the cost of softer textures. Default 0.50." position="bottom">
+                  <ColorSlider label="STRUCTURE" value={researchConfig.alpha_structure} onChange={(v) => updateResearchParam('alpha_structure', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                </Tooltip>
+                <Tooltip text="Weight for texture detail recovery. Controls how aggressively fine surface detail (fabric, skin pores, grain) is reconstructed. Default 0.30." position="bottom">
+                  <ColorSlider label="TEXTURE" value={researchConfig.alpha_texture} onChange={(v) => updateResearchParam('alpha_texture', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                </Tooltip>
+                <Tooltip text="Weight for perceptual similarity. Optimizes output to look natural to the human eye rather than pixel-exact. Higher values may smooth fine detail. Default 0.15." position="bottom">
+                  <ColorSlider label="PERCEPTUAL" value={researchConfig.alpha_perceptual} onChange={(v) => updateResearchParam('alpha_perceptual', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                </Tooltip>
+                <Tooltip text="Weight for diffusion-based refinement pass. Adds subtle generative detail but can introduce hallucinated content at high values. Keep low for archival work. Default 0.05." position="bottom">
+                  <ColorSlider label="DIFFUSION" value={researchConfig.alpha_diffusion} onChange={(v) => updateResearchParam('alpha_diffusion', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                </Tooltip>
+              </div>
+
+              {/* Frequency Band */}
+              <div style={{ marginBottom: '4px' }}>
+                <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                  FREQUENCY BAND
+                </div>
+                <Tooltip text="Amplification of low-frequency content (smooth gradients, large shapes). Values above 1.0 boost, below 1.0 attenuate. Increase to strengthen broad tonal structure. Default 1.00." position="bottom">
+                  <ColorSlider label="LOW FREQ" value={researchConfig.low_freq_strength} onChange={(v) => updateResearchParam('low_freq_strength', v)} min={0} max={2} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                </Tooltip>
+                <Tooltip text="Amplification of mid-frequency content (medium detail, object contours). Controls the body of visible sharpness. Boost for crisper mid-detail, reduce to soften. Default 1.00." position="bottom">
+                  <ColorSlider label="MID FREQ" value={researchConfig.mid_freq_strength} onChange={(v) => updateResearchParam('mid_freq_strength', v)} min={0} max={2} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                </Tooltip>
+                <Tooltip text="Amplification of high-frequency content (fine edges, noise, micro-texture). Higher values sharpen fine detail but may amplify noise or ringing artifacts. Default 1.00." position="bottom">
+                  <ColorSlider label="HIGH FREQ" value={researchConfig.high_freq_strength} onChange={(v) => updateResearchParam('high_freq_strength', v)} min={0} max={2} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                </Tooltip>
+              </div>
+
+              {/* Hallucination */}
+              <div style={{ marginBottom: '4px' }}>
+                <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                  HALLUCINATION
+                </div>
+                <Tooltip text="How aggressively the detector flags AI-generated detail as hallucinated. Higher values catch more false detail but may suppress legitimate reconstruction. Default 1.00." position="bottom">
+                  <ColorSlider label="SENSITIVITY" value={researchConfig.h_sensitivity} onChange={(v) => updateResearchParam('h_sensitivity', v)} min={0} max={3} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                </Tooltip>
+                <Tooltip text="Strength of blending applied to regions flagged as hallucinated. At 1.0, flagged regions are fully replaced with the source. Lower values allow partial AI detail to remain. Default 0.50." position="bottom">
+                  <ColorSlider label="BLEND REDUCTION" value={researchConfig.h_blend_reduction} onChange={(v) => updateResearchParam('h_blend_reduction', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                </Tooltip>
+              </div>
+
+              {/* Spatial Routing */}
+              <div style={{ marginBottom: '4px' }}>
+                <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                  SPATIAL ROUTING
+                </div>
+                <Tooltip text="How strongly edge-detected regions prefer the structure-preserving model branch. Higher values keep hard edges sharper but may introduce stairstepping on diagonal lines. Default 0.70." position="bottom">
+                  <ColorSlider label="EDGE BIAS" value={researchConfig.edge_model_bias} onChange={(v) => updateResearchParam('edge_model_bias', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                </Tooltip>
+                <Tooltip text="How strongly textured regions prefer the texture-recovery model branch. Increase for richer surface detail in complex areas (foliage, fabric). Default 0.70." position="bottom">
+                  <ColorSlider label="TEXTURE BIAS" value={researchConfig.texture_model_bias} onChange={(v) => updateResearchParam('texture_model_bias', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                </Tooltip>
+                <Tooltip text="Suppresses AI enhancement in flat, low-detail regions (sky, walls) to prevent noise amplification and false texture. Higher values apply more suppression. Default 0.30." position="bottom">
+                  <ColorSlider label="FLAT SUPPRESSION" value={researchConfig.flat_region_suppression} onChange={(v) => updateResearchParam('flat_region_suppression', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                </Tooltip>
+              </div>
+
+              {/* Advanced (collapsed by default) */}
+              <div>
+                <button
+                  onClick={() => setAdvancedOpen(!advancedOpen)}
+                  style={{
+                    width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    padding: '6px 0', border: 'none', background: 'none', cursor: 'pointer',
+                    borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: advancedOpen ? '4px' : '0',
+                  }}
+                >
+                  <span style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em' }}>
+                    ADVANCED
+                  </span>
+                  <span style={{
+                    color: 'var(--text-muted)', transform: advancedOpen ? 'rotate(180deg)' : 'rotate(0deg)',
+                    transition: 'transform 0.15s ease',
+                  }}>
+                    <IconChevronDown />
+                  </span>
+                </button>
+                {advancedOpen && (
+                  <div>
+                    <Tooltip text="Gaussian blur sigma for the low-frequency band separation. Larger values capture broader structures in the low band. Increase for smoother tonal rolloff. Default 4.0." position="bottom">
+                      <ColorSlider label="LOW SIGMA" value={researchConfig.freq_low_sigma} onChange={(v) => updateResearchParam('freq_low_sigma', v)} min={0.5} max={10} step={0.1} accentColor="#f59e0b" formatValue={(v) => v.toFixed(1)} />
+                    </Tooltip>
+                    <Tooltip text="Gaussian blur sigma for the mid-frequency band separation. Controls the cutoff between mid and high detail. Lower values shift more content into the high band. Default 1.5." position="bottom">
+                      <ColorSlider label="MID SIGMA" value={researchConfig.freq_mid_sigma} onChange={(v) => updateResearchParam('freq_mid_sigma', v)} min={0.5} max={5} step={0.1} accentColor="#f59e0b" formatValue={(v) => v.toFixed(1)} />
+                    </Tooltip>
+                    <Tooltip text="Gradient magnitude threshold for classifying a pixel as an edge. Pixels above this threshold are routed to the edge model branch. Lower values detect more edges. Default 0.50." position="bottom">
+                      <ColorSlider label="EDGE THRESHOLD" value={researchConfig.edge_threshold} onChange={(v) => updateResearchParam('edge_threshold', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                    <Tooltip text="Local variance threshold for classifying a region as textured. Pixels above this threshold are routed to the texture model branch. Lower values classify more area as textured. Default 0.20." position="bottom">
+                      <ColorSlider label="TEXTURE THRESHOLD" value={researchConfig.texture_threshold} onChange={(v) => updateResearchParam('texture_threshold', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                    <Tooltip text="Blend ratio between spatial routing and frequency-band routing. At 0.0 only spatial routing is used; at 1.0 only frequency bands drive the blend. Default 0.50." position="bottom">
+                      <ColorSlider label="SPATIAL-FREQ MIX" value={researchConfig.spatial_freq_mix} onChange={(v) => updateResearchParam('spatial_freq_mix', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+
+                    {/* HF Method dropdown */}
+                    <Tooltip text="Algorithm used to extract high-frequency detail. Laplacian: second-order edges, general purpose. Sobel: first-order gradient, sharper edges. Highpass: simple subtraction, fast. FFT: spectral domain, most precise but slowest." position="bottom">
+                      <div style={{
+                        display: 'flex', flexDirection: 'column', gap: '6px',
+                        padding: '10px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
+                        border: '1px solid rgba(255,255,255,0.04)',
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
+                            HF METHOD
+                          </label>
+                          <span style={{ fontSize: '11px', fontFamily: 'var(--font-mono)', color: '#f59e0b', fontWeight: 600 }}>
+                            {researchConfig.hf_method.toUpperCase()}
+                          </span>
+                        </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '4px' }}>
+                        {HF_METHODS.map(method => (
+                          <button
+                            key={method}
+                            onClick={() => updateResearchParam('hf_method', method)}
+                            style={{
+                              fontSize: '9px', height: '28px', borderRadius: '5px',
+                              background: researchConfig.hf_method === method
+                                ? 'rgba(245,158,11,0.15)' : 'rgba(255,255,255,0.03)',
+                              border: researchConfig.hf_method === method
+                                ? '1px solid rgba(245,158,11,0.4)' : '1px solid rgba(255,255,255,0.08)',
+                              color: researchConfig.hf_method === method ? '#f59e0b' : 'var(--text-muted)',
+                              fontWeight: researchConfig.hf_method === method ? 700 : 500,
+                              cursor: 'pointer', transition: 'all 0.15s ease',
+                              textTransform: 'uppercase', letterSpacing: '0.03em',
+                            }}
+                          >
+                            {method === 'highpass' ? 'HP' : method === 'laplacian' ? 'LAP' : method.toUpperCase()}
+                          </button>
+                        ))}
+                      </div>
+                      </div>
+                    </Tooltip>
+                  </div>
+                )}
+              </div>
+
+              {/* SR Pipeline */}
+              <div>
+                <button
+                  onClick={() => setSrPipelineOpen(!srPipelineOpen)}
+                  style={{
+                    width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    padding: '6px 0', border: 'none', background: 'none', cursor: 'pointer',
+                    borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: srPipelineOpen ? '4px' : '0',
+                  }}
+                >
+                  <span style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em' }}>
+                    SR PIPELINE
+                  </span>
+                  <span style={{
+                    color: 'var(--text-muted)', transform: srPipelineOpen ? 'rotate(180deg)' : 'rotate(0deg)',
+                    transition: 'transform 0.15s ease',
+                  }}>
+                    <IconChevronDown />
+                  </span>
+                </button>
+                {srPipelineOpen && (
+                  <div>
+                    {/* Detail Enhancement */}
+                    <div style={{ marginBottom: '4px' }}>
+                      <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                        DETAIL ENHANCEMENT
+                      </div>
+                      <Tooltip text="Enable Adaptive Detail Residual. Extracts high-frequency texture from the secondary (GAN) model and injects it into the primary (structure) output for richer surface detail." position="bottom">
+                        <div style={{
+                          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                          padding: '8px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
+                          border: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px',
+                        }}>
+                          <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
+                            ADR ENABLED
+                          </label>
+                          <div
+                            role="switch"
+                            aria-checked={researchConfig.adr_enabled}
+                            tabIndex={0}
+                            onClick={() => updateResearchParam('adr_enabled', !researchConfig.adr_enabled)}
+                            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); updateResearchParam('adr_enabled', !researchConfig.adr_enabled); } }}
+                            style={{
+                              width: '32px', height: '18px', borderRadius: '9px', position: 'relative', cursor: 'pointer',
+                              background: researchConfig.adr_enabled ? 'rgba(245,158,11,0.4)' : 'rgba(255,255,255,0.08)',
+                              border: researchConfig.adr_enabled ? '1px solid rgba(245,158,11,0.5)' : '1px solid rgba(255,255,255,0.1)',
+                              transition: 'all 0.2s ease', outline: 'none',
+                            }}
+                          >
+                            <div style={{
+                              width: '14px', height: '14px', borderRadius: '50%',
+                              background: researchConfig.adr_enabled ? '#f59e0b' : 'rgba(255,255,255,0.3)',
+                              position: 'absolute', top: '1px',
+                              left: researchConfig.adr_enabled ? '15px' : '1px',
+                              transition: 'all 0.2s ease',
+                            }} />
+                          </div>
+                        </div>
+                      </Tooltip>
+                      <Tooltip text="How much GAN high-frequency texture to inject into the structure output. 0 = no detail injection, 1 = full GAN residual. Requires a secondary model. Default 0.50." position="bottom">
+                        <ColorSlider label="DETAIL STRENGTH" value={researchConfig.detail_strength} onChange={(v) => updateResearchParam('detail_strength', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                      </Tooltip>
+                    </div>
+
+                    {/* Blending */}
+                    <div style={{ marginBottom: '4px' }}>
+                      <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                        BLENDING
+                      </div>
+                      <Tooltip text="Blend only the luminance (Y) channel in YCbCr space. Preserves the structure model's colour accuracy while injecting GAN brightness detail. Prevents colour shifts." position="bottom">
+                        <div style={{
+                          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                          padding: '8px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
+                          border: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px',
+                        }}>
+                          <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
+                            LUMA ONLY
+                          </label>
+                          <div
+                            role="switch"
+                            aria-checked={researchConfig.luma_only}
+                            tabIndex={0}
+                            onClick={() => updateResearchParam('luma_only', !researchConfig.luma_only)}
+                            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); updateResearchParam('luma_only', !researchConfig.luma_only); } }}
+                            style={{
+                              width: '32px', height: '18px', borderRadius: '9px', position: 'relative', cursor: 'pointer',
+                              background: researchConfig.luma_only ? 'rgba(245,158,11,0.4)' : 'rgba(255,255,255,0.08)',
+                              border: researchConfig.luma_only ? '1px solid rgba(245,158,11,0.5)' : '1px solid rgba(255,255,255,0.1)',
+                              transition: 'all 0.2s ease', outline: 'none',
+                            }}
+                          >
+                            <div style={{
+                              width: '14px', height: '14px', borderRadius: '50%',
+                              background: researchConfig.luma_only ? '#f59e0b' : 'rgba(255,255,255,0.3)',
+                              position: 'absolute', top: '1px',
+                              left: researchConfig.luma_only ? '15px' : '1px',
+                              transition: 'all 0.2s ease',
+                            }} />
+                          </div>
+                        </div>
+                      </Tooltip>
+                      <Tooltip text="Sobel edge mask strength for spatially-varying blend. Higher values apply stronger blending on edges, weaker on flat regions. 0 = uniform blend. Default 0.30." position="bottom">
+                        <ColorSlider label="EDGE STRENGTH" value={researchConfig.edge_strength} onChange={(v) => updateResearchParam('edge_strength', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                      </Tooltip>
+                      <Tooltip text="GPU unsharp mask intensity applied after blending. Adds crispness to the final output. 0 = disabled, higher = sharper. Can amplify noise at high values. Default 0.00." position="bottom">
+                        <ColorSlider label="SHARPEN" value={researchConfig.sharpen_strength} onChange={(v) => updateResearchParam('sharpen_strength', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                      </Tooltip>
+                    </div>
+
+                    {/* Temporal */}
+                    <div style={{ marginBottom: '4px' }}>
+                      <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                        TEMPORAL
+                      </div>
+                      <Tooltip text="Enable exponential moving average (EMA) temporal stabilization across frames. Reduces inter-frame flicker in video upscaling." position="bottom">
+                        <div style={{
+                          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                          padding: '8px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
+                          border: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px',
+                        }}>
+                          <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
+                            TEMPORAL EMA
+                          </label>
+                          <div
+                            role="switch"
+                            aria-checked={researchConfig.temporal_enabled}
+                            tabIndex={0}
+                            onClick={() => updateResearchParam('temporal_enabled', !researchConfig.temporal_enabled)}
+                            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); updateResearchParam('temporal_enabled', !researchConfig.temporal_enabled); } }}
+                            style={{
+                              width: '32px', height: '18px', borderRadius: '9px', position: 'relative', cursor: 'pointer',
+                              background: researchConfig.temporal_enabled ? 'rgba(245,158,11,0.4)' : 'rgba(255,255,255,0.08)',
+                              border: researchConfig.temporal_enabled ? '1px solid rgba(245,158,11,0.5)' : '1px solid rgba(255,255,255,0.1)',
+                              transition: 'all 0.2s ease', outline: 'none',
+                            }}
+                          >
+                            <div style={{
+                              width: '14px', height: '14px', borderRadius: '50%',
+                              background: researchConfig.temporal_enabled ? '#f59e0b' : 'rgba(255,255,255,0.3)',
+                              position: 'absolute', top: '1px',
+                              left: researchConfig.temporal_enabled ? '15px' : '1px',
+                              transition: 'all 0.2s ease',
+                            }} />
+                          </div>
+                        </div>
+                      </Tooltip>
+                      <Tooltip text="EMA smoothing factor. Lower = more smoothing (more temporal averaging). Higher = faster response to new frames. Default 0.90." position="bottom">
+                        <ColorSlider label="TEMPORAL ALPHA" value={researchConfig.temporal_alpha} onChange={(v) => updateResearchParam('temporal_alpha', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                      </Tooltip>
+                      <Tooltip text="Flush all temporal EMA buffers. Use after seeking, changing clips, or when ghosting artifacts appear." position="bottom">
+                        <button
+                          onClick={() => { invoke("reset_temporal_buffer").catch(() => {}); }}
+                          style={{
+                            width: '100%', height: '30px', fontSize: '9px', fontWeight: 700,
+                            borderRadius: '6px', border: '1px solid rgba(245,158,11,0.3)',
+                            background: 'rgba(245,158,11,0.08)', color: '#f59e0b',
+                            cursor: 'pointer', letterSpacing: '0.05em',
+                            transition: 'all 0.15s ease', marginTop: '4px',
+                          }}
+                        >
+                          RESET TEMPORAL BUFFER
+                        </button>
+                      </Tooltip>
+                    </div>
+
+                    {/* Secondary Model */}
+                    <div style={{ marginBottom: '4px' }}>
+                      <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                        SECONDARY MODEL
+                      </div>
+                      <Tooltip text="Select a secondary (GAN/texture) model for dual-model blending. 'None' uses only the primary model. Requires ADR or blending to take effect." position="bottom">
+                        <div style={{
+                          padding: '8px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
+                          border: '1px solid rgba(255,255,255,0.04)',
+                        }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                            <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
+                              MODEL
+                            </label>
+                            <span style={{ fontSize: '11px', fontFamily: 'var(--font-mono)', color: '#f59e0b', fontWeight: 600 }}>
+                              {researchConfig.secondary_model}
+                            </span>
+                          </div>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '4px', maxHeight: '120px', overflowY: 'auto' }}>
+                            {["None", ...availableModels].map(m => (
+                              <button
+                                key={m}
+                                onClick={() => updateResearchParam('secondary_model', m)}
+                                title={m}
+                                style={{
+                                  fontSize: '8px', height: '28px', borderRadius: '5px',
+                                  background: researchConfig.secondary_model === m
+                                    ? 'rgba(245,158,11,0.15)' : 'rgba(255,255,255,0.03)',
+                                  border: researchConfig.secondary_model === m
+                                    ? '1px solid rgba(245,158,11,0.4)' : '1px solid rgba(255,255,255,0.08)',
+                                  color: researchConfig.secondary_model === m ? '#f59e0b' : 'var(--text-muted)',
+                                  fontWeight: researchConfig.secondary_model === m ? 700 : 500,
+                                  cursor: 'pointer', transition: 'all 0.15s ease',
+                                  letterSpacing: '0.03em',
+                                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                                }}
+                              >
+                                {m === 'None' ? 'NONE' : truncateModelName(m)}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </Tooltip>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </PipelineNode>
+          </>
+        )}
+
         <PipelineConnector isActive={isAIActive} />
 
         {/* CROP NODE */}
         <PipelineNode
           title="Crop & Frame"
           icon={<IconCrop />}
-          nodeNumber={3}
+          nodeNumber={isAIActive ? 4 : 3}
           isActive={isCropActive}
           accentColor="#3b82f6"
           extra={
@@ -1677,7 +2232,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
         <PipelineNode
           title="Transform"
           icon={<IconMove />}
-          nodeNumber={4}
+          nodeNumber={isAIActive ? 5 : 4}
           isActive={editState.rotation !== 0 || editState.flipH || editState.flipV}
           accentColor="#ec4899"
           extra={
@@ -1844,7 +2399,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
         <PipelineNode
           title="Color Grading"
           icon={<IconPalette />}
-          nodeNumber={5}
+          nodeNumber={isAIActive ? 6 : 5}
           isActive={hasColorEdits}
           accentColor="#a855f7"
           extra={
@@ -1947,7 +2502,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
           <PipelineNode
             title="Frame Rate"
             icon={<IconClock />}
-            nodeNumber={6}
+            nodeNumber={isAIActive ? 7 : 6}
             isActive={hasMotionEdits}
             accentColor="#eab308"
             extra={
@@ -1993,7 +2548,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
         <PipelineNode
           title="Export Output"
           icon={<IconExport />}
-          nodeNumber={mode === 'video' ? 7 : 6}
+          nodeNumber={mode === 'video' ? (isAIActive ? 8 : 7) : (isAIActive ? 7 : 6)}
           isActive={!!outputPath}
           accentColor="#10b981"
         >

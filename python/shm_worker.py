@@ -54,6 +54,27 @@ except ImportError as e:
     print(f"[Python Critical] Missing Dependency: {e}", flush=True)
     sys.exit(1)
 
+# Research layer (optional — graceful fallback if unavailable)
+try:
+    from research_layer import (
+        VideoForgeResearchLayer,
+        ModelRole,
+        SpatialRouter,
+        create_research_layer,
+    )
+    HAS_RESEARCH_LAYER = True
+except ImportError:
+    HAS_RESEARCH_LAYER = False
+    print("[Python] Research layer not available — running vanilla inference only", flush=True)
+
+# Blender engine (optional — SR pipeline post-processing)
+try:
+    from blender_engine import PredictionBlender, clear_temporal_buffers
+    HAS_BLENDER = True
+except ImportError:
+    HAS_BLENDER = False
+    print("[Python] Blender engine not available — SR pipeline post-processing disabled", flush=True)
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -79,6 +100,7 @@ class Config:
 
 
 ZENOH_PREFIX = Config.ZENOH_PREFIX
+SPATIAL_MAP_TOPIC = "videoforge/research/spatial_map"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
@@ -1140,6 +1162,16 @@ class AIWorker:
         # Color format: True if model expects RGB, False for BGR
         self.expects_rgb: bool = True
 
+        # Research layer (initialized after first model load)
+        self.research_layer: Optional[Any] = None
+        self.spatial_pub = None
+        if HAS_RESEARCH_LAYER:
+            try:
+                self.spatial_pub = self.session.declare_publisher(SPATIAL_MAP_TOPIC)
+                print("[Python] Spatial map publisher ready", flush=True)
+            except Exception as e:
+                print(f"[Python Warning] Spatial map publisher failed: {e}", flush=True)
+
         # Load default model
         default_model = "RCAN_x4"
         print(f"[Python] Attempting initial load: {default_model}", flush=True)
@@ -1187,6 +1219,20 @@ class AIWorker:
                 f"[Python] Loaded: {self.model_name} (Scale: x{self.model_scale}, expects_rgb={self.expects_rgb})",
                 flush=True,
             )
+
+            # Register with research layer
+            if HAS_RESEARCH_LAYER:
+                try:
+                    self.research_layer = create_research_layer(
+                        models={"structure": self.model},
+                        scale=self.model_scale,
+                        device=self.device,
+                    )
+                    print(f"[Python] Research layer initialized with {self.model_name} as structure model", flush=True)
+                except Exception as e:
+                    print(f"[Python Warning] Research layer init failed: {e}", flush=True)
+                    self.research_layer = None
+
             self.send_status(
                 "MODEL_LOADED", {"model": self.model_name, "scale": self.model_scale}
             )
@@ -1221,6 +1267,8 @@ class AIWorker:
                 self.handle_image_file(payload)
             elif cmd == "analyze_for_auto_grade":
                 self.handle_auto_grade_analysis(payload)
+            elif cmd == "update_research_params":
+                self.handle_update_research_params(payload)
             elif cmd == "shutdown":
                 self.running = False
         except Exception as e:
@@ -1299,6 +1347,51 @@ class AIWorker:
             print(f"[Python Error] Auto-grade analysis failed: {e}", flush=True)
             traceback.print_exc()
             self.send_status("error", {"message": f"Auto-grade failed: {str(e)}"})
+
+    def handle_update_research_params(self, payload: Dict[str, Any]) -> None:
+        """Handle research parameter updates from the Rust backend."""
+        if not HAS_RESEARCH_LAYER or self.research_layer is None:
+            self.send_status("error", {"message": "Research layer not available"})
+            return
+        try:
+            params = payload.get("params", {})
+            self.research_layer.update_params(params)
+            print(f"[Python] Research params updated: {list(params.keys())}", flush=True)
+            self.send_status("RESEARCH_PARAMS_UPDATED", {"keys": list(params.keys())})
+        except Exception as e:
+            print(f"[Python Error] Research params update failed: {e}", flush=True)
+            self.send_status("error", {"message": f"Params update failed: {str(e)}"})
+
+    def _publish_spatial_map(self, lr_rgb: np.ndarray) -> None:
+        """Compute and publish spatial routing mask for the frontend overlay."""
+        if self.spatial_pub is None or not HAS_RESEARCH_LAYER:
+            return
+        try:
+            h, w = lr_rgb.shape[:2]
+            img_float = lr_rgb.astype(np.float32) / 255.0
+            tensor = torch.from_numpy(img_float.transpose(2, 0, 1)).unsqueeze(0)
+            tensor = tensor.to(self.device)
+
+            rl = self.research_layer
+            edge_t = rl.params.edge_threshold if rl else 0.5
+            tex_t = rl.params.texture_threshold if rl else 0.2
+            edge_mask, texture_mask, flat_mask = SpatialRouter.compute_routing_masks(
+                tensor, edge_threshold=edge_t, texture_threshold=tex_t
+            )
+
+            # Build classification mask: 0=flat, 1=texture, 2=edge
+            edge_np = edge_mask.squeeze().cpu().numpy()
+            texture_np = texture_mask.squeeze().cpu().numpy()
+            classification = np.zeros((h, w), dtype=np.uint8)
+            classification[texture_np > 0.5] = 1
+            classification[edge_np > 0.5] = 2
+
+            # Binary payload: [u32 LE width][u32 LE height][mask bytes]
+            import struct
+            buf = struct.pack("<II", w, h) + classification.tobytes()
+            self.spatial_pub.put(buf)
+        except Exception as e:
+            print(f"[Python Warning] Spatial map publish failed: {e}", flush=True)
 
     # -------------------------------------------------------------------------
     # TILING LOGIC - Tile-invariant, Crop-invariant, No Seam Artifacts
@@ -1422,6 +1515,15 @@ class AIWorker:
     def handle_image_file(self, payload: Dict) -> None:
         """Handle image file upscaling with geometry and color edits"""
         req_id = payload.get("id")
+
+        # Apply research params if included
+        research_params = payload.get("research_params")
+        if research_params and self.research_layer is not None and HAS_RESEARCH_LAYER:
+            try:
+                self.research_layer.update_params(research_params)
+            except Exception as e:
+                print(f"[Python Warning] Research params update failed: {e}", flush=True)
+
         try:
             params = payload["params"]
             img = cv2.imread(params["input_path"], cv2.IMREAD_COLOR)
@@ -1494,6 +1596,23 @@ class AIWorker:
             with suppress_stdout():
                 output = self.process_image_tile(img, req_id)
 
+            # Research layer post-processing for images
+            if self.research_layer is not None and HAS_RESEARCH_LAYER:
+                try:
+                    # cv2 uses BGR; research_layer expects RGB
+                    rgb_input = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    rgb_out = self.research_layer.process_frame_numpy(rgb_input)
+                    output = cv2.cvtColor(rgb_out, cv2.COLOR_RGB2BGR)
+                except Exception as e:
+                    print(f"[Python Warning] Research layer failed on image, using vanilla: {e}", flush=True)
+
+            # Publish spatial map for UI overlay
+            try:
+                rgb_for_spatial = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                self._publish_spatial_map(rgb_for_spatial)
+            except Exception:
+                pass
+
             cv2.imwrite(params["output_path"], output)
             self.send_status("ok", {"id": req_id})
 
@@ -1552,6 +1671,14 @@ class AIWorker:
             self.send_status("error", {"message": "No model loaded"})
             return
 
+        # Apply research params if included with this frame
+        research_params = payload.get("research_params")
+        if research_params and self.research_layer is not None and HAS_RESEARCH_LAYER:
+            try:
+                self.research_layer.update_params(research_params)
+            except Exception as e:
+                print(f"[Python Warning] Research params inline update failed: {e}", flush=True)
+
         slot_idx = payload.get("slot", 0)
         try:
             base = slot_idx * self.slot_byte_size
@@ -1598,11 +1725,100 @@ class AIWorker:
             else:
                 out_for_rust = out_from_model  # Already RGB
 
+            # Research layer post-processing (if available)
+            if self.research_layer is not None and HAS_RESEARCH_LAYER:
+                try:
+                    out_for_rust = self.research_layer.process_frame_numpy(img_input)
+                except Exception as e:
+                    # Fallback to vanilla output on research layer failure
+                    print(f"[Python Warning] Research layer failed, using vanilla: {e}", flush=True)
+
+            # Publish spatial routing map for UI overlay
+            self._publish_spatial_map(img_input)
+
+            # SR Pipeline post-processing (blender_engine)
+            # Applies: ADR detail injection, edge-aware mask,
+            # sharpening, temporal EMA — all GPU-resident via PredictionBlender.
+            if HAS_BLENDER and research_params:
+                try:
+                    sr = research_params  # shorthand
+
+                    # --- Temporal buffer reset (one-shot flag from UI) ---
+                    if sr.get("reset_temporal"):
+                        clear_temporal_buffers()
+                        print("[Python] Temporal buffers cleared by user request", flush=True)
+
+                    adr_on = bool(sr.get("adr_enabled", False))
+                    detail_str = float(sr.get("detail_strength", 0.0))
+                    luma_only = bool(sr.get("luma_only", True))
+                    edge_str = float(sr.get("edge_strength", 0.0))
+                    sharpen_val = float(sr.get("sharpen_strength", 0.0))
+                    temporal_on = bool(sr.get("temporal_enabled", False))
+                    temporal_a = float(sr.get("temporal_alpha", 0.9))
+
+                    needs_sr_pipeline = (
+                        (adr_on and detail_str > 1e-4)
+                        or edge_str > 1e-4
+                        or sharpen_val > 1e-4
+                        or temporal_on
+                    )
+
+                    if needs_sr_pipeline:
+                        # Convert uint8 HWC → float32 NCHW GPU tensor for blender ops
+                        sr_float = out_for_rust.astype(np.float32) / 255.0
+                        sr_tensor = torch.from_numpy(sr_float.transpose(2, 0, 1)).unsqueeze(0)
+                        sr_tensor = sr_tensor.to(device=self.device, non_blocking=True)
+
+                        # ADR — Adaptive Detail Residual injection
+                        # Uses the vanilla (pre-research) inference as GAN source
+                        if adr_on and detail_str > 1e-4:
+                            # Use the original model output as the "GAN" source
+                            # and current sr_tensor as the "structure" base
+                            gan_float = out_from_model.astype(np.float32) / 255.0
+                            gan_tensor = torch.from_numpy(
+                                gan_float.transpose(2, 0, 1)
+                            ).unsqueeze(0).to(device=self.device, non_blocking=True)
+                            sr_tensor = PredictionBlender.apply_detail_residual(
+                                sr_tensor, gan_tensor, detail_str, luma_only
+                            )
+
+                        # Edge-aware blend — stronger detail on edges, softer on flat
+                        if edge_str > 1e-4:
+                            # Self-blend with edge mask to boost edge contrast
+                            sr_tensor = PredictionBlender.blend_edge_aware(
+                                sr_tensor, sr_tensor, alpha=edge_str, edge_strength=1.0
+                            )
+
+                        # Sharpen — GPU unsharp mask
+                        if sharpen_val > 1e-4:
+                            sr_tensor = PredictionBlender.apply_sharpen(sr_tensor, sharpen_val)
+
+                        # Temporal EMA stabilization
+                        if temporal_on:
+                            _, _, th, tw = sr_tensor.shape
+                            t_key = (th, tw, sr_tensor.shape[1])
+                            sr_tensor = PredictionBlender.apply_temporal(
+                                sr_tensor, t_key, temporal_a
+                            )
+
+                        # Convert back to uint8 HWC
+                        out_for_rust = (
+                            sr_tensor.squeeze(0)
+                            .clamp_(0.0, 1.0)
+                            .mul_(255.0)
+                            .round_()
+                            .to(torch.uint8)
+                            .permute(1, 2, 0)
+                            .cpu()
+                            .numpy()
+                        )
+                except Exception as e:
+                    print(f"[Python Warning] SR pipeline post-processing failed: {e}", flush=True)
+
             # Handle scale mismatch (resize output if needed)
             h, w = out_for_rust.shape[:2]
             target_h, target_w = self.output_shape[:2]
             if h != target_h or w != target_w:
-                # NOTE: We resize BEFORE SR in production, but handle mismatch gracefully
                 out_for_rust = cv2.resize(out_for_rust, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
 
             # Write to output slot (RGB + Alpha -> RGBA)
