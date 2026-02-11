@@ -4,6 +4,7 @@ torchaudio==2.0.2+cu117
 
 basicsr
 realesrgan
+spandrel
 
 numpy<2
 pillow<10

@@ -267,50 +267,55 @@ class RCAN(torch.nn.Module):
 # =============================================================================
 # Reference: Enhanced Deep Residual Networks for Single Image Super-Resolution
 # https://arxiv.org/abs/1707.02921
+#
+# Key format matches the official EDSR-PyTorch repo (head/body/tail naming,
+# Sequential ResBlocks) so state dicts from official .pt files load directly.
 
-class ResidualBlockNoBN(torch.nn.Module):
+class EDSRResBlock(torch.nn.Module):
     """
-    Residual Block without Batch Normalization - matches BasicSR naming.
+    Residual Block without Batch Normalization.
 
-    BasicSR uses conv1/conv2 naming, not Sequential body.
+    Uses Sequential body (body.0 = conv, body.1 = ReLU, body.2 = conv) to
+    match the official EDSR-PyTorch key format.
     """
-    def __init__(self, num_feat: int = 64, res_scale: float = 1.0):
+    def __init__(self, num_feat: int = 256, res_scale: float = 0.1):
         super().__init__()
+        self.body = torch.nn.Sequential(
+            torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True),
+        )
         self.res_scale = res_scale
-        # BasicSR naming: conv1, conv2 (not body Sequential)
-        self.conv1 = torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True)
-        self.conv2 = torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True)
-        self.relu = torch.nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = x
-        out = self.conv2(self.relu(self.conv1(x)))
-        return identity + out * self.res_scale
+        return x + self.body(x) * self.res_scale
 
 
 class EDSR(torch.nn.Module):
     """
-    Enhanced Deep Residual Network for Image Super-Resolution
-    Architecture matches BasicSR implementation for weight compatibility.
+    Enhanced Deep Residual Network for Image Super-Resolution.
 
-    Deterministic SR model used as fallback when RCAN is unavailable.
-    No batch normalization = more stable training and inference.
+    Architecture matches the official EDSR-PyTorch repo for weight compatibility.
+    Uses head/body/tail naming with Sequential ResBlocks.
+
+    Default parameters match the EDSR *large* model (256 feat, 32 blocks,
+    res_scale=0.1) since the official .pt files are the large variant.
 
     Args:
         num_in_ch: Number of input channels (3 for RGB)
         num_out_ch: Number of output channels (3 for RGB)
-        num_feat: Number of intermediate feature channels
-        num_block: Number of residual blocks
-        res_scale: Residual scaling factor
+        num_feat: Number of intermediate feature channels (256 for large, 64 for baseline)
+        num_block: Number of residual blocks (32 for large, 16 for baseline)
+        res_scale: Residual scaling factor (0.1 for large, 1.0 for baseline)
         scale: Upscaling factor (2, 3, or 4)
     """
     def __init__(
         self,
         num_in_ch: int = 3,
         num_out_ch: int = 3,
-        num_feat: int = 64,
-        num_block: int = 16,
-        res_scale: float = 1.0,
+        num_feat: int = 256,
+        num_block: int = 32,
+        res_scale: float = 0.1,
         scale: int = 4
     ):
         super().__init__()
@@ -323,52 +328,41 @@ class EDSR(torch.nn.Module):
         self.num_out_ch = num_out_ch
         self.num_feat = num_feat
 
-        # Head - matches BasicSR 'conv_first'
-        self.conv_first = torch.nn.Conv2d(num_in_ch, num_feat, 3, 1, 1, bias=True)
-
-        # Body - residual blocks (NO final conv here, that's conv_after_body)
-        self.body = torch.nn.Sequential(
-            *[ResidualBlockNoBN(num_feat, res_scale) for _ in range(num_block)]
+        # head.0 — shallow feature extraction
+        self.head = torch.nn.Sequential(
+            torch.nn.Conv2d(num_in_ch, num_feat, 3, 1, 1, bias=True)
         )
 
-        # Conv after body - matches BasicSR 'conv_after_body'
-        self.conv_after_body = torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True)
+        # body.0..{num_block-1} = ResBlocks, body.{num_block} = conv after body
+        body_modules = [EDSRResBlock(num_feat, res_scale) for _ in range(num_block)]
+        body_modules.append(torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True))
+        self.body = torch.nn.Sequential(*body_modules)
 
-        # Upsampling - matches BasicSR 'upsample'
-        self.upsample = self._make_upsample(num_feat, scale)
+        # tail.0 = Upsampler (Sequential), tail.1 = final conv
+        upsampler = self._make_upsampler(num_feat, scale)
+        self.tail = torch.nn.Sequential(
+            upsampler,
+            torch.nn.Conv2d(num_feat, num_out_ch, 3, 1, 1, bias=True)
+        )
 
-        # Tail - matches BasicSR 'conv_last'
-        self.conv_last = torch.nn.Conv2d(num_feat, num_out_ch, 3, 1, 1, bias=True)
-
-    def _make_upsample(self, num_feat: int, scale: int) -> torch.nn.Sequential:
-        """Create upsampling layers using PixelShuffle - matches BasicSR Upsample"""
+    def _make_upsampler(self, num_feat: int, scale: int) -> torch.nn.Sequential:
+        """Create PixelShuffle upsampler matching official Upsampler structure."""
+        import math as _math
         layers = []
-        if scale == 2:
-            layers.append(torch.nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1, bias=True))
-            layers.append(torch.nn.PixelShuffle(2))
+        if (scale & (scale - 1)) == 0:  # power of 2
+            for _ in range(int(_math.log2(scale))):
+                layers.append(torch.nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1, bias=True))
+                layers.append(torch.nn.PixelShuffle(2))
         elif scale == 3:
             layers.append(torch.nn.Conv2d(num_feat, num_feat * 9, 3, 1, 1, bias=True))
             layers.append(torch.nn.PixelShuffle(3))
-        elif scale == 4:
-            # BasicSR uses two stages for 4x
-            layers.append(torch.nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1, bias=True))
-            layers.append(torch.nn.PixelShuffle(2))
-            layers.append(torch.nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1, bias=True))
-            layers.append(torch.nn.PixelShuffle(2))
         return torch.nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Head
-        feat = self.conv_first(x)
-
-        # Body with global residual
-        body_feat = self.conv_after_body(self.body(feat))
+        feat = self.head(x)
+        body_feat = self.body(feat)
         feat = feat + body_feat
-
-        # Upsample and reconstruct
-        feat = self.upsample(feat)
-        out = self.conv_last(feat)
-
+        out = self.tail(feat)
         return out
 
 
@@ -532,83 +526,78 @@ def extract_state_dict(loaded: Any) -> Dict[str, torch.Tensor]:
 
 def remap_rcan_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """
-    Remap official RCAN checkpoint keys to our architecture.
+    Strip MeanShift keys from official RCAN state dicts.
 
-    Official RCAN uses:
-        head.0.weight -> conv_first.weight
-        body.N.body.M.* -> body.N.rg.M.*
-        tail.0.0.weight (upsample) -> upsample.*.weight
-        tail.1.weight -> conv_last.weight
+    Our RCAN architecture uses the same head/body/tail naming as the official
+    EDSR-PyTorch repo, so no key renaming is needed — only sub_mean/add_mean
+    removal (these are handled by the EDSRRCANAdapter instead).
     """
-    new_dict = {}
+    new_dict = {k: v for k, v in state_dict.items()
+                if not k.startswith("sub_mean.") and not k.startswith("add_mean.")}
 
-    for key, value in state_dict.items():
-        new_key = key
-
-        # head.0 -> conv_first
-        if key.startswith('head.0.'):
-            new_key = key.replace('head.0.', 'conv_first.')
-
-        # body.N.body -> body.N.rg (residual groups)
-        elif key.startswith('body.') and '.body.' in key:
-            # body.0.body.0.rcab.0.weight -> body.0.rg.0.rcab.0.weight
-            new_key = key.replace('.body.', '.rg.')
-
-        # tail -> upsample and conv_last
-        elif key.startswith('tail.'):
-            parts = key.split('.')
-            if len(parts) >= 2:
-                tail_idx = int(parts[1])
-                rest = '.'.join(parts[2:])
-
-                # tail.0.X (upsampler) -> upsample.X
-                if tail_idx == 0:
-                    new_key = f'upsample.{rest}'
-                # tail.1 (final conv) -> conv_last
-                elif tail_idx == 1:
-                    new_key = f'conv_last.{rest}'
-
-        new_dict[new_key] = value
-
-    if new_dict != state_dict:
-        print(f"[Python] Remapped {len(new_dict)} RCAN keys", flush=True)
+    removed = len(state_dict) - len(new_dict)
+    if removed > 0:
+        print(f"[Python] Stripped {removed} MeanShift keys from RCAN state dict", flush=True)
 
     return new_dict
 
 
 def remap_edsr_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """
-    Remap BasicSR EDSR checkpoint keys to our architecture.
+    Remap BasicSR-style EDSR keys (conv_first/conv_after_body/upsample/conv_last)
+    to the official EDSR format (head/body/tail) used by our EDSR class.
 
-    BasicSR EDSR uses:
-        conv_first.weight -> conv_first.weight (same)
-        body.N.body.0.weight -> body.N.body.0.weight (same)
-        conv_after_body.weight -> body.{last}.weight
-        upsample.X.weight -> upsample.X.weight (same)
-        conv_last.weight -> conv_last.weight (same)
+    Also strips sub_mean/add_mean MeanShift keys.
     """
+    # Check if this is already in official format (has head/tail keys)
+    has_head = any(k.startswith("head.") for k in state_dict)
+    has_tail = any(k.startswith("tail.") for k in state_dict)
+
+    if has_head and has_tail:
+        # Already in official format, just strip MeanShift
+        return {k: v for k, v in state_dict.items()
+                if not k.startswith("sub_mean.") and not k.startswith("add_mean.")}
+
+    # Remap from BasicSR format to official format
     new_dict = {}
     max_body_idx = -1
 
-    # First pass: find max body index and copy most keys
-    for key, value in state_dict.items():
-        if key.startswith('body.') and '.body.' in key:
-            parts = key.split('.')
-            if len(parts) > 1 and parts[1].isdigit():
+    # Find max body block index (for conv_after_body placement)
+    for key in state_dict:
+        if key.startswith("body.") and ".conv1." in key:
+            parts = key.split(".")
+            if parts[1].isdigit():
                 max_body_idx = max(max_body_idx, int(parts[1]))
 
-        # Skip conv_after_body for now
-        if not key.startswith('conv_after_body'):
-            new_dict[key] = value
-
-    # Handle conv_after_body -> append to body as final conv
     for key, value in state_dict.items():
-        if key.startswith('conv_after_body'):
-            # conv_after_body.weight -> body.{max+1}.weight
-            rest = key.replace('conv_after_body', '')
-            new_key = f'body.{max_body_idx + 1}{rest}'
-            new_dict[new_key] = value
+        if key.startswith("sub_mean.") or key.startswith("add_mean."):
+            continue  # strip MeanShift
 
+        if key.startswith("conv_first."):
+            # conv_first.weight → head.0.weight
+            new_key = key.replace("conv_first.", "head.0.")
+        elif key.startswith("body.") and (".conv1." in key or ".conv2." in key):
+            # body.N.conv1.X → body.N.body.0.X
+            # body.N.conv2.X → body.N.body.2.X
+            new_key = key.replace(".conv1.", ".body.0.").replace(".conv2.", ".body.2.")
+        elif key.startswith("conv_after_body."):
+            # conv_after_body.X → body.{max+1}.X
+            rest = key[len("conv_after_body."):]
+            new_key = f"body.{max_body_idx + 1}.{rest}"
+        elif key.startswith("upsample."):
+            # upsample.X → tail.0.X
+            rest = key[len("upsample."):]
+            new_key = f"tail.0.{rest}"
+        elif key.startswith("conv_last."):
+            # conv_last.X → tail.1.X
+            rest = key[len("conv_last."):]
+            new_key = f"tail.1.{rest}"
+        else:
+            new_key = key
+
+        new_dict[new_key] = value
+
+    print(f"[Python] Remapped {len(new_dict)} EDSR keys from BasicSR -> official format", flush=True)
     return new_dict
 
 
@@ -719,64 +708,33 @@ class ModelLoader:
 
     def load(self, model_identifier: str) -> Tuple[torch.nn.Module, int]:
         """
-        Load a model by identifier (e.g., "RCAN_x4", "RealESRGAN_x4plus.pth").
+        Load any model by identifier.
 
-        Canonical format: {FAMILY}_x{SCALE}
-        Examples: RCAN_x2, RCAN_x3, RCAN_x4, EDSR_x2, EDSR_x3, EDSR_x4
+        Uses model_manager._load_module() as the single universal loader.
+        It handles:
+          - Full model objects (torch.save(model, path))
+          - State-dict checkpoints via spandrel (30+ architectures)
+          - Legacy RCAN / EDSR builders as fallback
+        Also creates an architecture adapter for proper pre/post processing
+        (window padding for transformers, output clamping, etc.)
         """
-        # Handle creative mode (RealESRGAN)
-        if model_identifier.lower().startswith("realesrgan"):
-            return self._load_realesrgan(model_identifier)
+        print(f"[Python] Loading model: '{model_identifier}'", flush=True)
 
-        # Parse model identifier for deterministic models
-        model_upper = model_identifier.upper().strip()
+        from model_manager import _load_module
+        from arch_wrappers import create_adapter
 
-        # Map legacy names to new format
-        if model_upper == "RCAN":
-            model_upper = "RCAN_X4"
-        elif model_upper == "EDSR":
-            model_upper = "EDSR_X4"
+        model, scale = _load_module(model_identifier)
+        model = self._prepare_model(model)
 
-        # Extract model type and scale using regex for robustness
-        import re
-        match = re.match(r"^(RCAN|EDSR)[_\-]?[Xx]?(\d+)$", model_upper)
-        if not match:
-            # Try alternative format: RCAN4, EDSR_4x, etc.
-            match = re.match(r"^(RCAN|EDSR)[_\-]?(\d+)[Xx]?$", model_upper)
+        # Create adapter for proper pre/post processing during inference
+        self.adapter = create_adapter(model_identifier, model, scale, self.device)
 
-        if not match:
-            raise ValueError(
-                f"Invalid model identifier format: '{model_identifier}'. "
-                f"Expected format: RCAN_x4, EDSR_x3, etc. "
-                f"Valid models: {Config.VALID_MODELS}"
-            )
+        self.model = model
+        self.model_name = model_identifier
+        self.model_scale = scale
+        self.expects_rgb = True
 
-        model_type = match.group(1)  # RCAN or EDSR
-        scale = int(match.group(2))
-
-        if scale not in Config.SUPPORTED_SCALES:
-            raise ValueError(
-                f"Unsupported scale: {scale}x. "
-                f"Valid scales: {Config.SUPPORTED_SCALES}"
-            )
-
-        print(f"[Python] Parsed model request: {model_type} x{scale}", flush=True)
-
-        # Try to load the requested model, with fallback
-        if model_type == "RCAN":
-            try:
-                return self._load_rcan(scale)
-            except (FileNotFoundError, RuntimeError) as e:
-                print(f"[Python WARNING] RCAN unavailable ({e}), falling back to EDSR", flush=True)
-                try:
-                    return self._load_edsr(scale)
-                except Exception as edsr_error:
-                    raise RuntimeError(
-                        f"Both RCAN and EDSR unavailable for {scale}x. "
-                        f"RCAN error: {e}. EDSR error: {edsr_error}"
-                    )
-        else:  # EDSR
-            return self._load_edsr(scale)
+        return model, scale
 
     def _load_rcan(self, scale: int) -> Tuple[torch.nn.Module, int]:
         """Load RCAN model with strict validation"""
@@ -1063,7 +1021,8 @@ def inference(
     model: torch.nn.Module,
     img_rgb: np.ndarray,
     device: torch.device,
-    half: bool = False
+    half: bool = False,
+    adapter=None
 ) -> np.ndarray:
     """
     Unified inference function for both image and video processing.
@@ -1080,6 +1039,8 @@ def inference(
         img_rgb: Input image as numpy array, RGB order, uint8 [0-255]
         device: Torch device (cuda or cpu)
         half: Whether to use FP16 precision
+        adapter: Optional BaseAdapter for pre/post processing (window padding,
+                 output clamping). Required for transformer models (SwinIR, HAT, DAT).
 
     Returns:
         Upscaled image as numpy array, RGB order, uint8 [0-255]
@@ -1098,9 +1059,13 @@ def inference(
     dtype = torch.float16 if half else torch.float32
     tensor = tensor.to(device=device, dtype=dtype, non_blocking=True)
 
-    # CRITICAL: No gradient computation - ensures determinism and saves memory
-    with torch.no_grad():
-        output = model(tensor)
+    # Use adapter if available — handles window padding, output cropping, etc.
+    if adapter is not None:
+        output = adapter.forward(tensor)
+    else:
+        # CRITICAL: No gradient computation - ensures determinism and saves memory
+        with torch.no_grad():
+            output = model(tensor)
 
     # Convert back to numpy: (1, C, H, W) -> (H, W, C)
     output = output.squeeze(0).float().cpu().clamp_(0, 1).numpy()
@@ -1161,6 +1126,8 @@ class AIWorker:
         self.use_half = (precision == "fp16" and self.device.type == "cuda")
         # Color format: True if model expects RGB, False for BGR
         self.expects_rgb: bool = True
+        # Architecture adapter for pre/post processing (window padding, etc.)
+        self.adapter = None
 
         # Research layer (initialized after first model load)
         self.research_layer: Optional[Any] = None
@@ -1173,7 +1140,7 @@ class AIWorker:
                 print(f"[Python Warning] Spatial map publisher failed: {e}", flush=True)
 
         # Load default model
-        default_model = "RCAN_x4"
+        default_model = "rcan_4x"
         print(f"[Python] Attempting initial load: {default_model}", flush=True)
         self.load_model(default_model)
         self.loop()
@@ -1214,6 +1181,7 @@ class AIWorker:
             self.model_scale = scale
             self.model_name = self.model_loader.model_name
             self.expects_rgb = self.model_loader.expects_rgb
+            self.adapter = getattr(self.model_loader, 'adapter', None)
 
             print(
                 f"[Python] Loaded: {self.model_name} (Scale: x{self.model_scale}, expects_rgb={self.expects_rgb})",
@@ -1471,7 +1439,8 @@ class AIWorker:
                         self.model,
                         tile_for_model,
                         self.device,
-                        half=self.use_half
+                        half=self.use_half,
+                        adapter=self.adapter
                     )
 
                 # Convert output back to BGR if model outputs RGB
@@ -1596,15 +1565,9 @@ class AIWorker:
             with suppress_stdout():
                 output = self.process_image_tile(img, req_id)
 
-            # Research layer post-processing for images
-            if self.research_layer is not None and HAS_RESEARCH_LAYER:
-                try:
-                    # cv2 uses BGR; research_layer expects RGB
-                    rgb_input = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    rgb_out = self.research_layer.process_frame_numpy(rgb_input)
-                    output = cv2.cvtColor(rgb_out, cv2.COLOR_RGB2BGR)
-                except Exception as e:
-                    print(f"[Python Warning] Research layer failed on image, using vanilla: {e}", flush=True)
+            # NOTE: Research layer is skipped for images — it would reprocess the
+            # entire image through the model(s) without tiling, causing OOM/hangs
+            # on large images.  Tiled inference output is used directly.
 
             # Publish spatial map for UI overlay
             try:
@@ -1716,7 +1679,8 @@ class AIWorker:
                     self.model,
                     img_for_model,
                     self.device,
-                    half=self.use_half
+                    half=self.use_half,
+                    adapter=self.adapter
                 )
 
             # Convert output back to RGB for Rust

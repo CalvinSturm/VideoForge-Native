@@ -101,6 +101,14 @@ _FAMILY_CAPABILITIES: Dict[str, FrozenSet[str]] = {
         ModelCapability.SHARPEN,
         ModelCapability.SECONDARY,
     }),
+    "swin2sr": frozenset({
+        ModelCapability.TEMPORAL,
+        ModelCapability.ADR,
+        ModelCapability.EDGE_AWARE,
+        ModelCapability.LUMA_BLEND,
+        ModelCapability.SHARPEN,
+        ModelCapability.SECONDARY,
+    }),
     "hat": frozenset({
         ModelCapability.TEMPORAL,
         ModelCapability.ADR,

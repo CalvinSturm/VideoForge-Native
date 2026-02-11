@@ -3,10 +3,10 @@ import React, { useState, useMemo, useEffect, useRef, useCallback } from "react"
 import {
   Mosaic,
   MosaicWindow,
-  MosaicNode,
   getLeaves,
   createBalancedTreeFromLeaves
 } from "react-mosaic-component";
+import type { MosaicNode } from "react-mosaic-component";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -167,7 +167,8 @@ const App: React.FC = () => {
   const { setIsProcessing, setLastOutputPath, upscaleConfig } = useJobStore();
 
   // Helper: Extract scale factor from model string (robust fallback)
-  const getScaleFromModel = (modelId: string): number => {
+  const getScaleFromModel = (modelId?: string): number => {
+    if (!modelId) return 4;
     const match = modelId.match(/x(\d)/);
     return match ? parseInt(match[1], 10) : 4;
   };
@@ -362,8 +363,28 @@ const App: React.FC = () => {
     // Use store's scaleFactor as source of truth, with model string as fallback
     const activeScale = upscaleConfig.scaleFactor || getScaleFromModel(model);
 
+    // Build comprehensive upscale payload with all new fields
+    const upscalePayload = {
+      inputPath,
+      outputPath,
+      model: upscaleConfig.primaryModelId || model, // Use store's model as source of truth
+      editConfig: getRustEditConfig(),
+      scale: activeScale,
+      // New architecture-aware fields
+      architectureClass: upscaleConfig.architectureClass,
+      // Secondary model blending
+      secondaryModel: null, // Managed via ResearchConfig
+      blendAlpha: 0, // Managed via ResearchConfig
+      // Custom resolution overrides
+      resolutionMode: upscaleConfig.resolutionMode,
+      targetWidth: upscaleConfig.resolutionMode === 'target' ? upscaleConfig.targetWidth : null,
+      targetHeight: upscaleConfig.resolutionMode === 'target' ? upscaleConfig.targetHeight : null,
+    };
+
+    console.debug('[App] Upscale payload:', upscalePayload);
+
     try {
-      const resultPath = await invoke<string>("upscale_request", { inputPath, outputPath, model, editConfig: getRustEditConfig(), scale: activeScale });
+      const resultPath = await invoke<string>("upscale_request", upscalePayload);
       setLogs(prev => [...prev, `[SYSTEM] Job ${jobId} finished.`]);
       const finishedJob: Job = { ...newJob, status: 'done', progress: 100, outputPath: resultPath, eta: 0 };
       setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
@@ -407,8 +428,27 @@ const App: React.FC = () => {
     const jobId = "preview_" + Date.now().toString().slice(-6);
     const newJob: Job = { id: jobId, command: `PREVIEW SAMPLE`, status: "running", progress: 0, statusMessage: "Rendering...", paused: false, eta: 0 };
     setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
+
+    // Build comprehensive preview payload with all new fields
+    const previewPayload = {
+      inputPath,
+      outputPath: "",
+      model: upscaleConfig.primaryModelId || model,
+      editConfig: previewConfig,
+      scale: activeScale,
+      // New architecture-aware fields
+      architectureClass: upscaleConfig.architectureClass,
+      // Secondary model blending
+      secondaryModel: null, // Managed via ResearchConfig
+      blendAlpha: 0, // Managed via ResearchConfig
+      // Custom resolution overrides (use scale mode for previews typically)
+      resolutionMode: upscaleConfig.resolutionMode,
+      targetWidth: upscaleConfig.resolutionMode === 'target' ? upscaleConfig.targetWidth : null,
+      targetHeight: upscaleConfig.resolutionMode === 'target' ? upscaleConfig.targetHeight : null,
+    };
+
     try {
-      const resultPath = await invoke<string>("upscale_request", { inputPath, outputPath: "", model, editConfig: previewConfig, scale: activeScale });
+      const resultPath = await invoke<string>("upscale_request", previewPayload);
       setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'done', progress: 100, outputPath: resultPath } : j));
       setActiveJob(prev => prev?.id === jobId ? { ...prev, status: 'done', outputPath: resultPath, progress: 100 } : prev);
       setPreviewFile(resultPath); addToast("Preview Ready", "success");
@@ -467,7 +507,7 @@ const App: React.FC = () => {
         title={id} path={path}
         renderToolbar={(props) => (
           <div style={{ width: '100%', height: '100%' }}>
-            <PanelHeader title={props.title} onSplit={props.onSplit} onClose={() => togglePanel(id)} />
+            <PanelHeader title={props.title} onClose={() => togglePanel(id)} />
           </div>
         )}
       >

@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(python3:*)",
+      "Bash(/mnt/c/Users/Calvin/VideoForge/venv310/Scripts/python.exe:*)"
     ]
   }
 }
