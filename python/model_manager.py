@@ -22,14 +22,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# ── determinism (must precede any CUDA kernel launch) ──────────────────────
+# ── Safe defaults (precision fully configured by shm_worker.configure_precision) ──
 torch.manual_seed(0)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(0)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
+# NOTE: TF32 and deterministic_algorithms flags are set by
+# shm_worker.configure_precision() at startup — NOT here.
 
 from arch_wrappers import BaseAdapter, create_adapter  # noqa: E402
 from blender_engine import PredictionBlender, clear_temporal_buffers  # noqa: E402

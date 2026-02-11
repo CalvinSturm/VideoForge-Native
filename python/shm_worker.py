@@ -17,6 +17,7 @@ import argparse
 import json
 import mmap
 import os
+import struct
 import sys
 import tempfile
 import time
@@ -25,23 +26,60 @@ from contextlib import contextmanager
 from typing import Optional, Tuple, Dict, Any
 
 # =============================================================================
-# DETERMINISM CONFIGURATION - Must be set BEFORE any torch operations
+# PRECISION CONFIGURATION
 # =============================================================================
-# These settings MUST remain at module level to take effect before model loading
+# Configurable at startup via --precision flag. Do NOT set torch backend flags
+# at module level — configure_precision() is the single source of truth.
 
 import torch
 
-# CRITICAL: Disable CUDNN benchmark for deterministic behavior
-# benchmark=True causes nondeterminism by selecting different algorithms per input size
+# Global precision mode — set by configure_precision(), read by inference()
+_PRECISION_MODE: str = "fp32"
+
+
+def configure_precision(mode: str = "fp32") -> None:
+    """
+    Configure PyTorch backend flags for the selected precision mode.
+
+    Must be called BEFORE any model loading or CUDA kernel launch.
+
+    Modes:
+      fp32          — TF32 enabled, cuDNN deterministic, no autocast.
+                      Best balance of speed and quality.
+      fp16          — TF32 enabled, cuDNN deterministic, autocast float16.
+                      ~2× throughput, minor quality trade-off.
+      deterministic — TF32 disabled, strict deterministic algorithms,
+                      cuDNN deterministic, no autocast, batch_size=1.
+                      Same GPU + driver + CUDA → bit-exact output.
+    """
+    global _PRECISION_MODE
+    mode = mode.lower().strip()
+    if mode not in ("fp32", "fp16", "deterministic"):
+        raise ValueError(f"Unknown precision mode: {mode!r}. Use fp32/fp16/deterministic.")
+    _PRECISION_MODE = mode
+
+    # --- Common: always keep cuDNN deterministic, never auto-tune ---
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    if mode == "deterministic":
+        # Strictest reproducibility: disable TF32 and enable deterministic algorithms
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.use_deterministic_algorithms(True)
+        print(f"[Python] Precision: DETERMINISTIC (TF32=off, strict_deterministic=on)", flush=True)
+    else:
+        # fp32 / fp16: enable TF32 for 2-4× speedup on Ampere+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.use_deterministic_algorithms(False)
+        tag = "FP16 (autocast)" if mode == "fp16" else "FP32"
+        print(f"[Python] Precision: {tag} (TF32=on, cuDNN_deterministic=on)", flush=True)
+
+
+# Apply safe defaults immediately (overridden by configure_precision() at startup)
 torch.backends.cudnn.benchmark = False
-
-# CRITICAL: Enable deterministic CUDNN operations
-# This ensures same input -> same output across runs
 torch.backends.cudnn.deterministic = True
-
-# Disable TF32 for maximum precision consistency (Ampere+ GPUs)
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
 
 # =============================================================================
 # 3rd Party Imports
@@ -84,6 +122,26 @@ class Config:
     RING_SIZE = 3
     PARENT_CHECK_INTERVAL = 2  # seconds
     ZENOH_PREFIX = "videoforge/ipc"
+
+    # --- SHM Slot State Machine ---
+    # Must match Rust src-tauri/src/shm.rs constants exactly.
+    SLOT_EMPTY = 0
+    SLOT_RUST_WRITING = 1
+    SLOT_READY_FOR_AI = 2
+    SLOT_AI_PROCESSING = 3
+    SLOT_READY_FOR_ENCODE = 4
+    SLOT_ENCODING = 5
+
+    # Per-slot header: 4 × u32 = 16 bytes
+    SLOT_HEADER_SIZE = 16
+    # State field is at byte offset 8 within each slot header
+    STATE_FIELD_OFFSET = 8
+    # frame_bytes field is at byte offset 12
+    FRAME_BYTES_FIELD_OFFSET = 12
+
+    # Micro-batching: max frames to batch in a single GPU forward pass.
+    # Set to 1 to disable batching.  RING_SIZE is the upper bound.
+    MAX_BATCH_SIZE = 3
 
     # Supported models and scales
     # Canonical format: {FAMILY}_x{SCALE} for deterministic models
@@ -1061,11 +1119,16 @@ def inference(
     - Input normalization is deterministic (simple division)
     - Output denormalization is deterministic (simple multiplication + clamp)
 
+    Precision behaviour:
+    - fp32:          Standard float32 inference (TF32 used on Ampere+ via backend flags)
+    - fp16:          torch.autocast wraps the forward pass in float16
+    - deterministic: Standard float32, strictest backend flags
+
     Args:
         model: The SR model (must be in eval mode)
         img_rgb: Input image as numpy array, RGB order, uint8 [0-255]
         device: Torch device (cuda or cpu)
-        half: Whether to use FP16 precision
+        half: Whether to use FP16 precision (legacy flag, overridden by _PRECISION_MODE)
         adapter: Optional BaseAdapter for pre/post processing (window padding,
                  output clamping). Required for transformer models (SwinIR, HAT, DAT).
 
@@ -1082,17 +1145,26 @@ def inference(
     # Convert to tensor: (H, W, C) -> (1, C, H, W)
     tensor = torch.from_numpy(img_float.transpose(2, 0, 1)).unsqueeze(0)
 
-    # Transfer to device with correct dtype
-    dtype = torch.float16 if half else torch.float32
+    # Determine dtype from precision mode
+    use_fp16 = (_PRECISION_MODE == "fp16") or half
+    dtype = torch.float16 if use_fp16 else torch.float32
     tensor = tensor.to(device=device, dtype=dtype, non_blocking=True)
 
     # Use adapter if available — handles window padding, output cropping, etc.
     if adapter is not None:
-        output = adapter.forward(tensor)
+        if use_fp16 and device.type == "cuda":
+            with torch.autocast("cuda", dtype=torch.float16):
+                output = adapter.forward(tensor)
+        else:
+            output = adapter.forward(tensor)
     else:
         # CRITICAL: No gradient computation - ensures determinism and saves memory
         with torch.no_grad():
-            output = model(tensor)
+            if use_fp16 and device.type == "cuda":
+                with torch.autocast("cuda", dtype=torch.float16):
+                    output = model(tensor)
+            else:
+                output = model(tensor)
 
     # Convert back to numpy: (1, C, H, W) -> (H, W, C)
     output = output.squeeze(0).float().cpu().clamp_(0, 1).numpy()
@@ -1104,12 +1176,89 @@ def inference(
     return output
 
 
+def inference_batch(
+    model: torch.nn.Module,
+    imgs_rgb: list,
+    device: torch.device,
+    half: bool = False,
+    adapter=None,
+) -> list:
+    """
+    Batched inference: process multiple frames in a single GPU forward pass.
+
+    Requires all images to have identical (H, W) dimensions (guaranteed for
+    video frames from the same SHM ring buffer).
+
+    Returns a list of numpy arrays in the same order as the input.
+
+    Falls back to sequential inference if the batch forward pass fails
+    (e.g. OOM on very large frames).
+    """
+    if not imgs_rgb:
+        return []
+    if len(imgs_rgb) == 1:
+        return [inference(model, imgs_rgb[0], device, half=half, adapter=adapter)]
+
+    # Validate: all frames must have same shape
+    shape0 = imgs_rgb[0].shape
+    for img in imgs_rgb[1:]:
+        if img.shape != shape0:
+            # Shape mismatch — fall back to sequential
+            return [inference(model, img, device, half=half, adapter=adapter) for img in imgs_rgb]
+
+    # Stack into batch tensor: list of (H,W,3) -> (N,3,H,W)
+    batch_float = np.stack([img.astype(np.float32) / 255.0 for img in imgs_rgb], axis=0)
+    batch_tensor = torch.from_numpy(batch_float.transpose(0, 3, 1, 2))  # (N,3,H,W)
+
+    use_fp16 = (_PRECISION_MODE == "fp16") or half
+    dtype = torch.float16 if use_fp16 else torch.float32
+    batch_tensor = batch_tensor.to(device=device, dtype=dtype, non_blocking=True)
+
+    try:
+        if adapter is not None:
+            if use_fp16 and device.type == "cuda":
+                with torch.autocast("cuda", dtype=torch.float16):
+                    output = adapter.forward(batch_tensor)
+            else:
+                output = adapter.forward(batch_tensor)
+        else:
+            with torch.no_grad():
+                if use_fp16 and device.type == "cuda":
+                    with torch.autocast("cuda", dtype=torch.float16):
+                        output = model(batch_tensor)
+                else:
+                    output = model(batch_tensor)
+    except RuntimeError as e:
+        # OOM or other failure — fall back to sequential
+        if "out of memory" in str(e).lower():
+            print(f"[Python] Batch OOM (N={len(imgs_rgb)}), falling back to sequential", flush=True)
+            torch.cuda.empty_cache()
+        else:
+            print(f"[Python] Batch forward failed: {e}, falling back to sequential", flush=True)
+        return [inference(model, img, device, half=half, adapter=adapter) for img in imgs_rgb]
+
+    # Split batch output back to list of numpy arrays
+    output = output.float().cpu().clamp_(0, 1)
+    results = []
+    for i in range(output.shape[0]):
+        frame = output[i].numpy().transpose(1, 2, 0)  # (C,H,W) -> (H,W,C)
+        frame = (frame * 255.0).round().astype(np.uint8)
+        results.append(frame)
+
+    return results
+
+
 # =============================================================================
 # WORKER CLASS
 # =============================================================================
 
 class AIWorker:
     def __init__(self, port: str, precision: str = "fp32"):
+        # Deterministic mode forces batch_size=1 for bit-exact output
+        if precision == "deterministic":
+            Config.MAX_BATCH_SIZE = 1
+            print(f"[Python] Deterministic mode: batch_size forced to 1", flush=True)
+
         print(f"[Python] Initializing Zenoh on Port {port}...", flush=True)
         print(f"[Python] Precision mode: {precision}", flush=True)
         print(f"[Python] CUDNN deterministic: {torch.backends.cudnn.deterministic}", flush=True)
@@ -1141,6 +1290,13 @@ class AIWorker:
         self.shm_path = None
         self.is_configured = False
         self.running = True
+
+        # Frame loop state (SHM atomic polling)
+        self._frame_loop_active = False
+        self._frame_loop_thread: Optional[threading.Thread] = None
+        self._cached_research_params: Optional[Dict] = None
+        self.header_region_size = 0
+        self.output_size = 0
 
         # Model state
         self.precision = precision
@@ -1254,6 +1410,10 @@ class AIWorker:
                 self.create_shm(payload)
             elif cmd == "process_frame":
                 self.process_frame(payload)
+            elif cmd == "start_frame_loop":
+                self.start_frame_loop(payload)
+            elif cmd == "stop_frame_loop":
+                self.stop_frame_loop(payload)
             elif cmd == "load_model":
                 new_model = payload.get("params", {}).get("model_name")
                 if new_model:
@@ -1264,7 +1424,10 @@ class AIWorker:
                 self.handle_auto_grade_analysis(payload)
             elif cmd == "update_research_params":
                 self.handle_update_research_params(payload)
+                # Also update cached params for the frame loop
+                self._cached_research_params = payload.get("params")
             elif cmd == "shutdown":
+                self.stop_frame_loop()
                 self.running = False
         except Exception as e:
             print(f"[Python Error] Request failed: {e}", flush=True)
@@ -1502,9 +1665,9 @@ class AIWorker:
                     "progress", {"current": count, "total": total_tiles, "id": job_id}
                 )
 
-        # Free GPU memory after processing
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # NOTE: empty_cache() intentionally removed from hot path.
+        # Per-frame cache clearing causes CUDA driver sync + allocator churn,
+        # adding 2-5ms per frame.  VRAM is managed by PyTorch's caching allocator.
 
         return output_img
 
@@ -1611,17 +1774,24 @@ class AIWorker:
             self.send_status("error", {"id": req_id, "message": str(e)})
 
     def create_shm(self, payload: Dict) -> None:
-        """Create shared memory ring buffer for video frame processing"""
+        """Create shared memory ring buffer for video frame processing.
+
+        Layout:
+            [ SlotHeader × ring_size (ring_size × 16 bytes) ]
+            [ Slot 0: input (W×H×3) | output (sW×sH×3) ]
+            [ Slot 1: input | output ]
+            ...
+        """
         width = payload["width"]
         height = payload["height"]
         self.active_scale = payload["scale"]
         self.ring_size = payload.get("ring_size", 3)
 
-        self.input_size = width * height * 4
-        self.slot_byte_size = self.input_size + (
-            (width * self.active_scale) * (height * self.active_scale) * 4
-        )
-        total_size = self.slot_byte_size * self.ring_size
+        self.input_size = width * height * 3
+        self.output_size = (width * self.active_scale) * (height * self.active_scale) * 3
+        self.slot_byte_size = self.input_size + self.output_size
+        self.header_region_size = Config.SLOT_HEADER_SIZE * self.ring_size
+        total_size = self.header_region_size + self.slot_byte_size * self.ring_size
 
         if self.mmap:
             self.cleanup()
@@ -1634,108 +1804,316 @@ class AIWorker:
             self.shm_file.seek(0)
             self.mmap = mmap.mmap(self.shm_file.fileno(), total_size)
 
-            self.input_shape = (height, width, 4)
+            self.input_shape = (height, width, 3)
             self.output_shape = (
                 height * self.active_scale,
                 width * self.active_scale,
-                4,
+                3,
             )
             self.is_configured = True
+            print(
+                f"[Python] SHM created: {total_size} bytes "
+                f"(header={self.header_region_size}, "
+                f"{self.ring_size} slots × {self.slot_byte_size})",
+                flush=True,
+            )
             self.send_status("SHM_CREATED", {"shm_path": self.shm_path})
         except Exception as e:
             traceback.print_exc()
             self.send_status("error", {"message": str(e)})
 
-    def process_frame(self, payload: Dict) -> None:
+    # -------------------------------------------------------------------------
+    # SHM SLOT STATE HELPERS
+    # -------------------------------------------------------------------------
+
+    def _slot_state_offset(self, slot_idx: int) -> int:
+        """Byte offset of the state field for a given slot header."""
+        return slot_idx * Config.SLOT_HEADER_SIZE + Config.STATE_FIELD_OFFSET
+
+    def _read_slot_state(self, slot_idx: int) -> int:
+        """Read the u32 state of a slot from the mmap header."""
+        off = self._slot_state_offset(slot_idx)
+        return struct.unpack_from("<I", self.mmap, off)[0]
+
+    def _write_slot_state(self, slot_idx: int, state: int) -> None:
+        """Write the u32 state of a slot into the mmap header."""
+        off = self._slot_state_offset(slot_idx)
+        struct.pack_into("<I", self.mmap, off, state)
+
+    def _slot_data_base(self, slot_idx: int) -> int:
+        """Byte offset of the start of data for a given slot (after headers)."""
+        return self.header_region_size + slot_idx * self.slot_byte_size
+
+    # -------------------------------------------------------------------------
+    # CORE FRAME PROCESSING (shared by Zenoh fallback and polling loop)
+    # -------------------------------------------------------------------------
+
+    def _process_slot(self, slot_idx: int, research_params: Optional[Dict] = None) -> None:
         """
-        Process a single video frame from shared memory.
+        Process a single video frame from shared memory slot.
+
+        Uses header-based offsets.  Caller is responsible for state transitions.
 
         DETERMINISM GUARANTEES:
-        - Model is stateless - no hidden recurrence between frames
-        - Same frame processed alone vs after other frames = identical output
+        - Model is stateless — no hidden recurrence between frames
         - Uses unified inference() function (same as image path)
         """
-        if not self.is_configured:
-            return
-        if self.model is None:
-            self.send_status("error", {"message": "No model loaded"})
+        base = self._slot_data_base(slot_idx)
+        in_end = base + self.input_size
+        out_end = base + self.slot_byte_size
+
+        in_view = np.frombuffer(
+            self.mmap, dtype=np.uint8, count=self.input_size, offset=base
+        ).reshape(self.input_shape)
+        out_view = np.frombuffer(
+            self.mmap, dtype=np.uint8, count=self.output_size, offset=in_end
+        ).reshape(self.output_shape)
+
+        # Passthrough for scale=1
+        if self.active_scale == 1:
+            out_view[:] = in_view[:]
             return
 
-        # Apply research params if included with this frame
+        # Input is already RGB24 (no alpha channel)
+        img_input = in_view.copy()
+
+        # Convert color space if needed
+        if not self.expects_rgb:
+            img_for_model = img_input[:, :, ::-1].copy()  # RGB -> BGR
+        else:
+            img_for_model = img_input  # Already RGB
+
+        # UNIFIED INFERENCE CALL
+        with suppress_stdout():
+            out_from_model = inference(
+                self.model,
+                img_for_model,
+                self.device,
+                half=self.use_half,
+                adapter=self.adapter
+            )
+
+        # Convert output back to RGB for Rust
+        if not self.expects_rgb:
+            out_for_rust = out_from_model[:, :, ::-1].copy()  # BGR -> RGB
+        else:
+            out_for_rust = out_from_model  # Already RGB
+
+        # Research layer post-processing (if available)
+        if self.research_layer is not None and HAS_RESEARCH_LAYER:
+            try:
+                out_for_rust = self.research_layer.process_frame_numpy(img_input)
+            except Exception as e:
+                print(f"[Python Warning] Research layer failed, using vanilla: {e}", flush=True)
+
+        # Publish spatial routing map for UI overlay
+        self._publish_spatial_map(img_input)
+
+        # SR Pipeline post-processing (blender_engine)
+        if HAS_BLENDER and research_params:
+            try:
+                sr = research_params
+
+                if sr.get("reset_temporal"):
+                    clear_temporal_buffers()
+                    print("[Python] Temporal buffers cleared by user request", flush=True)
+
+                adr_on = bool(sr.get("adr_enabled", False))
+                detail_str = float(sr.get("detail_strength", 0.0))
+                luma_only = bool(sr.get("luma_only", True))
+                edge_str = float(sr.get("edge_strength", 0.0))
+                sharpen_val = float(sr.get("sharpen_strength", 0.0))
+                temporal_on = bool(sr.get("temporal_enabled", False))
+                temporal_a = float(sr.get("temporal_alpha", 0.9))
+
+                needs_sr_pipeline = (
+                    (adr_on and detail_str > 1e-4)
+                    or edge_str > 1e-4
+                    or sharpen_val > 1e-4
+                    or temporal_on
+                )
+
+                if needs_sr_pipeline:
+                    sr_float = out_for_rust.astype(np.float32) / 255.0
+                    sr_tensor = torch.from_numpy(sr_float.transpose(2, 0, 1)).unsqueeze(0)
+                    sr_tensor = sr_tensor.to(device=self.device, non_blocking=True)
+
+                    if adr_on and detail_str > 1e-4:
+                        gan_float = out_from_model.astype(np.float32) / 255.0
+                        gan_tensor = torch.from_numpy(
+                            gan_float.transpose(2, 0, 1)
+                        ).unsqueeze(0).to(device=self.device, non_blocking=True)
+                        sr_tensor = PredictionBlender.apply_detail_residual(
+                            sr_tensor, gan_tensor, detail_str, luma_only
+                        )
+
+                    if edge_str > 1e-4:
+                        sr_tensor = PredictionBlender.blend_edge_aware(
+                            sr_tensor, sr_tensor, alpha=edge_str, edge_strength=1.0
+                        )
+
+                    if sharpen_val > 1e-4:
+                        sr_tensor = PredictionBlender.apply_sharpen(sr_tensor, sharpen_val)
+
+                    if temporal_on:
+                        _, _, th, tw = sr_tensor.shape
+                        t_key = (th, tw, sr_tensor.shape[1])
+                        sr_tensor = PredictionBlender.apply_temporal(
+                            sr_tensor, t_key, temporal_a
+                        )
+
+                    out_for_rust = (
+                        sr_tensor.squeeze(0)
+                        .clamp_(0.0, 1.0)
+                        .mul_(255.0)
+                        .round_()
+                        .to(torch.uint8)
+                        .permute(1, 2, 0)
+                        .cpu()
+                        .numpy()
+                    )
+            except Exception as e:
+                print(f"[Python Warning] SR pipeline post-processing failed: {e}", flush=True)
+
+        # Handle scale mismatch (resize output if needed)
+        h, w = out_for_rust.shape[:2]
+        target_h, target_w = self.output_shape[:2]
+        if h != target_h or w != target_w:
+            out_for_rust = cv2.resize(out_for_rust, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+
+        # Write RGB24 directly to output slot
+        out_view[:] = out_for_rust
+
+    # -------------------------------------------------------------------------
+    # ZENOH FALLBACK: process_frame (legacy per-frame Zenoh command)
+    # -------------------------------------------------------------------------
+
+    def process_frame(self, payload: Dict) -> None:
+        """Legacy per-frame Zenoh handler — delegates to _process_slot."""
+        if not self.is_configured or self.model is None:
+            self.send_status("error", {"message": "Not configured or no model"})
+            return
+
         research_params = payload.get("research_params")
         if research_params and self.research_layer is not None and HAS_RESEARCH_LAYER:
             try:
                 self.research_layer.update_params(research_params)
             except Exception as e:
-                print(f"[Python Warning] Research params inline update failed: {e}", flush=True)
+                print(f"[Python Warning] Research params update failed: {e}", flush=True)
 
         slot_idx = payload.get("slot", 0)
         try:
-            base = slot_idx * self.slot_byte_size
-            in_end = base + self.input_size
-            out_end = base + self.slot_byte_size
+            self._process_slot(slot_idx, research_params)
+            self.send_status("FRAME_DONE", {"slot": slot_idx})
+        except Exception as e:
+            traceback.print_exc()
+            self.send_status("error", {"message": str(e)})
 
+    # -------------------------------------------------------------------------
+    # SHM ATOMIC FRAME LOOP (replaces per-frame Zenoh signaling)
+    # -------------------------------------------------------------------------
+
+    def _collect_ready_slots(self, start_slot: int) -> list:
+        """
+        Scan slots starting from start_slot, collecting consecutive READY_FOR_AI
+        slots up to MAX_BATCH_SIZE.  Returns list of slot indices in ring order.
+
+        Consecutive means ring-order from start_slot: if slot 2 is ready but
+        slot 1 (start) is not, we return [] because ordering is strict.
+        """
+        batch = []
+        max_batch = min(Config.MAX_BATCH_SIZE, self.ring_size)
+        slot = start_slot
+        for _ in range(max_batch):
+            if self._read_slot_state(slot) == Config.SLOT_READY_FOR_AI:
+                batch.append(slot)
+                slot = (slot + 1) % self.ring_size
+            else:
+                break
+        return batch
+
+    def _process_batch(self, slot_indices: list, research_params: Optional[Dict] = None) -> None:
+        """
+        Process multiple SHM slots as a single GPU batch.
+
+        1. Read input frames from all slots
+        2. Run batched inference (single forward pass)
+        3. Apply per-frame post-processing (research layer, blender)
+        4. Write output frames back to slots
+
+        Falls back to sequential _process_slot() if batching is unsupported
+        (e.g. scale=1 passthrough, or adapter doesn't support batches).
+        """
+        if len(slot_indices) == 1:
+            self._process_slot(slot_indices[0], research_params)
+            return
+
+        # Scale=1 passthrough doesn't benefit from batching
+        if self.active_scale == 1:
+            for idx in slot_indices:
+                self._process_slot(idx, research_params)
+            return
+
+        # --- Collect input frames ---
+        inputs_rgb = []
+        for slot_idx in slot_indices:
+            base = self._slot_data_base(slot_idx)
             in_view = np.frombuffer(
                 self.mmap, dtype=np.uint8, count=self.input_size, offset=base
             ).reshape(self.input_shape)
-            out_view = np.frombuffer(
-                self.mmap, dtype=np.uint8, count=(out_end - in_end), offset=in_end
-            ).reshape(self.output_shape)
+            img_input = in_view.copy()
 
-            # Passthrough for scale=1
-            if self.active_scale == 1:
-                out_view[:] = in_view[:]
-                self.send_status("FRAME_DONE", {"slot": slot_idx})
-                return
-
-            # Extract RGB from RGBA input
-            # Rust sends RGBA via FFmpeg (RGB order + Alpha)
-            img_input = in_view[:, :, :3].copy()
-
-            # Convert color space if needed
-            # Video frames from Rust are in RGB order
-            # If model expects BGR, convert RGB -> BGR
             if not self.expects_rgb:
-                img_for_model = img_input[:, :, ::-1].copy()  # RGB -> BGR
-            else:
-                img_for_model = img_input  # Already RGB
+                img_input = img_input[:, :, ::-1].copy()  # RGB -> BGR for model
 
-            # UNIFIED INFERENCE CALL - same function as image path
-            with suppress_stdout():
-                out_from_model = inference(
-                    self.model,
-                    img_for_model,
-                    self.device,
-                    half=self.use_half,
-                    adapter=self.adapter
-                )
+            inputs_rgb.append(img_input)
 
-            # Convert output back to RGB for Rust
+        # --- Batched GPU inference ---
+        with suppress_stdout():
+            outputs = inference_batch(
+                self.model,
+                inputs_rgb,
+                self.device,
+                half=self.use_half,
+                adapter=self.adapter,
+            )
+
+        # --- Per-frame post-processing and write-back ---
+        for i, slot_idx in enumerate(slot_indices):
+            out_from_model = outputs[i]
+
+            # Convert back to RGB if model output is BGR
             if not self.expects_rgb:
                 out_for_rust = out_from_model[:, :, ::-1].copy()  # BGR -> RGB
             else:
-                out_for_rust = out_from_model  # Already RGB
+                out_for_rust = out_from_model
 
-            # Research layer post-processing (if available)
+            # Research layer post-processing
             if self.research_layer is not None and HAS_RESEARCH_LAYER:
                 try:
+                    base = self._slot_data_base(slot_idx)
+                    in_view = np.frombuffer(
+                        self.mmap, dtype=np.uint8, count=self.input_size, offset=base
+                    ).reshape(self.input_shape)
+                    img_input = in_view.copy()
                     out_for_rust = self.research_layer.process_frame_numpy(img_input)
                 except Exception as e:
-                    # Fallback to vanilla output on research layer failure
                     print(f"[Python Warning] Research layer failed, using vanilla: {e}", flush=True)
 
-            # Publish spatial routing map for UI overlay
-            self._publish_spatial_map(img_input)
+            # Spatial map (only for first frame in batch to reduce overhead)
+            if i == 0:
+                base = self._slot_data_base(slot_idx)
+                in_view = np.frombuffer(
+                    self.mmap, dtype=np.uint8, count=self.input_size, offset=base
+                ).reshape(self.input_shape)
+                self._publish_spatial_map(in_view.copy())
 
             # SR Pipeline post-processing (blender_engine)
-            # Applies: ADR detail injection, edge-aware mask,
-            # sharpening, temporal EMA — all GPU-resident via PredictionBlender.
             if HAS_BLENDER and research_params:
                 try:
-                    sr = research_params  # shorthand
+                    sr = research_params
 
-                    # --- Temporal buffer reset (one-shot flag from UI) ---
-                    if sr.get("reset_temporal"):
+                    if sr.get("reset_temporal") and i == 0:
                         clear_temporal_buffers()
                         print("[Python] Temporal buffers cleared by user request", flush=True)
 
@@ -1755,16 +2133,11 @@ class AIWorker:
                     )
 
                     if needs_sr_pipeline:
-                        # Convert uint8 HWC → float32 NCHW GPU tensor for blender ops
                         sr_float = out_for_rust.astype(np.float32) / 255.0
                         sr_tensor = torch.from_numpy(sr_float.transpose(2, 0, 1)).unsqueeze(0)
                         sr_tensor = sr_tensor.to(device=self.device, non_blocking=True)
 
-                        # ADR — Adaptive Detail Residual injection
-                        # Uses the vanilla (pre-research) inference as GAN source
                         if adr_on and detail_str > 1e-4:
-                            # Use the original model output as the "GAN" source
-                            # and current sr_tensor as the "structure" base
                             gan_float = out_from_model.astype(np.float32) / 255.0
                             gan_tensor = torch.from_numpy(
                                 gan_float.transpose(2, 0, 1)
@@ -1773,18 +2146,14 @@ class AIWorker:
                                 sr_tensor, gan_tensor, detail_str, luma_only
                             )
 
-                        # Edge-aware blend — stronger detail on edges, softer on flat
                         if edge_str > 1e-4:
-                            # Self-blend with edge mask to boost edge contrast
                             sr_tensor = PredictionBlender.blend_edge_aware(
                                 sr_tensor, sr_tensor, alpha=edge_str, edge_strength=1.0
                             )
 
-                        # Sharpen — GPU unsharp mask
                         if sharpen_val > 1e-4:
                             sr_tensor = PredictionBlender.apply_sharpen(sr_tensor, sharpen_val)
 
-                        # Temporal EMA stabilization
                         if temporal_on:
                             _, _, th, tw = sr_tensor.shape
                             t_key = (th, tw, sr_tensor.shape[1])
@@ -1792,7 +2161,6 @@ class AIWorker:
                                 sr_tensor, t_key, temporal_a
                             )
 
-                        # Convert back to uint8 HWC
                         out_for_rust = (
                             sr_tensor.squeeze(0)
                             .clamp_(0.0, 1.0)
@@ -1806,24 +2174,94 @@ class AIWorker:
                 except Exception as e:
                     print(f"[Python Warning] SR pipeline post-processing failed: {e}", flush=True)
 
-            # Handle scale mismatch (resize output if needed)
+            # Handle scale mismatch
             h, w = out_for_rust.shape[:2]
             target_h, target_w = self.output_shape[:2]
             if h != target_h or w != target_w:
                 out_for_rust = cv2.resize(out_for_rust, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
 
-            # Write to output slot (RGB + Alpha -> RGBA)
-            out_view[:, :, :3] = out_for_rust
-            out_view[:, :, 3] = 255  # Alpha channel
+            # Write to output slot
+            base = self._slot_data_base(slot_idx)
+            in_end = base + self.input_size
+            out_view = np.frombuffer(
+                self.mmap, dtype=np.uint8, count=self.output_size, offset=in_end
+            ).reshape(self.output_shape)
+            out_view[:] = out_for_rust
 
-            self.send_status("FRAME_DONE", {"slot": slot_idx})
+    def _frame_loop(self) -> None:
+        """
+        Background polling loop with micro-batching: collects consecutive
+        READY_FOR_AI slots and processes them in a single GPU forward pass.
 
-        except Exception as e:
-            traceback.print_exc()
-            self.send_status("error", {"message": str(e)})
-        finally:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        Runs in a daemon thread.  Stopped by setting self._frame_loop_active = False.
+        Slots are processed in strict sequential order (0 → 1 → 2 → 0 → …)
+        to preserve frame ordering.
+        """
+        print("[Python] Frame loop started (SHM atomic polling, micro-batch)", flush=True)
+        next_slot = 0
+        idle_spins = 0
+
+        while self._frame_loop_active:
+            if not self.is_configured or self.model is None:
+                time.sleep(0.01)
+                continue
+
+            batch = self._collect_ready_slots(next_slot)
+
+            if batch:
+                idle_spins = 0
+
+                # Transition all batch slots: READY_FOR_AI → AI_PROCESSING
+                for idx in batch:
+                    self._write_slot_state(idx, Config.SLOT_AI_PROCESSING)
+
+                try:
+                    self._process_batch(batch, self._cached_research_params)
+                except Exception as e:
+                    print(f"[Python Error] Batch processing failed: {e}", flush=True)
+                    traceback.print_exc()
+
+                # Transition all batch slots: AI_PROCESSING → READY_FOR_ENCODE
+                for idx in batch:
+                    self._write_slot_state(idx, Config.SLOT_READY_FOR_ENCODE)
+
+                next_slot = (batch[-1] + 1) % self.ring_size
+            else:
+                # No work available — adaptive backoff
+                idle_spins += 1
+                if idle_spins < 100:
+                    time.sleep(0.0001)  # 100µs tight spin
+                elif idle_spins < 1000:
+                    time.sleep(0.001)   # 1ms
+                else:
+                    time.sleep(0.005)   # 5ms deep idle
+
+        print("[Python] Frame loop stopped", flush=True)
+
+    def start_frame_loop(self, payload: Dict) -> None:
+        """Start the SHM atomic frame polling loop in a background thread."""
+        if hasattr(self, '_frame_loop_thread') and self._frame_loop_thread is not None:
+            if self._frame_loop_thread.is_alive():
+                print("[Python] Frame loop already running", flush=True)
+                return
+
+        # Cache initial research params
+        self._cached_research_params = payload.get("research_params")
+        self._frame_loop_active = True
+
+        self._frame_loop_thread = threading.Thread(
+            target=self._frame_loop, daemon=True, name="vf-frame-loop"
+        )
+        self._frame_loop_thread.start()
+        self.send_status("FRAME_LOOP_STARTED")
+
+    def stop_frame_loop(self, payload: Dict = None) -> None:
+        """Stop the SHM atomic frame polling loop."""
+        self._frame_loop_active = False
+        if hasattr(self, '_frame_loop_thread') and self._frame_loop_thread is not None:
+            self._frame_loop_thread.join(timeout=5.0)
+            self._frame_loop_thread = None
+        self.send_status("FRAME_LOOP_STOPPED")
 
 
 # =============================================================================
@@ -1838,10 +2276,13 @@ if __name__ == "__main__":
         "--precision",
         type=str,
         default="fp32",
-        choices=["fp32", "fp16"],
-        help="Inference precision (fp32 recommended for determinism)"
+        choices=["fp32", "fp16", "deterministic"],
+        help="Inference precision: fp32 (TF32 on), fp16 (autocast), deterministic (strict)"
     )
     args = parser.parse_args()
+
+    # Configure precision BEFORE any model loading or CUDA ops
+    configure_precision(args.precision)
 
     if args.parent_pid > 0:
         start_watchdog(args.parent_pid)

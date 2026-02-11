@@ -27,18 +27,17 @@ lazy_static::lazy_static! {
 use std::os::windows::process::CommandExt;
 
 // --- MODULES ---
+pub mod control;
 mod edit_config;
 mod models;
 mod shm;
-mod shm_ring;
-mod video_pipeline;
-pub mod control;
-pub mod spatial_publisher;
 pub mod spatial_map;
+pub mod spatial_publisher;
+mod video_pipeline;
 
+use crate::control::ResearchConfig;
 use crate::edit_config::{build_ffmpeg_filters, calculate_output_dimensions, EditConfig};
 use crate::models::ModelInfo;
-use crate::control::ResearchConfig;
 
 // --- CONSTANTS ---
 const ENGINE_URL: &str = "https://github.com/YourRepo/releases/download/v1.0/engine.zip";
@@ -561,7 +560,19 @@ async fn upscale_request(
     model: String,
     edit_config: EditConfig,
     scale: u32,
+    #[allow(unused_variables)] precision: Option<String>,
 ) -> Result<String, String> {
+    // Validate precision mode (fp32, fp16, deterministic)
+    let precision = precision.unwrap_or_else(|| "fp32".to_string());
+    let precision = match precision.as_str() {
+        "fp32" | "fp16" | "deterministic" => precision,
+        _ => {
+            return Err(format!(
+                "Invalid precision mode '{}'. Use fp32, fp16, or deterministic.",
+                precision
+            ))
+        }
+    };
     if !Path::new(&input_path).exists() {
         return Err(format!("Input file not found: {}", input_path));
     }
@@ -601,6 +612,8 @@ async fn upscale_request(
     cmd.arg(port.to_string());
     cmd.arg("--parent-pid");
     cmd.arg(std::process::id().to_string());
+    cmd.arg("--precision");
+    cmd.arg(&precision);
     cmd.stdout(Stdio::null()); // Prevent blocking on pipe buffer
     cmd.stderr(Stdio::null());
     #[cfg(target_os = "windows")]
@@ -716,7 +729,10 @@ async fn upscale_request(
                 PYTHON_PIDS.lock().unwrap().remove(&pid);
             }
             // Wait with timeout
-            if timeout(Duration::from_secs(10), child.wait()).await.is_err() {
+            if timeout(Duration::from_secs(10), child.wait())
+                .await
+                .is_err()
+            {
                 println!("Image engine did not exit in time. Forcing kill...");
                 let _ = child.start_kill();
             }
@@ -768,87 +784,164 @@ async fn upscale_request(
 
     let shm = shm::VideoShm::open(&shm_path, process_w, process_h, scale_factor)
         .map_err(|e| e.to_string())?;
+    // Reset all slot headers to EMPTY before starting
+    shm.reset_all_slots();
     let shared_shm = Mutex::new(shm);
 
+    // Internal flow control channels (Rust-side only, not cross-process)
     let (free_tx, mut free_rx) = mpsc::channel::<usize>(shm::RING_SIZE);
-    let (ai_tx, mut ai_rx) = mpsc::channel::<usize>(shm::RING_SIZE);
+    let (pending_tx, mut pending_rx) = mpsc::channel::<usize>(shm::RING_SIZE);
     let (enc_tx, mut enc_rx) = mpsc::channel::<usize>(shm::RING_SIZE);
 
     for i in 0..shm::RING_SIZE {
         free_tx.send(i).await.map_err(|e| e.to_string())?;
     }
 
+    // Send initial research params and start the Python frame polling loop
+    let research_config_ref = research_state.inner().clone();
+    {
+        let guard = research_config_ref.lock().await;
+        let params_val = serde_json::to_value(&*guard).unwrap_or_default();
+        let start_req = serde_json::json!({
+            "command": "start_frame_loop",
+            "research_params": params_val
+        });
+        publisher
+            .put(start_req.to_string())
+            .await
+            .map_err(|e: zenoh::Error| e.to_string())?;
+    }
+    // Wait for Python to confirm frame loop started
+    let loop_msg = timeout(Duration::from_secs(10), subscriber.recv_async())
+        .await
+        .map_err(|_| "Frame loop start timeout")?
+        .map_err(|e: zenoh::Error| e.to_string())?;
+    let loop_data =
+        String::from_utf8(loop_msg.payload().to_bytes().to_vec()).map_err(|e| e.to_string())?;
+    if !loop_data.contains("FRAME_LOOP_STARTED") {
+        return Err(format!("Frame loop start failed: {}", loop_data));
+    }
+    println!("Pipeline: Python frame loop started (SHM atomic polling)");
+
     let filters = build_ffmpeg_filters(&edit_config, input_w, input_h);
 
+    // --- DECODER TASK ---
+    // Reads FFmpeg frames → writes to SHM input slot → sets READY_FOR_AI
     let decoder_task = async {
-        let mut decoder =
-            video_pipeline::VideoDecoder::new(&input_path, start_time, process_duration, &filters)
-                .await
-                .map_err(|e| e.to_string())?;
+        let use_nvdec = video_pipeline::probe_nvdec();
+        let mut decoder = video_pipeline::VideoDecoder::new(
+            &input_path,
+            start_time,
+            process_duration,
+            &filters,
+            use_nvdec,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if decoder.using_hwaccel {
+            println!("Decoder: Using NVDEC hardware acceleration");
+        }
+        let mut frame_id: u32 = 0;
         while let Some(slot_idx) = free_rx.recv().await {
             let mut shm_guard = shared_shm.lock().await;
-            let input_slot = match shm_guard.input_slot_mut(slot_idx) {
-                Ok(slot) => slot,
-                Err(e) => {
-                    eprintln!("SHM Error: {}", e);
-                    break;
+            // Set RUST_WRITING before writing data
+            shm_guard.set_slot_state(slot_idx, shm::SLOT_RUST_WRITING);
+            let frame_size = {
+                let input_slot = match shm_guard.input_slot_mut(slot_idx) {
+                    Ok(slot) => slot,
+                    Err(e) => {
+                        eprintln!("SHM Error: {}", e);
+                        break;
+                    }
+                };
+                let size = input_slot.len() as u32;
+                let got_frame = decoder
+                    .read_raw_frame_into(input_slot)
+                    .await
+                    .unwrap_or(false);
+                if got_frame {
+                    Some(size)
+                } else {
+                    None
                 }
             };
-            if decoder
-                .read_raw_frame_into(input_slot)
-                .await
-                .unwrap_or(false)
-            {
+            if let Some(size) = frame_size {
+                frame_id += 1;
+                shm_guard.set_slot_write_index(slot_idx, frame_id);
+                shm_guard.set_slot_frame_bytes(slot_idx, size);
+                // Transition: RUST_WRITING → READY_FOR_AI
+                // Python frame loop will pick this up via atomic polling.
+                shm_guard.set_slot_state(slot_idx, shm::SLOT_READY_FOR_AI);
                 drop(shm_guard);
-                if ai_tx.send(slot_idx).await.is_err() {
+                if pending_tx.send(slot_idx).await.is_err() {
                     break;
                 }
             } else {
+                // No more frames — reset state and exit
+                shm_guard.set_slot_state(slot_idx, shm::SLOT_EMPTY);
                 break;
             }
         }
         Ok::<(), String>(())
     };
 
-    let research_config_ref = research_state.inner().clone();
-    let ai_task = async {
-        while let Some(slot_idx) = ai_rx.recv().await {
-            // Include current research params so Python stays in sync
-            let params_val = {
+    // --- POLL TASK ---
+    // Polls SHM slot state for READY_FOR_ENCODE (Python done).
+    // Replaces per-frame Zenoh request/response round-trip.
+    // Also pushes research param updates via Zenoh control plane.
+    let poll_task = async {
+        let mut last_params_push = Instant::now();
+        while let Some(slot_idx) = pending_rx.recv().await {
+            // Push research params periodically (every 500ms) via Zenoh control plane
+            if last_params_push.elapsed() > Duration::from_millis(500) {
                 let mut guard = research_config_ref.lock().await;
+                let has_reset = guard.reset_temporal;
                 let val = serde_json::to_value(&*guard).unwrap_or_default();
-                // Clear transient reset flag after serialization (one-shot)
-                if guard.reset_temporal {
+                if has_reset {
                     guard.reset_temporal = false;
                 }
-                val
-            };
-            let req = serde_json::json!({
-                "command": "process_frame",
-                "slot": slot_idx,
-                "research_params": params_val
-            });
-            if publisher.put(req.to_string()).await.is_err() {
-                break;
+                drop(guard);
+                let _ = publisher
+                    .put(
+                        serde_json::json!({
+                            "command": "update_research_params",
+                            "params": val
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                last_params_push = Instant::now();
             }
-            match timeout(Duration::from_secs(30), subscriber.recv_async()).await {
-                Ok(Ok(msg)) => {
-                    let s =
-                        String::from_utf8(msg.payload().to_bytes().to_vec()).unwrap_or_default();
-                    if s.contains("FRAME_DONE") {
-                        if enc_tx.send(slot_idx).await.is_err() {
-                            break;
-                        }
-                    } else {
-                        return Err(format!("AI Error: {}", s));
+
+            // Poll for READY_FOR_ENCODE with timeout
+            let poll_start = Instant::now();
+            loop {
+                {
+                    let shm_guard = shared_shm.lock().await;
+                    let state = shm_guard.slot_state(slot_idx);
+                    if state == shm::SLOT_READY_FOR_ENCODE {
+                        break;
                     }
                 }
-                _ => return Err("AI Timeout".to_string()),
+                // Timeout: 30 seconds per frame
+                if poll_start.elapsed() > Duration::from_secs(30) {
+                    // Crash recovery: reset slot to EMPTY
+                    let shm_guard = shared_shm.lock().await;
+                    shm_guard.set_slot_state(slot_idx, shm::SLOT_EMPTY);
+                    return Err("AI processing timeout (30s)".to_string());
+                }
+                tokio::time::sleep(Duration::from_micros(200)).await;
+            }
+
+            if enc_tx.send(slot_idx).await.is_err() {
+                break;
             }
         }
         Ok(())
     };
 
+    // --- ENCODER TASK ---
+    // Reads AI output from SHM → writes to FFmpeg → sets EMPTY
     let target_fps = edit_config.fps;
     let encoder_task = async {
         let mut encoder = video_pipeline::VideoEncoder::new_with_audio(
@@ -860,6 +953,7 @@ async fn upscale_request(
             Some(&input_path),
             start_time,
             process_duration,
+            precision == "deterministic",
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -869,6 +963,8 @@ async fn upscale_request(
 
         while let Some(slot_idx) = enc_rx.recv().await {
             let shm_guard = shared_shm.lock().await;
+            // Transition: READY_FOR_ENCODE → ENCODING
+            shm_guard.set_slot_state(slot_idx, shm::SLOT_ENCODING);
             let output_slot = match shm_guard.output_slot(slot_idx) {
                 Ok(slot) => slot,
                 Err(e) => {
@@ -876,13 +972,12 @@ async fn upscale_request(
                     break;
                 }
             };
-            if let Err(e) = encoder
-                .write_raw_frame(output_slot)
-                .await
-            {
+            if let Err(e) = encoder.write_raw_frame(output_slot).await {
                 eprintln!("Encoder Write Error: {}", e);
                 break;
             }
+            // Transition: ENCODING → EMPTY (slot is free for decoder)
+            shm_guard.set_slot_state(slot_idx, shm::SLOT_EMPTY);
             drop(shm_guard);
             let _ = free_tx.send(slot_idx).await;
 
@@ -920,9 +1015,14 @@ async fn upscale_request(
         Ok(())
     };
 
-    if let Err(e) = tokio::try_join!(decoder_task, ai_task, encoder_task) {
+    if let Err(e) = tokio::try_join!(decoder_task, poll_task, encoder_task) {
         return Err(e);
     }
+
+    // Stop Python frame loop before shutdown
+    let _ = publisher
+        .put(serde_json::json!({ "command": "stop_frame_loop" }).to_string())
+        .await;
 
     let _ = publisher
         .put(serde_json::json!({ "command": "shutdown" }).to_string())
@@ -941,7 +1041,7 @@ async fn upscale_request(
             // Double-tap with Windows taskkill by PID to be sure
             #[cfg(target_os = "windows")]
             if let Some(pid) = child.id() {
-                 let _ = std::process::Command::new("taskkill")
+                let _ = std::process::Command::new("taskkill")
                     .args(["/F", "/PID", &pid.to_string()])
                     .creation_flags(0x08000000)
                     .output();
