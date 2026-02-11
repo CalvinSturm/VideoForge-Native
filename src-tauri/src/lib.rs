@@ -473,6 +473,8 @@ async fn export_request(
         "p7".to_string(),
         "-cq".to_string(),
         "18".to_string(),
+        "-c:a".to_string(),
+        "copy".to_string(), // Pass through audio without re-encoding
         "-movflags".to_string(),
         "+faststart".to_string(),
         output_path.clone(),
@@ -849,12 +851,15 @@ async fn upscale_request(
 
     let target_fps = edit_config.fps;
     let encoder_task = async {
-        let mut encoder = video_pipeline::VideoEncoder::new(
+        let mut encoder = video_pipeline::VideoEncoder::new_with_audio(
             &output_path,
             fps as u32,
             target_fps,
             process_w * scale_factor,
             process_h * scale_factor,
+            Some(&input_path),
+            start_time,
+            process_duration,
         )
         .await
         .map_err(|e| e.to_string())?;

@@ -189,6 +189,23 @@ impl VideoEncoder {
         width: usize,
         height: usize,
     ) -> Result<Self> {
+        Self::new_with_audio(output, source_fps, target_fps, width, height, None, 0.0, 0.0).await
+    }
+
+    /// Create encoder with optional audio source from the original input file.
+    /// `audio_source`: path to original video to copy audio from
+    /// `audio_start`: trim start offset (seconds) to sync audio
+    /// `audio_duration`: trim duration (seconds), 0 = full
+    pub async fn new_with_audio(
+        output: &str,
+        source_fps: u32,
+        target_fps: u32,
+        width: usize,
+        height: usize,
+        audio_source: Option<&str>,
+        audio_start: f64,
+        audio_duration: f64,
+    ) -> Result<Self> {
         let resolution = format!("{}x{}", width, height);
 
         // Auto-switch codec: H.264 typically maxes at 4096px (4K).
@@ -227,6 +244,25 @@ impl VideoEncoder {
             "-i".to_string(),
             "-".to_string(),
         ];
+
+        // Add original file as second input for audio stream
+        if let Some(audio_src) = audio_source {
+            if audio_start > 0.0 {
+                args.push("-ss".to_string());
+                args.push(format!("{:.3}", audio_start));
+            }
+            if audio_duration > 0.0 {
+                args.push("-t".to_string());
+                args.push(format!("{:.3}", audio_duration));
+            }
+            args.push("-i".to_string());
+            args.push(audio_src.to_string());
+            // Map video from pipe (input 0) and audio from original file (input 1)
+            args.push("-map".to_string());
+            args.push("0:v".to_string());
+            args.push("-map".to_string());
+            args.push("1:a?".to_string()); // '?' = optional, won't fail if no audio
+        }
 
         // --- FILTER CHAIN CONSTRUCTION ---
         let mut filters = Vec::new();
@@ -270,7 +306,18 @@ impl VideoEncoder {
             "100M".to_string(), // Max Bitrate: 100 Mbps
             "-bufsize".to_string(),
             "100M".to_string(), // VBV Buffer
-            // --- CONTAINER SETTINGS ---
+        ]);
+
+        // Copy audio stream if present (no re-encode)
+        if audio_source.is_some() {
+            args.extend_from_slice(&[
+                "-c:a".to_string(),
+                "copy".to_string(),
+            ]);
+        }
+
+        // --- CONTAINER SETTINGS ---
+        args.extend_from_slice(&[
             "-movflags".to_string(),
             "+faststart".to_string(), // Move metadata to start (faster muxing/playback)
             output.to_string(),
