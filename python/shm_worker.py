@@ -117,47 +117,74 @@ WEIGHTS_DIRS = [
 # https://arxiv.org/abs/1807.02758
 
 class ChannelAttention(torch.nn.Module):
-    """Channel Attention Module for RCAN - matches official CALayer naming"""
+    """Channel Attention with fc1/PReLU/fc2 structure (RCAN+ variant)."""
     def __init__(self, num_feat: int, squeeze_factor: int = 16):
         super().__init__()
-        # Official RCAN uses separate avg_pool and conv_du
         self.avg_pool = torch.nn.AdaptiveAvgPool2d(1)
-        self.conv_du = torch.nn.Sequential(
-            torch.nn.Conv2d(num_feat, num_feat // squeeze_factor, 1, padding=0, bias=True),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Conv2d(num_feat // squeeze_factor, num_feat, 1, padding=0, bias=True),
-            torch.nn.Sigmoid()
-        )
+        self.fc1 = torch.nn.Conv2d(num_feat, num_feat // squeeze_factor, 1, bias=False)
+        self.relu1 = torch.nn.PReLU(num_feat // squeeze_factor)
+        self.fc2 = torch.nn.Conv2d(num_feat // squeeze_factor, num_feat, 1, bias=False)
+        self.sigmoid = torch.nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.avg_pool(x)
-        y = self.conv_du(y)
+        y = self.fc1(y)
+        y = self.relu1(y)
+        y = self.fc2(y)
+        y = self.sigmoid(y)
         return x * y
 
 
-class RCAB(torch.nn.Module):
-    """Residual Channel Attention Block - matches official RCAN naming"""
+class SpatialAttention(torch.nn.Module):
+    """Spatial Attention with a single 7x7 conv."""
+    def __init__(self):
+        super().__init__()
+        self.conv1 = torch.nn.Conv2d(1, 1, 7, padding=3, bias=False)
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        y = self.conv1(avg_out)
+        y = self.sigmoid(y)
+        return x * y
+
+
+class CSAM(torch.nn.Module):
+    """Combined Channel + Spatial Attention Module for RCAN."""
     def __init__(self, num_feat: int, squeeze_factor: int = 16):
         super().__init__()
-        # Use 'body' to match official RCAN key names
+        self.ca = ChannelAttention(num_feat, squeeze_factor)
+        self.sa = SpatialAttention()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.ca(x)
+        x = self.sa(x)
+        return x
+
+
+class RCAB(torch.nn.Module):
+    """Residual Channel Attention Block with combined CA+SA."""
+    def __init__(self, num_feat: int, squeeze_factor: int = 16, res_scale: float = 0.1):
+        super().__init__()
         self.body = torch.nn.Sequential(
             torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1),
             torch.nn.ReLU(inplace=True),
             torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1),
-            ChannelAttention(num_feat, squeeze_factor)
+            CSAM(num_feat, squeeze_factor)
         )
+        self.res_scale = res_scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.body(x)
+        return x + self.body(x) * self.res_scale
 
 
 class ResidualGroup(torch.nn.Module):
     """Residual Group containing multiple RCABs - matches official RCAN naming"""
-    def __init__(self, num_feat: int, num_rcab: int = 20, squeeze_factor: int = 16):
+    def __init__(self, num_feat: int, num_rcab: int = 20, squeeze_factor: int = 16, res_scale: float = 0.1):
         super().__init__()
         # Use 'body' to match official RCAN key names
         self.body = torch.nn.Sequential(
-            *[RCAB(num_feat, squeeze_factor) for _ in range(num_rcab)],
+            *[RCAB(num_feat, squeeze_factor, res_scale) for _ in range(num_rcab)],
             torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1)
         )
 
@@ -208,7 +235,7 @@ class RCAN(torch.nn.Module):
         )
 
         # Body: deep feature extraction with residual groups
-        body_modules = [ResidualGroup(num_feat, num_rcab, squeeze_factor) for _ in range(num_group)]
+        body_modules = [ResidualGroup(num_feat, num_rcab, squeeze_factor, res_scale=0.1) for _ in range(num_group)]
         body_modules.append(torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1))
         self.body = torch.nn.Sequential(*body_modules)
 

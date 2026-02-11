@@ -258,20 +258,47 @@ def _register_official_model_stubs() -> None:
     rcan_mod = types.ModuleType("model.rcan")
 
     class CALayer(nn.Module):
+        """Channel Attention with fc1/relu1(PReLU)/fc2 structure."""
         def __init__(self, channel=64, reduction=16):
             super().__init__()
             self.avg_pool = nn.AdaptiveAvgPool2d(1)
-            self.conv_du = nn.Sequential(
-                nn.Conv2d(channel, channel // reduction, 1, bias=True),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(channel // reduction, channel, 1, bias=True),
-                nn.Sigmoid(),
-            )
+            self.fc1 = nn.Conv2d(channel, channel // reduction, 1, bias=False)
+            self.relu1 = nn.PReLU(channel // reduction)
+            self.fc2 = nn.Conv2d(channel // reduction, channel, 1, bias=False)
+            self.sigmoid = nn.Sigmoid()
 
         def forward(self, x):
             y = self.avg_pool(x)
-            y = self.conv_du(y)
+            y = self.fc1(y)
+            y = self.relu1(y)
+            y = self.fc2(y)
+            y = self.sigmoid(y)
             return x * y
+
+    class SALayer(nn.Module):
+        """Spatial Attention with a single 7x7 conv."""
+        def __init__(self):
+            super().__init__()
+            self.conv1 = nn.Conv2d(1, 1, 7, padding=3, bias=False)
+            self.sigmoid = nn.Sigmoid()
+
+        def forward(self, x):
+            avg_out = torch.mean(x, dim=1, keepdim=True)
+            y = self.conv1(avg_out)
+            y = self.sigmoid(y)
+            return x * y
+
+    class CSAM(nn.Module):
+        """Combined Channel + Spatial Attention Module."""
+        def __init__(self, channel=64, reduction=16):
+            super().__init__()
+            self.ca = CALayer(channel, reduction)
+            self.sa = SALayer()
+
+        def forward(self, x):
+            x = self.ca(x)
+            x = self.sa(x)
+            return x
 
     rcan_mod.CALayer = CALayer
 
@@ -282,11 +309,12 @@ def _register_official_model_stubs() -> None:
             modules = [conv(n_feat, n_feat, kernel_size, bias=bias),
                        act if act else nn.ReLU(True),
                        conv(n_feat, n_feat, kernel_size, bias=bias),
-                       CALayer(n_feat, reduction)]
+                       CSAM(n_feat, reduction)]
             self.body = nn.Sequential(*modules)
+            self.res_scale = res_scale
 
         def forward(self, x):
-            return x + self.body(x)
+            return x + self.body(x) * self.res_scale
 
     rcan_mod.RCAB = RCAB_Stub
 
