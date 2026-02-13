@@ -1,0 +1,529 @@
+/* ui/src/App.css */
+
+/* ============================================================
+   1. THEME VARIABLES & CORE RESET
+   ============================================================ */
+:root {
+  /* BACKGROUNDS - Subtle Gradient for Depth */
+  --bg-color: #09090b;
+  --bg-gradient: radial-gradient(circle at 50% 0%, #1a1a1c 0%, #09090b 40%);
+
+  --panel-bg: #111113;
+  --panel-border: rgba(255, 255, 255, 0.08);
+  --section-bg: rgba(255, 255, 255, 0.02);
+
+  /* BRAND */
+  --brand-primary: #00ff88;
+  --brand-dim: rgba(0, 255, 136, 0.1);
+  --brand-text-on-primary: #000000;
+
+  /* TEXT */
+  --text-primary: #ededed;
+  --text-secondary: #a1a1aa;
+  --text-muted: #52525b;
+
+  /* CONTROLS */
+  --button-bg: #27272a;
+  --button-hover-bg: #3f3f46;
+  --input-bg: #050505;
+  --input-border: #27272a;
+
+  /* SHADOWS & DEPTH */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.5);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.5), 0 2px 4px -1px rgba(0, 0, 0, 0.3);
+  --bevel-light: inset 0 1px 0 0 rgba(255, 255, 255, 0.05);
+  --inset-deep: inset 0 2px 4px 0 rgba(0, 0, 0, 0.6);
+
+  /* FONTS */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+  /* DOCK (Defaults) */
+  --dock-bg: #111113;
+  --dock-border: rgba(255, 255, 255, 0.1);
+  --dock-hover: #1a1a1c;
+  /* SCROLLBARS */
+  --scrollbar-thumb: #333;
+  --scrollbar-thumb-hover: #555;
+
+  /* NODE/CARD BACKGROUNDS */
+  --node-bg: linear-gradient(180deg, #141416, #111113);
+  --node-bg-hover: rgba(255, 255, 255, 0.02);
+  --node-border: rgba(255, 255, 255, 0.12);
+
+  /* TIMELINE */
+  --timeline-bg: linear-gradient(to bottom, #0a0a0c 0%, #0d0d0f 100%);
+  --timeline-toolbar-bg: linear-gradient(to bottom, #0d0d0f, #09090b);
+  --timeline-track-bg: linear-gradient(to bottom, #0f0f11, #141416);
+
+  /* TOAST NOTIFICATIONS */
+  --toast-bg: #1a1a1c;
+  --toast-border: rgba(255, 255, 255, 0.1);
+  --toast-text: #ededed;
+
+  /* MOSAIC SPECIFIC (Dark Mode Defaults) */
+  --mosaic-title-bg: #111113;
+  --mosaic-title-border: rgba(255, 255, 255, 0.08);
+}
+
+/* ============================================================
+   LIGHT MODE OVERRIDES
+   ============================================================ 
+   
+   Design Rationale:
+   - Off-white backgrounds avoid harsh #FFFFFF glare
+   - Warm neutral tones (subtle cream undertones) feel cinematic
+   - Stone/Slate grays provide professional depth
+   - Sufficient contrast (WCAG AA) maintained throughout
+   ============================================================ */
+.light-mode-container {
+  /* BACKGROUNDS - Warm off-whites with subtle depth */
+  --bg-color: #e5e5e5;
+  /* Stone-200: Darker desktop to reduce glare */
+  --bg-gradient: radial-gradient(circle at 50% 0%, #f3f4f6 0%, #e5e5e5 40%);
+
+  --panel-bg: #f3f4f6;
+  /* Grey-100: Distinctly "grey" panel surface */
+  --panel-border: #d1d5db;
+  /* Grey-300: Stronger definition */
+  --section-bg: #e5e7eb;
+  /* Grey-200: Very subtle contrast against panel */
+
+  /* BRAND - Vibrant but readable Green */
+  --brand-primary: #059669;
+  /* Emerald-600: Brighter, friendlier than 700 */
+  --brand-dim: rgba(5, 150, 105, 0.1);
+  --brand-text-on-primary: #ffffff;
+
+  /* TEXT - High Readability */
+  --text-primary: #1c1917;
+  /* Stone-900: Soft Black */
+  --text-secondary: #44403c;
+  /* Stone-700: High contrast secondary */
+  --text-muted: #57534e;
+  /* Stone-600: Much more legible than 500 */
+
+  /* CONTROLS - Tactile & Visible */
+  --button-bg: #ffffff;
+  /* Pop against stone-50 panel */
+  --button-hover-bg: #f5f5f4;
+  --input-bg: #ffffff;
+  --input-border: #d6d3d1;
+  /* Matches panel border for consistency */
+
+  /* SHADOWS - Softer, more diffuse "Natural Light" */
+  --shadow-sm: 0 1px 2px 0 rgba(28, 25, 23, 0.08);
+  --shadow-md: 0 4px 12px -2px rgba(28, 25, 23, 0.08), 0 2px 6px -1px rgba(28, 25, 23, 0.04);
+  --bevel-light: inset 0 1px 0 0 rgba(255, 255, 255, 0.8);
+  --inset-deep: inset 0 1px 3px 0 rgba(28, 25, 23, 0.08);
+
+  /* MOSAIC SPECIFIC */
+  --mosaic-title-bg: #f0f0f0;
+  /* Distinct header bg */
+  --mosaic-title-border: #d6d3d1;
+
+  /* SCROLLBARS */
+  --scrollbar-thumb: #d6d3d1;
+  --scrollbar-thumb-hover: #a8a29e;
+
+  /* DOCK/DOCK STRIPS */
+  --dock-bg: #fafaf9;
+  --dock-border: #d6d3d1;
+  --dock-hover: #f5f5f4;
+
+  /* NODE/CARD BACKGROUNDS */
+  --node-bg: #ffffff;
+  --node-bg-hover: #f9fafb;
+  --node-border: rgba(0, 0, 0, 0.12);
+  /* Slightly softer than 0.15 */
+
+  /* TIMELINE */
+  --timeline-bg: linear-gradient(to bottom, #f0f0f0 0%, #f5f5f4 100%);
+  --timeline-toolbar-bg: linear-gradient(to bottom, #f5f5f4, #f0f0f0);
+  --timeline-track-bg: linear-gradient(to bottom, #e7e5e4, #d6d3d1);
+
+  /* TOAST NOTIFICATIONS */
+  --toast-bg: #ffffff;
+  --toast-border: rgba(0, 0, 0, 0.12);
+  --toast-text: #1c1917;
+}
+
+/* FIX: Override Blueprint's default grey background */
+.app-container.bp5-dark {
+  background-color: transparent !important;
+  background: transparent !important;
+  color: var(--text-primary) !important;
+  outline: none !important;
+}
+
+.mosaic-blueprint-theme,
+.mosaic-blueprint-theme .mosaic-root,
+.mosaic-root {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+/* Global Background Enforcer - MOVED TO APP CONTAINER */
+html,
+body,
+#root {
+  margin: 0;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+  background-color: #09090b;
+  /* Fallback dark */
+}
+
+.app-container {
+  height: 100vh;
+  width: 100vw;
+  background-color: var(--bg-color);
+  background-image: var(--bg-gradient);
+  display: flex;
+  flex-direction: column;
+}
+
+/* ============================================================
+   2. SCROLLBARS (Dark Mode Optimized)
+   ============================================================ */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+  background: transparent;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 4px;
+  border: 2px solid var(--bg-color);
+  /* Matches bg to fake padding */
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* GLOBAL LAYOUT */
+* {
+  box-sizing: border-box;
+}
+
+img,
+video {
+  display: block;
+  max-width: 100%;
+}
+
+/* ============================================================
+   3. COMPONENT OVERRIDES
+   ============================================================ */
+
+.font-mono {
+  font-family: var(--font-mono) !important;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+h3 {
+  margin: 0 0 8px 0 !important;
+  font-family: var(--font-sans) !important;
+  font-size: 11px !important;
+  font-weight: 700 !important;
+  color: var(--text-secondary) !important;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+h3::before {
+  content: '';
+  display: block;
+  width: 3px;
+  height: 3px;
+  background: var(--brand-primary);
+  opacity: 0.8;
+  box-shadow: 0 0 5px var(--brand-primary);
+}
+
+/* Inputs */
+select,
+input,
+.bp5-html-select select {
+  background-color: var(--input-bg);
+  border: 1px solid var(--input-border);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  border-radius: 4px;
+  height: 26px;
+  padding: 0 8px;
+  box-shadow: var(--inset-deep);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+select:focus,
+input:focus {
+  border-color: var(--brand-primary);
+  box-shadow: 0 0 0 1px var(--brand-dim), var(--inset-deep);
+  outline: none;
+}
+
+/* Buttons */
+button {
+  background: var(--button-bg);
+  color: var(--text-primary);
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 11px;
+  height: 26px;
+  padding: 0 10px;
+  box-shadow: var(--shadow-sm);
+  transition: all 0.1s cubic-bezier(0.4, 0, 0.2, 1);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  letter-spacing: 0.02em;
+}
+
+button:hover:not(:disabled) {
+  background: var(--button-hover-bg);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(0);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.4);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+button.action-primary {
+  background: var(--brand-primary) !important;
+  color: #000 !important;
+  font-weight: 800;
+  text-transform: uppercase;
+  border: none !important;
+  box-shadow: 0 0 10px rgba(0, 255, 136, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.4) !important;
+}
+
+button.action-primary:hover:not(:disabled) {
+  background: #33ff99 !important;
+  box-shadow: 0 0 20px rgba(0, 255, 136, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.4) !important;
+}
+
+button.action-primary:active:not(:disabled) {
+  background: #00cc6a !important;
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.2) !important;
+}
+
+button.action-secondary {
+  background: rgba(255, 255, 255, 0.03) !important;
+  border: 1px solid var(--panel-border) !important;
+  color: var(--text-secondary) !important;
+  box-shadow: var(--shadow-sm);
+}
+
+button.action-secondary:hover:not(:disabled) {
+  border-color: var(--text-primary) !important;
+  color: var(--text-primary) !important;
+  background: rgba(255, 255, 255, 0.06) !important;
+}
+
+button.toggle-active {
+  background: var(--brand-primary) !important;
+  color: #000 !important;
+  font-weight: 800 !important;
+  border-color: var(--brand-primary) !important;
+  box-shadow: 0 0 8px rgba(0, 255, 136, 0.4) !important;
+}
+
+.titlebar-btn {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  border-top: none !important;
+}
+
+.titlebar-btn:hover {
+  background-color: var(--button-hover-bg, rgba(255, 255, 255, 0.08)) !important;
+  color: var(--text-primary) !important;
+}
+
+.titlebar-btn.danger-hover:hover {
+  background-color: #e81123 !important;
+  color: white !important;
+}
+
+/* DOCK STRIP - The collapsed panel tabs */
+.dock-strip {
+  background-color: var(--dock-bg, #111113);
+  border: 1px solid var(--dock-border, rgba(255, 255, 255, 0.1));
+  color: var(--text-secondary);
+  transition: all 0.1s;
+}
+
+.dock-strip:hover {
+  background-color: var(--dock-hover, #1a1a1c);
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+
+/* ============================================================
+   4. MOSAIC CUSTOMIZATION (THE PREMIUM GRID)
+   ============================================================ */
+
+/* 1. The Grid Cells (Tiles) */
+/* Padding here creates the gutter between panels */
+.mosaic-tile {
+  padding: 4px !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  border: none !important;
+  margin: 0 !important;
+  min-width: 200px;
+  min-height: 100px;
+}
+
+/* 2. The Panels (Windows) */
+/* The visible box inside the padded tile */
+.mosaic-window {
+  margin: 0 !important;
+  /* Margin handled by tile padding */
+  width: 100% !important;
+  height: 100% !important;
+
+  /* Premium Panel Style */
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  /* Deep shadow for floating effect */
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Header */
+.mosaic-window-toolbar {
+  background: var(--mosaic-title-bg) !important;
+  border-bottom: 1px solid var(--mosaic-title-border) !important;
+  height: 32px !important;
+  z-index: 10;
+  padding: 0 !important;
+  display: flex !important;
+  align-items: center;
+}
+
+/* Content Body */
+.mosaic-window-body {
+  background: var(--panel-bg) !important;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Splitters (Invisible interaction zones) */
+.mosaic-split {
+  background: transparent !important;
+  border: none !important;
+  z-index: 10 !important;
+}
+
+/* Hover state shows the splitter logic */
+.mosaic-split:hover {
+  background: var(--brand-primary) !important;
+  opacity: 0.5;
+  transition: opacity 0.2s;
+}
+
+.timeline-scroll-area::-webkit-scrollbar {
+  height: 6px;
+  /* Slimmer horizontal bar */
+  background: #09090b;
+  /* Match bg */
+}
+
+.timeline-scroll-area::-webkit-scrollbar-track {
+  background: #18181b;
+  /* Dark track */
+  border-radius: 3px;
+  margin: 0 16px;
+  /* Padding from edges */
+}
+
+.timeline-scroll-area::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  /* Subtle grey thumb */
+  border-radius: 3px;
+  border: 1px solid #18181b;
+}
+
+.timeline-scroll-area::-webkit-scrollbar-thumb:hover {
+  background: #52525b;
+  /* Lighter on hover */
+}
+
+/* ============================================================
+   5. ANIMATIONS
+   ============================================================ */
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulse {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* Panel header accent glow on hover */
+.mosaic-window:hover .mosaic-window-toolbar {
+  border-bottom-color: rgba(255, 255, 255, 0.1);
+}
+
+/* Enhanced focus states for accessibility */
+.mosaic-window:focus-within {
+  outline: none;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.1);
+}

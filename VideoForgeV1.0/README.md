@@ -1,0 +1,295 @@
+<p align="center">
+  <img src="ui/src/VideoForge_icon.png" alt="VideoForge" width="120" />
+</p>
+
+<h1 align="center">VideoForge</h1>
+
+<p align="center">
+  <strong>Local-first, deterministic AI super-resolution for professional image &amp; video enhancement.</strong>
+</p>
+
+<p align="center">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-blue?style=flat-square" />
+  <img alt="Tauri" src="https://img.shields.io/badge/Tauri-2.0-orange?style=flat-square" />
+  <img alt="React" src="https://img.shields.io/badge/React-19-61dafb?style=flat-square" />
+  <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.0-ee4c2c?style=flat-square" />
+  <img alt="CUDA" src="https://img.shields.io/badge/CUDA-11.7+-76b900?style=flat-square" />
+  <img alt="License" src="https://img.shields.io/badge/license-Proprietary-lightgrey?style=flat-square" />
+</p>
+
+---
+
+## Overview
+
+VideoForge is a high-performance desktop application for AI-powered image and video upscaling. It runs entirely on your local machine — no cloud, no uploads, no data leaves your GPU. The app combines a Rust orchestration layer, a Python AI inference engine, and a professional React-based UI into a zero-copy pipeline that decodes, upscales, and encodes video frames with minimal overhead.
+
+### Core Philosophy
+
+- **Privacy First** — All processing happens locally on your GPU. No network calls, no telemetry.
+- **Determinism** — Supported models (RCAN, EDSR) produce bit-identical output across runs. GAN models (RealESRGAN) are clearly labeled as non-deterministic.
+- **User Authority** — Full control over trim, crop, color grading, model selection, and precision mode. Preview before you commit.
+- **Zero-Copy Pipeline** — Frames flow through shared memory between decoder → AI engine → encoder with no serialization overhead.
+
+---
+
+## Features
+
+| Category | Details |
+|----------|---------|
+| **AI Upscaling** | RealESRGAN, RCAN, EDSR, SwinIR, HAT, Swin2SR, diffusion, and lightweight models |
+| **Video Pipeline** | FFmpeg decode → SHM ring buffer → PyTorch inference → FFmpeg encode (H.264/H.265 NVENC) |
+| **Editing** | Trim, crop, rotation, color grading (brightness, contrast, saturation, hue), FPS override |
+| **Research Layer** | Multi-model blending, frequency band analysis, hallucination detection, spatial routing |
+| **Auto Grading** | Histogram analysis, white balance correction, noise estimation, skin tone detection |
+| **Precision Modes** | FP32, FP16, and deterministic (forces `cudnn.deterministic`, disables TF32) |
+| **Job Queue** | Batch processing with per-job progress, ETA estimation, pause/resume controls |
+| **Professional UI** | Tiled mosaic layout (react-mosaic), video preview with crop overlay, interactive timeline |
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  React / TypeScript UI                                          │
+│  Vite · BlueprintJS · Zustand · react-mosaic                    │
+│  ├─ InputOutputPanel  ── Model selection, editing, export       │
+│  ├─ PreviewPanel      ── Video/image preview with crop overlay  │
+│  ├─ AIUpscaleNode     ── Upscale config & research controls     │
+│  ├─ JobsPanel         ── Queue with progress & ETA              │
+│  └─ Timeline          ── Trim, timeline scrubbing               │
+└────────────────────┬────────────────────────────────────────────┘
+                     │  Tauri IPC (invoke / listen)
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Rust Backend (Tauri 2.0)                                       │
+│  ├─ lib.rs             ── Commands, process mgmt, SHM orch.    │
+│  ├─ video_pipeline.rs  ── FFmpeg decode/encode, NVENC probing   │
+│  ├─ shm.rs             ── 3-slot ring buffer (memmap2)          │
+│  ├─ control.rs         ── Zenoh pub/sub parameter sync          │
+│  ├─ edit_config.rs     ── FFmpeg filter chain builder           │
+│  └─ models.rs          ── Model file discovery & metadata       │
+└───────┬─────────────────────────────┬───────────────────────────┘
+        │  stdin/stdout pipes         │  SHM (mmap) + Zenoh IPC
+        ▼                             ▼
+   FFmpeg (decode/encode)        Python AI Sidecar
+   NVDEC / NVENC                 ├─ shm_worker.py       ── Main inference loop
+                                 ├─ model_manager.py    ── Model loading & VRAM mgmt
+                                 ├─ arch_wrappers.py    ── Architecture adapters
+                                 ├─ blender_engine.py   ── GPU blending & detail ops
+                                 ├─ research_layer.py   ── Multi-model SR framework
+                                 ├─ sr_settings_node.py ── Settings & feature gating
+                                 └─ auto_grade_analysis.py ── Auto color grading
+```
+
+### Engine v2 (Next-Gen GPU-Native Pipeline)
+
+A second-generation engine is in active development at `engine-v2/`. It targets a fully GPU-resident pipeline:
+
+- **NVDEC → CUDA Preprocessing → TensorRT/ONNX Inference → NVENC** — no CPU round-trips
+- CUDA custom kernels for NV12↔RGB conversion, scaling, and format transforms
+- RAII-based VRAM management with bucketed buffer pools
+- Async multi-threaded reactor (decode / infer / encode on dedicated threads)
+
+---
+
+## Data Flow (Video Upscale)
+
+```
+1. User selects input video, model, and edit settings in the UI
+2. UI sends upscale_request via Tauri IPC to the Rust backend
+3. Rust spawns the Python AI worker and performs a Zenoh handshake
+4. Rust allocates a 3-slot SHM ring buffer (input + output regions per slot)
+5. Processing loop:
+   ┌──────────┐     ┌──────────────────┐     ┌──────────────┐
+   │  FFmpeg  │────▶│  SHM Input Slot  │────▶│  Python GPU  │
+   │  Decode  │     │  (raw RGB24)     │     │  Inference   │
+   └──────────┘     └──────────────────┘     └──────┬───────┘
+                                                    │
+   ┌──────────┐     ┌──────────────────┐            │
+   │  FFmpeg  │◀────│  SHM Output Slot │◀───────────┘
+   │  Encode  │     │  (upscaled RGB)  │
+   └──────────┘     └──────────────────┘
+6. Rust streams encoded frames to FFmpeg → final MP4 (NVENC H.264/H.265)
+7. Cleanup: SHM files removed, Python worker terminated
+```
+
+---
+
+## Supported AI Models
+
+| Architecture | Type | Deterministic | Capabilities |
+|-------------|------|:---:|--------------|
+| **RCAN** | CNN | ✅ | Temporal, edge-aware, luma blend, sharpen |
+| **EDSR** | CNN | ✅ | Temporal, edge-aware, luma blend, sharpen |
+| **RealESRGAN** | GAN | ❌ | Full pipeline + secondary model blending |
+| **SwinIR** | Transformer | ❌ | Full pipeline + secondary model blending |
+| **HAT** | Transformer | ❌ | Full pipeline + secondary model blending |
+| **Swin2SR** | Transformer | ❌ | Full pipeline + secondary model blending |
+| **Diffusion** | Diffusion | ❌ | Sharpen |
+| **Lightweight** | CNN | varies | Sharpen (fast preview) |
+
+Model weights are loaded from the `weights/` directory and scanned automatically at startup.
+
+---
+
+## Prerequisites
+
+- **OS:** Windows 10/11 (primary platform)
+- **GPU:** NVIDIA GPU with CUDA 11.7+ and NVENC support
+- **Software:**
+  - [Node.js](https://nodejs.org/) ≥ 18
+  - [Rust](https://rustup.rs/) (stable toolchain)
+  - [FFmpeg & FFprobe](https://ffmpeg.org/) in `PATH`
+  - Python 3.10+ (bundled or installed to `%APPDATA%/VideoForge/python/`)
+
+---
+
+## Getting Started
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/your-org/VideoForge.git
+cd VideoForge
+```
+
+### 2. Install dependencies
+
+```bash
+# Install root Tauri CLI
+npm install
+
+# Install UI dependencies
+npm run ui-install
+
+# Install Python dependencies (into your venv or bundled runtime)
+pip install -r requirements.txt
+```
+
+### 3. Run in development mode
+
+```bash
+npm run dev
+```
+
+This launches the Tauri app with Vite hot-reload for the UI. The Rust backend compiles and starts automatically.
+
+Alternatively, use the convenience script:
+
+```bat
+run.bat
+```
+
+### 4. Production build
+
+```bash
+npm run build
+```
+
+---
+
+## Development
+
+### Build Commands
+
+| Command | Description |
+|---------|-------------|
+| `npm run dev` | Launch Tauri + Vite dev server with hot-reload |
+| `npm run build` | Production build (compiles Rust + bundles UI) |
+| `npm run ui-install` | Install UI npm dependencies |
+| `cd src-tauri && cargo test` | Run Rust unit tests |
+| `cd ui && npx tsc --noEmit` | Type-check the TypeScript UI |
+
+### Project Structure
+
+```
+VideoForge/
+├── src-tauri/              # Rust backend (Tauri 2.0)
+│   ├── src/                #   Source files (lib.rs, video_pipeline.rs, shm.rs, ...)
+│   ├── Cargo.toml          #   Rust dependencies
+│   └── tauri.conf.json     #   Tauri window & build config
+├── ui/                     # React/TypeScript frontend
+│   ├── src/                #   Components, stores, hooks, utils
+│   ├── package.json        #   UI dependencies (React 19, BlueprintJS, Zustand, ...)
+│   └── vite.config.ts      #   Vite bundler config
+├── python/                 # Python AI worker (sidecar process)
+│   ├── shm_worker.py       #   Main inference loop & Zenoh subscriber
+│   ├── model_manager.py    #   Model registry, weight loading, VRAM eviction
+│   ├── arch_wrappers.py    #   Architecture-specific adapters
+│   ├── blender_engine.py   #   GPU blending, EMA, edge detection
+│   ├── research_layer.py   #   Multi-model SR blending framework
+│   ├── sr_settings_node.py #   Settings management & dispatch
+│   └── auto_grade_analysis.py  # Auto color grading analysis
+├── engine-v2/              # Next-gen GPU-native upscale engine (Rust/CUDA)
+│   ├── src/
+│   │   ├── core/           #     GPU context, CUDA kernels, types
+│   │   ├── codecs/         #     NVDEC, NVENC, FFI bindings
+│   │   ├── backends/       #     TensorRT inference backend
+│   │   └── engine/         #     Pipeline orchestration, inference loop
+│   └── Cargo.toml
+├── weights/                # AI model weights directory (not tracked in git)
+├── docs/                   # Architecture docs & roadmap
+├── requirements.txt        # Python dependencies
+├── package.json            # Root workspace (Tauri CLI)
+└── run.bat                 # One-click dev launcher
+```
+
+---
+
+## Tech Stack
+
+| Layer | Technology | Purpose |
+|-------|-----------|---------|
+| **Desktop Shell** | Tauri 2.0 | Window management, IPC, process lifecycle |
+| **Backend** | Rust + Tokio | Pipeline orchestration, SHM, FFmpeg control |
+| **IPC** | Zenoh + memmap2 | Low-latency signaling + zero-copy frame transfer |
+| **AI Engine** | Python + PyTorch + CUDA 11.7 | Model inference (RealESRGAN, RCAN, SwinIR, ...) |
+| **Frontend** | React 19 + TypeScript + Vite 6 | Interactive UI |
+| **UI Framework** | BlueprintJS 6 | Professional component library |
+| **State** | Zustand 5 | Lightweight state management |
+| **Layout** | react-mosaic | Tiled, rearrangeable panel layout |
+| **Video I/O** | FFmpeg (NVDEC/NVENC) | Hardware-accelerated decode/encode |
+| **Next-Gen Engine** | Rust + cudarc + ort (TensorRT) | Fully GPU-resident pipeline (engine-v2) |
+
+---
+
+## Platform Notes
+
+- **Windows-primary**: Python runtime resolves to `%APPDATA%/Local/VideoForge/python/` in distribution builds. Development uses local venvs.
+- **NVIDIA GPU required**: CUDA 11.7+ with NVENC support for hardware encoding.
+- **FFmpeg must be in PATH**: Both `ffmpeg` and `ffprobe` are invoked as subprocesses.
+- **Model weights** are scanned from `weights/` directories relative to the installation path.
+
+---
+
+## Roadmap
+
+The next-generation engine (`engine-v2`) follows a 10-phase roadmap:
+
+| Phase | Goal | Status |
+|-------|------|--------|
+| **0** | Research & NVDEC/NVENC prototyping | ✅ Complete |
+| **1** | CLI entrypoint, engine bootstrap, capability validation | 🔧 In Progress |
+| **2** | NVDEC/NVENC codec integration | 🔧 In Progress |
+| **3** | TensorRT/ONNX backend model support | 🔧 In Progress |
+| **4** | VRAM management & bucketed buffer pools | ⬜ Planned |
+| **5** | Per-stage profiling & metrics | ⬜ Planned |
+| **6** | Error handling & graceful cancellation | ⬜ Planned |
+| **7** | Testing & audit suite | ⬜ Planned |
+| **8** | Packaging & distribution | ⬜ Planned |
+| **9** | Quality-of-life (multi-GPU, auto-detect, GUI) | ⬜ Planned |
+
+See [`docs/RoadMap.md`](docs/RoadMap.md) for the full expanded roadmap.
+
+---
+
+## Contributing
+
+Contributions are welcome. When contributing models or pipeline changes, ensure that determinism and performance characteristics are preserved where applicable. Please review the [Technical Audit](TECHNICAL_AUDIT_v1.md) for known issues and architectural guidelines.
+
+---
+
+## License
+
+Proprietary — All rights reserved.
