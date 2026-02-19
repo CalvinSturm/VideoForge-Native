@@ -108,11 +108,9 @@ impl VideoDecoder {
 
         args.extend_from_slice(&[
             "-f".to_string(),
-            "image2pipe".to_string(),
+            "rawvideo".to_string(), // FFmpeg 7+/8+ broke image2pipe+rawvideo; use -f rawvideo directly
             "-pix_fmt".to_string(),
             "rgb24".to_string(), // Output raw RGB24 to Rust (no alpha)
-            "-vcodec".to_string(),
-            "rawvideo".to_string(),
             "-".to_string(),
         ]);
 

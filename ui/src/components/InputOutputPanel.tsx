@@ -898,6 +898,7 @@ interface InputOutputPanelProps {
   startUpscale: () => void; isValidPaths: boolean;
   videoState: VideoState; editState: EditState; setEditState: (state: EditState) => void;
   onExportEdited: () => void; showTech: boolean;
+  showResearchParams?: boolean;
   viewMode: 'edit' | 'preview'; setViewMode: (mode: 'edit' | 'preview') => void;
 }
 
@@ -905,6 +906,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
   mode, setMode, pickInput, inputPath, pickOutput, outputPath,
   model, setModel, loadModel, availableModels, loadingModel,
   startUpscale, isValidPaths, videoState, editState, setEditState, onExportEdited,
+  showTech, showResearchParams = true,
 }) => {
 
   const panelRef = useRef<HTMLDivElement>(null);
@@ -1309,6 +1311,8 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             onModelChange={setModel}
             loadModel={loadModel}
             isLoading={loadingModel}
+            showTech={showTech}
+            showResearchParams={showResearchParams}
             pipelineFeatures={{
               adr_enabled: researchConfig.adr_enabled,
               temporal_enabled: researchConfig.temporal_enabled,
@@ -1319,9 +1323,9 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
           />
         </PipelineNode>
 
-        {/* RESEARCH PARAMETERS NODE - only when AI Upscale is active */}
+        {/* RESEARCH PARAMETERS NODE - only when AI Upscale is active and research params are enabled */}
         {
-          isAIActive && (() => {
+          isAIActive && showResearchParams && (() => {
             // Dependency booleans
             const hasSecondary = researchConfig.secondary_model !== 'None';
             const isAdrAvailable = hasSecondary;
@@ -1364,408 +1368,408 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             );
 
             return (
-            <>
-              <PipelineConnector isActive={true} />
-              <PipelineNode
-                title="Research Parameters"
-                icon={<IconCpu />}
-                nodeNumber={3}
-                isActive={true}
-                accentColor="#f59e0b"
-                defaultOpen={false}
-                extra={
-                  <div style={{ display: 'flex', gap: '4px' }}>
-                    {(['performance', 'balanced', 'quality'] as const).map(p => (
-                      <button
-                        key={p}
-                        onClick={(e) => { e.stopPropagation(); applyResearchPreset(p); }}
-                        style={{
-                          height: '22px',
-                          fontSize: '8px',
-                          padding: '0 8px',
-                          borderRadius: '4px',
-                          border: researchConfig.preset === p
-                            ? '1px solid rgba(245,158,11,0.5)'
-                            : '1px solid rgba(255,255,255,0.1)',
-                          background: researchConfig.preset === p
-                            ? 'rgba(245,158,11,0.15)'
-                            : 'transparent',
-                          color: researchConfig.preset === p ? '#f59e0b' : 'var(--text-muted)',
-                          fontWeight: 700,
-                          cursor: 'pointer',
-                          letterSpacing: '0.05em',
-                          transition: 'all 0.15s ease',
-                          textTransform: 'uppercase',
-                        }}
-                      >
-                        {p === 'performance' ? 'PERF' : p === 'balanced' ? 'BAL' : 'QUAL'}
-                      </button>
-                    ))}
-                  </div>
-                }
-              >
-                {/* 1. Summary Bar */}
-                {(() => {
-                  const activeFeatures: string[] = [];
-                  if (hasSecondary) activeFeatures.push('2ND MODEL');
-                  if (researchConfig.adr_enabled && hasSecondary) activeFeatures.push('ADR');
-                  if (researchConfig.temporal_enabled && isVideoMode) activeFeatures.push('TEMPORAL');
-                  if (researchConfig.luma_only && hasSecondary) activeFeatures.push('LUMA');
-                  if (researchConfig.sharpen_strength > 0) activeFeatures.push('SHARP');
-
-                  const modifiedCount = (Object.keys(RESEARCH_DEFAULTS) as (keyof ResearchConfig)[]).filter(k => {
-                    const cur = researchConfig[k];
-                    const def = RESEARCH_DEFAULTS[k];
-                    if (typeof cur === 'number' && typeof def === 'number') return Math.abs(cur - def) > 0.001;
-                    return cur !== def;
-                  }).length;
-
-                  return (
-                    <div style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '6px',
-                      padding: '8px 10px',
-                      background: 'rgba(245,158,11,0.05)',
-                      borderRadius: '6px',
-                      border: '1px solid rgba(245,158,11,0.15)',
-                      marginBottom: '8px',
-                      flexWrap: 'wrap',
-                    }}>
-                      {activeFeatures.length > 0 ? activeFeatures.map(f => (
-                        <span key={f} style={{
-                          fontSize: '7px', fontWeight: 700, padding: '2px 5px', borderRadius: '3px',
-                          background: 'rgba(245,158,11,0.15)', border: '1px solid rgba(245,158,11,0.3)',
-                          color: '#f59e0b', letterSpacing: '0.04em',
-                        }}>{f}</span>
-                      )) : (
-                        <span style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 600 }}>
-                          DEFAULT CONFIG
-                        </span>
-                      )}
-                      {modifiedCount > 0 && (
-                        <span style={{
-                          fontSize: '8px', color: 'var(--text-muted)', marginLeft: 'auto',
-                          fontFamily: 'var(--font-mono)',
-                        }}>
-                          {modifiedCount} modified
-                        </span>
-                      )}
-                    </div>
-                  );
-                })()}
-
-                {/* 2. SECONDARY MODEL — gates downstream features */}
-                <div style={{ marginBottom: '4px' }}>
-                  <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
-                    SECONDARY MODEL
-                  </div>
-                  <Tooltip text="Select a secondary (GAN/texture) model for dual-model blending. 'None' uses only the primary model. Enables ADR detail injection and luma blending." position="bottom">
-                    <div style={{
-                      padding: '8px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
-                      border: '1px solid rgba(255,255,255,0.04)',
-                    }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-                        <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
-                          MODEL
-                        </label>
-                        <span style={{ fontSize: '11px', fontFamily: 'var(--font-mono)', color: '#f59e0b', fontWeight: 600 }}>
-                          {researchConfig.secondary_model}
-                        </span>
-                      </div>
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '4px', maxHeight: '120px', overflowY: 'auto' }}>
-                        {["None", ...availableModels].map(m => (
-                          <button
-                            key={m}
-                            onClick={() => updateResearchParam('secondary_model', m)}
-                            title={m}
-                            style={{
-                              fontSize: '8px', height: '28px', borderRadius: '5px',
-                              background: researchConfig.secondary_model === m
-                                ? 'rgba(245,158,11,0.15)' : 'rgba(255,255,255,0.03)',
-                              border: researchConfig.secondary_model === m
-                                ? '1px solid rgba(245,158,11,0.4)' : '1px solid rgba(255,255,255,0.08)',
-                              color: researchConfig.secondary_model === m ? '#f59e0b' : 'var(--text-muted)',
-                              fontWeight: researchConfig.secondary_model === m ? 700 : 500,
-                              cursor: 'pointer', transition: 'all 0.15s ease',
-                              letterSpacing: '0.03em',
-                              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                            }}
-                          >
-                            {m === 'None' ? 'NONE' : truncateModelName(m)}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  </Tooltip>
-                </div>
-
-                {/* 3. DETAIL ENHANCEMENT — gated by secondary model */}
-                <div style={{ marginBottom: '4px' }}>
-                  <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
-                    DETAIL ENHANCEMENT
-                  </div>
-                  <div style={disabledWrap(!isAdrAvailable)}>
-                    <Tooltip text="Enable Adaptive Detail Residual. Extracts high-frequency texture from the secondary (GAN) model and injects it into the primary (structure) output for richer surface detail." position="bottom">
-                      <div style={{
-                        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                        padding: '8px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
-                        border: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px',
-                      }}>
-                        <div>
-                          <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
-                            ADR ENABLED
-                          </label>
-                          {!isAdrAvailable && (
-                            <div style={{ fontSize: '8px', color: 'rgba(245,158,11,0.6)', marginTop: '2px' }}>
-                              Requires secondary model
-                            </div>
-                          )}
-                        </div>
-                        <ResearchSwitch
-                          checked={researchConfig.adr_enabled}
-                          onChange={() => updateResearchParam('adr_enabled', !researchConfig.adr_enabled)}
-                          disabled={!isAdrAvailable}
-                        />
-                      </div>
-                    </Tooltip>
-                  </div>
-                  <div style={disabledWrap(!isAdrActive)}>
-                    <Tooltip text="How much GAN high-frequency texture to inject into the structure output. 0 = no detail injection, 1 = full GAN residual. Requires ADR enabled with a secondary model. Default 0.50." position="bottom">
-                      <ColorSlider label="DETAIL STRENGTH" value={researchConfig.detail_strength} onChange={(v) => updateResearchParam('detail_strength', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                    </Tooltip>
-                    <Tooltip text="Blend only the luminance (Y) channel in YCbCr space. Preserves the structure model's colour accuracy while injecting GAN brightness detail. Prevents colour shifts." position="bottom">
-                      <div style={{
-                        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                        padding: '8px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
-                        border: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px',
-                      }}>
-                        <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
-                          LUMA ONLY
-                        </label>
-                        <ResearchSwitch
-                          checked={researchConfig.luma_only}
-                          onChange={() => updateResearchParam('luma_only', !researchConfig.luma_only)}
-                          disabled={!isAdrActive}
-                        />
-                      </div>
-                    </Tooltip>
-                  </div>
-                </div>
-
-                {/* 4. POST-PROCESSING — always available */}
-                <div style={{ marginBottom: '4px' }}>
-                  <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
-                    POST-PROCESSING
-                  </div>
-                  <Tooltip text="Sobel edge mask strength for spatially-varying blend. Higher values apply stronger blending on edges, weaker on flat regions. 0 = uniform blend. Default 0.30." position="bottom">
-                    <ColorSlider label="EDGE STRENGTH" value={researchConfig.edge_strength} onChange={(v) => updateResearchParam('edge_strength', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                  <Tooltip text="GPU unsharp mask intensity applied after blending. Adds crispness to the final output. 0 = disabled, higher = sharper. Can amplify noise at high values. Default 0.00." position="bottom">
-                    <ColorSlider label="SHARPEN" value={researchConfig.sharpen_strength} onChange={(v) => updateResearchParam('sharpen_strength', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                </div>
-
-                {/* 5. TEMPORAL — video-mode aware */}
-                <div style={{ marginBottom: '4px' }}>
-                  <div style={{
-                    fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em',
-                    padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px',
-                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                  }}>
-                    <span>TEMPORAL</span>
-                    {!isVideoMode && (
-                      <span style={{ fontSize: '7px', color: 'rgba(245,158,11,0.5)', fontWeight: 600, letterSpacing: '0.03em' }}>
-                        VIDEO MODE ONLY
-                      </span>
-                    )}
-                  </div>
-                  <div style={disabledWrap(!isVideoMode)}>
-                    <Tooltip text="Enable exponential moving average (EMA) temporal stabilization across frames. Reduces inter-frame flicker in video upscaling." position="bottom">
-                      <div style={{
-                        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                        padding: '8px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
-                        border: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px',
-                      }}>
-                        <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
-                          TEMPORAL EMA
-                        </label>
-                        <ResearchSwitch
-                          checked={researchConfig.temporal_enabled}
-                          onChange={() => updateResearchParam('temporal_enabled', !researchConfig.temporal_enabled)}
-                          disabled={!isVideoMode}
-                        />
-                      </div>
-                    </Tooltip>
-                    <div style={disabledWrap(!isTemporalActive)}>
-                      <Tooltip text="EMA smoothing factor. Lower = more smoothing (more temporal averaging). Higher = faster response to new frames. Default 0.90." position="bottom">
-                        <ColorSlider label="TEMPORAL ALPHA" value={researchConfig.temporal_alpha} onChange={(v) => updateResearchParam('temporal_alpha', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                      </Tooltip>
-                      <Tooltip text="Flush all temporal EMA buffers. Use after seeking, changing clips, or when ghosting artifacts appear." position="bottom">
+              <>
+                <PipelineConnector isActive={true} />
+                <PipelineNode
+                  title="Research Parameters"
+                  icon={<IconCpu />}
+                  nodeNumber={3}
+                  isActive={true}
+                  accentColor="#f59e0b"
+                  defaultOpen={false}
+                  extra={
+                    <div style={{ display: 'flex', gap: '4px' }}>
+                      {(['performance', 'balanced', 'quality'] as const).map(p => (
                         <button
-                          onClick={() => { invoke("reset_temporal_buffer").catch(() => { }); }}
-                          disabled={!isTemporalActive}
+                          key={p}
+                          onClick={(e) => { e.stopPropagation(); applyResearchPreset(p); }}
                           style={{
-                            width: '100%', height: '30px', fontSize: '9px', fontWeight: 700,
-                            borderRadius: '6px', border: '1px solid rgba(245,158,11,0.3)',
-                            background: 'rgba(245,158,11,0.08)', color: '#f59e0b',
-                            cursor: isTemporalActive ? 'pointer' : 'not-allowed',
+                            height: '22px',
+                            fontSize: '8px',
+                            padding: '0 8px',
+                            borderRadius: '4px',
+                            border: researchConfig.preset === p
+                              ? '1px solid rgba(245,158,11,0.5)'
+                              : '1px solid rgba(255,255,255,0.1)',
+                            background: researchConfig.preset === p
+                              ? 'rgba(245,158,11,0.15)'
+                              : 'transparent',
+                            color: researchConfig.preset === p ? '#f59e0b' : 'var(--text-muted)',
+                            fontWeight: 700,
+                            cursor: 'pointer',
                             letterSpacing: '0.05em',
-                            transition: 'all 0.15s ease', marginTop: '4px',
+                            transition: 'all 0.15s ease',
+                            textTransform: 'uppercase',
                           }}
                         >
-                          RESET TEMPORAL BUFFER
+                          {p === 'performance' ? 'PERF' : p === 'balanced' ? 'BAL' : 'QUAL'}
                         </button>
-                      </Tooltip>
+                      ))}
                     </div>
+                  }
+                >
+                  {/* 1. Summary Bar */}
+                  {(() => {
+                    const activeFeatures: string[] = [];
+                    if (hasSecondary) activeFeatures.push('2ND MODEL');
+                    if (researchConfig.adr_enabled && hasSecondary) activeFeatures.push('ADR');
+                    if (researchConfig.temporal_enabled && isVideoMode) activeFeatures.push('TEMPORAL');
+                    if (researchConfig.luma_only && hasSecondary) activeFeatures.push('LUMA');
+                    if (researchConfig.sharpen_strength > 0) activeFeatures.push('SHARP');
+
+                    const modifiedCount = (Object.keys(RESEARCH_DEFAULTS) as (keyof ResearchConfig)[]).filter(k => {
+                      const cur = researchConfig[k];
+                      const def = RESEARCH_DEFAULTS[k];
+                      if (typeof cur === 'number' && typeof def === 'number') return Math.abs(cur - def) > 0.001;
+                      return cur !== def;
+                    }).length;
+
+                    return (
+                      <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        padding: '8px 10px',
+                        background: 'rgba(245,158,11,0.05)',
+                        borderRadius: '6px',
+                        border: '1px solid rgba(245,158,11,0.15)',
+                        marginBottom: '8px',
+                        flexWrap: 'wrap',
+                      }}>
+                        {activeFeatures.length > 0 ? activeFeatures.map(f => (
+                          <span key={f} style={{
+                            fontSize: '7px', fontWeight: 700, padding: '2px 5px', borderRadius: '3px',
+                            background: 'rgba(245,158,11,0.15)', border: '1px solid rgba(245,158,11,0.3)',
+                            color: '#f59e0b', letterSpacing: '0.04em',
+                          }}>{f}</span>
+                        )) : (
+                          <span style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 600 }}>
+                            DEFAULT CONFIG
+                          </span>
+                        )}
+                        {modifiedCount > 0 && (
+                          <span style={{
+                            fontSize: '8px', color: 'var(--text-muted)', marginLeft: 'auto',
+                            fontFamily: 'var(--font-mono)',
+                          }}>
+                            {modifiedCount} modified
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {/* 2. SECONDARY MODEL — gates downstream features */}
+                  <div style={{ marginBottom: '4px' }}>
+                    <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                      SECONDARY MODEL
+                    </div>
+                    <Tooltip text="Select a secondary (GAN/texture) model for dual-model blending. 'None' uses only the primary model. Enables ADR detail injection and luma blending." position="bottom">
+                      <div style={{
+                        padding: '8px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
+                        border: '1px solid rgba(255,255,255,0.04)',
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                          <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
+                            MODEL
+                          </label>
+                          <span style={{ fontSize: '11px', fontFamily: 'var(--font-mono)', color: '#f59e0b', fontWeight: 600 }}>
+                            {researchConfig.secondary_model}
+                          </span>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '4px', maxHeight: '120px', overflowY: 'auto' }}>
+                          {["None", ...availableModels].map(m => (
+                            <button
+                              key={m}
+                              onClick={() => updateResearchParam('secondary_model', m)}
+                              title={m}
+                              style={{
+                                fontSize: '8px', height: '28px', borderRadius: '5px',
+                                background: researchConfig.secondary_model === m
+                                  ? 'rgba(245,158,11,0.15)' : 'rgba(255,255,255,0.03)',
+                                border: researchConfig.secondary_model === m
+                                  ? '1px solid rgba(245,158,11,0.4)' : '1px solid rgba(255,255,255,0.08)',
+                                color: researchConfig.secondary_model === m ? '#f59e0b' : 'var(--text-muted)',
+                                fontWeight: researchConfig.secondary_model === m ? 700 : 500,
+                                cursor: 'pointer', transition: 'all 0.15s ease',
+                                letterSpacing: '0.03em',
+                                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                              }}
+                            >
+                              {m === 'None' ? 'NONE' : truncateModelName(m)}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </Tooltip>
                   </div>
-                </div>
 
-                {/* 6. MODEL WEIGHTS — always active */}
-                <div style={{ marginBottom: '4px' }}>
-                  <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
-                    MODEL WEIGHTS
-                  </div>
-                  <Tooltip text="Weight for structural fidelity (edges, geometry). Higher values preserve hard lines and shapes at the cost of softer textures. Default 0.50." position="bottom">
-                    <ColorSlider label="STRUCTURE" value={researchConfig.alpha_structure} onChange={(v) => updateResearchParam('alpha_structure', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                  <Tooltip text="Weight for texture detail recovery. Controls how aggressively fine surface detail (fabric, skin pores, grain) is reconstructed. Default 0.30." position="bottom">
-                    <ColorSlider label="TEXTURE" value={researchConfig.alpha_texture} onChange={(v) => updateResearchParam('alpha_texture', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                  <Tooltip text="Weight for perceptual similarity. Optimizes output to look natural to the human eye rather than pixel-exact. Higher values may smooth fine detail. Default 0.15." position="bottom">
-                    <ColorSlider label="PERCEPTUAL" value={researchConfig.alpha_perceptual} onChange={(v) => updateResearchParam('alpha_perceptual', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                  <Tooltip text="Weight for diffusion-based refinement pass. Adds subtle generative detail but can introduce hallucinated content at high values. Keep low for archival work. Default 0.05." position="bottom">
-                    <ColorSlider label="DIFFUSION" value={researchConfig.alpha_diffusion} onChange={(v) => updateResearchParam('alpha_diffusion', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                </div>
-
-                {/* 7. FREQUENCY BAND — always active */}
-                <div style={{ marginBottom: '4px' }}>
-                  <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
-                    FREQUENCY BAND
-                  </div>
-                  <Tooltip text="Amplification of low-frequency content (smooth gradients, large shapes). Values above 1.0 boost, below 1.0 attenuate. Increase to strengthen broad tonal structure. Default 1.00." position="bottom">
-                    <ColorSlider label="LOW FREQ" value={researchConfig.low_freq_strength} onChange={(v) => updateResearchParam('low_freq_strength', v)} min={0} max={2} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                  <Tooltip text="Amplification of mid-frequency content (medium detail, object contours). Controls the body of visible sharpness. Boost for crisper mid-detail, reduce to soften. Default 1.00." position="bottom">
-                    <ColorSlider label="MID FREQ" value={researchConfig.mid_freq_strength} onChange={(v) => updateResearchParam('mid_freq_strength', v)} min={0} max={2} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                  <Tooltip text="Amplification of high-frequency content (fine edges, noise, micro-texture). Higher values sharpen fine detail but may amplify noise or ringing artifacts. Default 1.00." position="bottom">
-                    <ColorSlider label="HIGH FREQ" value={researchConfig.high_freq_strength} onChange={(v) => updateResearchParam('high_freq_strength', v)} min={0} max={2} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                </div>
-
-                {/* 8. HALLUCINATION — always active */}
-                <div style={{ marginBottom: '4px' }}>
-                  <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
-                    HALLUCINATION
-                  </div>
-                  <Tooltip text="How aggressively the detector flags AI-generated detail as hallucinated. Higher values catch more false detail but may suppress legitimate reconstruction. Default 1.00." position="bottom">
-                    <ColorSlider label="SENSITIVITY" value={researchConfig.h_sensitivity} onChange={(v) => updateResearchParam('h_sensitivity', v)} min={0} max={3} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                  <Tooltip text="Strength of blending applied to regions flagged as hallucinated. At 1.0, flagged regions are fully replaced with the source. Lower values allow partial AI detail to remain. Default 0.50." position="bottom">
-                    <ColorSlider label="BLEND REDUCTION" value={researchConfig.h_blend_reduction} onChange={(v) => updateResearchParam('h_blend_reduction', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                </div>
-
-                {/* 9. SPATIAL ROUTING — always active */}
-                <div style={{ marginBottom: '4px' }}>
-                  <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
-                    SPATIAL ROUTING
-                  </div>
-                  <Tooltip text="How strongly edge-detected regions prefer the structure-preserving model branch. Higher values keep hard edges sharper but may introduce stairstepping on diagonal lines. Default 0.70." position="bottom">
-                    <ColorSlider label="EDGE BIAS" value={researchConfig.edge_model_bias} onChange={(v) => updateResearchParam('edge_model_bias', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                  <Tooltip text="How strongly textured regions prefer the texture-recovery model branch. Increase for richer surface detail in complex areas (foliage, fabric). Default 0.70." position="bottom">
-                    <ColorSlider label="TEXTURE BIAS" value={researchConfig.texture_model_bias} onChange={(v) => updateResearchParam('texture_model_bias', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                  <Tooltip text="Suppresses AI enhancement in flat, low-detail regions (sky, walls) to prevent noise amplification and false texture. Higher values apply more suppression. Default 0.30." position="bottom">
-                    <ColorSlider label="FLAT SUPPRESSION" value={researchConfig.flat_region_suppression} onChange={(v) => updateResearchParam('flat_region_suppression', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                  </Tooltip>
-                </div>
-
-                {/* 10. ADVANCED — collapsed by default */}
-                <div>
-                  <button
-                    onClick={() => setAdvancedOpen(!advancedOpen)}
-                    style={{
-                      width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                      padding: '6px 0', border: 'none', background: 'none', cursor: 'pointer',
-                      borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: advancedOpen ? '4px' : '0',
-                    }}
-                  >
-                    <span style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em' }}>
-                      ADVANCED
-                    </span>
-                    <span style={{
-                      color: 'var(--text-muted)', transform: advancedOpen ? 'rotate(180deg)' : 'rotate(0deg)',
-                      transition: 'transform 0.15s ease',
-                    }}>
-                      <IconChevronDown />
-                    </span>
-                  </button>
-                  {advancedOpen && (
-                    <div>
-                      <Tooltip text="Gaussian blur sigma for the low-frequency band separation. Larger values capture broader structures in the low band. Increase for smoother tonal rolloff. Default 4.0." position="bottom">
-                        <ColorSlider label="LOW SIGMA" value={researchConfig.freq_low_sigma} onChange={(v) => updateResearchParam('freq_low_sigma', v)} min={0.5} max={10} step={0.1} accentColor="#f59e0b" formatValue={(v) => v.toFixed(1)} />
-                      </Tooltip>
-                      <Tooltip text="Gaussian blur sigma for the mid-frequency band separation. Controls the cutoff between mid and high detail. Lower values shift more content into the high band. Default 1.5." position="bottom">
-                        <ColorSlider label="MID SIGMA" value={researchConfig.freq_mid_sigma} onChange={(v) => updateResearchParam('freq_mid_sigma', v)} min={0.5} max={5} step={0.1} accentColor="#f59e0b" formatValue={(v) => v.toFixed(1)} />
-                      </Tooltip>
-                      <Tooltip text="Gradient magnitude threshold for classifying a pixel as an edge. Pixels above this threshold are routed to the edge model branch. Lower values detect more edges. Default 0.50." position="bottom">
-                        <ColorSlider label="EDGE THRESHOLD" value={researchConfig.edge_threshold} onChange={(v) => updateResearchParam('edge_threshold', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                      </Tooltip>
-                      <Tooltip text="Local variance threshold for classifying a region as textured. Pixels above this threshold are routed to the texture model branch. Lower values classify more area as textured. Default 0.20." position="bottom">
-                        <ColorSlider label="TEXTURE THRESHOLD" value={researchConfig.texture_threshold} onChange={(v) => updateResearchParam('texture_threshold', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                      </Tooltip>
-                      <Tooltip text="Blend ratio between spatial routing and frequency-band routing. At 0.0 only spatial routing is used; at 1.0 only frequency bands drive the blend. Default 0.50." position="bottom">
-                        <ColorSlider label="SPATIAL-FREQ MIX" value={researchConfig.spatial_freq_mix} onChange={(v) => updateResearchParam('spatial_freq_mix', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
-                      </Tooltip>
-
-                      {/* HF Method dropdown */}
-                      <Tooltip text="Algorithm used to extract high-frequency detail. Laplacian: second-order edges, general purpose. Sobel: first-order gradient, sharper edges. Highpass: simple subtraction, fast. FFT: spectral domain, most precise but slowest." position="bottom">
+                  {/* 3. DETAIL ENHANCEMENT — gated by secondary model */}
+                  <div style={{ marginBottom: '4px' }}>
+                    <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                      DETAIL ENHANCEMENT
+                    </div>
+                    <div style={disabledWrap(!isAdrAvailable)}>
+                      <Tooltip text="Enable Adaptive Detail Residual. Extracts high-frequency texture from the secondary (GAN) model and injects it into the primary (structure) output for richer surface detail." position="bottom">
                         <div style={{
-                          display: 'flex', flexDirection: 'column', gap: '6px',
-                          padding: '10px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
-                          border: '1px solid rgba(255,255,255,0.04)',
+                          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                          padding: '8px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
+                          border: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px',
                         }}>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <div>
                             <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
-                              HF METHOD
+                              ADR ENABLED
                             </label>
-                            <span style={{ fontSize: '11px', fontFamily: 'var(--font-mono)', color: '#f59e0b', fontWeight: 600 }}>
-                              {researchConfig.hf_method.toUpperCase()}
-                            </span>
+                            {!isAdrAvailable && (
+                              <div style={{ fontSize: '8px', color: 'rgba(245,158,11,0.6)', marginTop: '2px' }}>
+                                Requires secondary model
+                              </div>
+                            )}
                           </div>
-                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '4px' }}>
-                            {HF_METHODS.map(method => (
-                              <button
-                                key={method}
-                                onClick={() => updateResearchParam('hf_method', method)}
-                                style={{
-                                  fontSize: '9px', height: '28px', borderRadius: '5px',
-                                  background: researchConfig.hf_method === method
-                                    ? 'rgba(245,158,11,0.15)' : 'rgba(255,255,255,0.03)',
-                                  border: researchConfig.hf_method === method
-                                    ? '1px solid rgba(245,158,11,0.4)' : '1px solid rgba(255,255,255,0.08)',
-                                  color: researchConfig.hf_method === method ? '#f59e0b' : 'var(--text-muted)',
-                                  fontWeight: researchConfig.hf_method === method ? 700 : 500,
-                                  cursor: 'pointer', transition: 'all 0.15s ease',
-                                  textTransform: 'uppercase', letterSpacing: '0.03em',
-                                }}
-                              >
-                                {method === 'highpass' ? 'HP' : method === 'laplacian' ? 'LAP' : method.toUpperCase()}
-                              </button>
-                            ))}
-                          </div>
+                          <ResearchSwitch
+                            checked={researchConfig.adr_enabled}
+                            onChange={() => updateResearchParam('adr_enabled', !researchConfig.adr_enabled)}
+                            disabled={!isAdrAvailable}
+                          />
                         </div>
                       </Tooltip>
                     </div>
-                  )}
-                </div>
-              </PipelineNode>
-            </>
+                    <div style={disabledWrap(!isAdrActive)}>
+                      <Tooltip text="How much GAN high-frequency texture to inject into the structure output. 0 = no detail injection, 1 = full GAN residual. Requires ADR enabled with a secondary model. Default 0.50." position="bottom">
+                        <ColorSlider label="DETAIL STRENGTH" value={researchConfig.detail_strength} onChange={(v) => updateResearchParam('detail_strength', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                      </Tooltip>
+                      <Tooltip text="Blend only the luminance (Y) channel in YCbCr space. Preserves the structure model's colour accuracy while injecting GAN brightness detail. Prevents colour shifts." position="bottom">
+                        <div style={{
+                          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                          padding: '8px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
+                          border: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px',
+                        }}>
+                          <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
+                            LUMA ONLY
+                          </label>
+                          <ResearchSwitch
+                            checked={researchConfig.luma_only}
+                            onChange={() => updateResearchParam('luma_only', !researchConfig.luma_only)}
+                            disabled={!isAdrActive}
+                          />
+                        </div>
+                      </Tooltip>
+                    </div>
+                  </div>
+
+                  {/* 4. POST-PROCESSING — always available */}
+                  <div style={{ marginBottom: '4px' }}>
+                    <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                      POST-PROCESSING
+                    </div>
+                    <Tooltip text="Sobel edge mask strength for spatially-varying blend. Higher values apply stronger blending on edges, weaker on flat regions. 0 = uniform blend. Default 0.30." position="bottom">
+                      <ColorSlider label="EDGE STRENGTH" value={researchConfig.edge_strength} onChange={(v) => updateResearchParam('edge_strength', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                    <Tooltip text="GPU unsharp mask intensity applied after blending. Adds crispness to the final output. 0 = disabled, higher = sharper. Can amplify noise at high values. Default 0.00." position="bottom">
+                      <ColorSlider label="SHARPEN" value={researchConfig.sharpen_strength} onChange={(v) => updateResearchParam('sharpen_strength', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                  </div>
+
+                  {/* 5. TEMPORAL — video-mode aware */}
+                  <div style={{ marginBottom: '4px' }}>
+                    <div style={{
+                      fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em',
+                      padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px',
+                      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    }}>
+                      <span>TEMPORAL</span>
+                      {!isVideoMode && (
+                        <span style={{ fontSize: '7px', color: 'rgba(245,158,11,0.5)', fontWeight: 600, letterSpacing: '0.03em' }}>
+                          VIDEO MODE ONLY
+                        </span>
+                      )}
+                    </div>
+                    <div style={disabledWrap(!isVideoMode)}>
+                      <Tooltip text="Enable exponential moving average (EMA) temporal stabilization across frames. Reduces inter-frame flicker in video upscaling." position="bottom">
+                        <div style={{
+                          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                          padding: '8px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
+                          border: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px',
+                        }}>
+                          <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
+                            TEMPORAL EMA
+                          </label>
+                          <ResearchSwitch
+                            checked={researchConfig.temporal_enabled}
+                            onChange={() => updateResearchParam('temporal_enabled', !researchConfig.temporal_enabled)}
+                            disabled={!isVideoMode}
+                          />
+                        </div>
+                      </Tooltip>
+                      <div style={disabledWrap(!isTemporalActive)}>
+                        <Tooltip text="EMA smoothing factor. Lower = more smoothing (more temporal averaging). Higher = faster response to new frames. Default 0.90." position="bottom">
+                          <ColorSlider label="TEMPORAL ALPHA" value={researchConfig.temporal_alpha} onChange={(v) => updateResearchParam('temporal_alpha', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                        </Tooltip>
+                        <Tooltip text="Flush all temporal EMA buffers. Use after seeking, changing clips, or when ghosting artifacts appear." position="bottom">
+                          <button
+                            onClick={() => { invoke("reset_temporal_buffer").catch(() => { }); }}
+                            disabled={!isTemporalActive}
+                            style={{
+                              width: '100%', height: '30px', fontSize: '9px', fontWeight: 700,
+                              borderRadius: '6px', border: '1px solid rgba(245,158,11,0.3)',
+                              background: 'rgba(245,158,11,0.08)', color: '#f59e0b',
+                              cursor: isTemporalActive ? 'pointer' : 'not-allowed',
+                              letterSpacing: '0.05em',
+                              transition: 'all 0.15s ease', marginTop: '4px',
+                            }}
+                          >
+                            RESET TEMPORAL BUFFER
+                          </button>
+                        </Tooltip>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 6. MODEL WEIGHTS — always active */}
+                  <div style={{ marginBottom: '4px' }}>
+                    <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                      MODEL WEIGHTS
+                    </div>
+                    <Tooltip text="Weight for structural fidelity (edges, geometry). Higher values preserve hard lines and shapes at the cost of softer textures. Default 0.50." position="bottom">
+                      <ColorSlider label="STRUCTURE" value={researchConfig.alpha_structure} onChange={(v) => updateResearchParam('alpha_structure', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                    <Tooltip text="Weight for texture detail recovery. Controls how aggressively fine surface detail (fabric, skin pores, grain) is reconstructed. Default 0.30." position="bottom">
+                      <ColorSlider label="TEXTURE" value={researchConfig.alpha_texture} onChange={(v) => updateResearchParam('alpha_texture', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                    <Tooltip text="Weight for perceptual similarity. Optimizes output to look natural to the human eye rather than pixel-exact. Higher values may smooth fine detail. Default 0.15." position="bottom">
+                      <ColorSlider label="PERCEPTUAL" value={researchConfig.alpha_perceptual} onChange={(v) => updateResearchParam('alpha_perceptual', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                    <Tooltip text="Weight for diffusion-based refinement pass. Adds subtle generative detail but can introduce hallucinated content at high values. Keep low for archival work. Default 0.05." position="bottom">
+                      <ColorSlider label="DIFFUSION" value={researchConfig.alpha_diffusion} onChange={(v) => updateResearchParam('alpha_diffusion', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                  </div>
+
+                  {/* 7. FREQUENCY BAND — always active */}
+                  <div style={{ marginBottom: '4px' }}>
+                    <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                      FREQUENCY BAND
+                    </div>
+                    <Tooltip text="Amplification of low-frequency content (smooth gradients, large shapes). Values above 1.0 boost, below 1.0 attenuate. Increase to strengthen broad tonal structure. Default 1.00." position="bottom">
+                      <ColorSlider label="LOW FREQ" value={researchConfig.low_freq_strength} onChange={(v) => updateResearchParam('low_freq_strength', v)} min={0} max={2} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                    <Tooltip text="Amplification of mid-frequency content (medium detail, object contours). Controls the body of visible sharpness. Boost for crisper mid-detail, reduce to soften. Default 1.00." position="bottom">
+                      <ColorSlider label="MID FREQ" value={researchConfig.mid_freq_strength} onChange={(v) => updateResearchParam('mid_freq_strength', v)} min={0} max={2} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                    <Tooltip text="Amplification of high-frequency content (fine edges, noise, micro-texture). Higher values sharpen fine detail but may amplify noise or ringing artifacts. Default 1.00." position="bottom">
+                      <ColorSlider label="HIGH FREQ" value={researchConfig.high_freq_strength} onChange={(v) => updateResearchParam('high_freq_strength', v)} min={0} max={2} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                  </div>
+
+                  {/* 8. HALLUCINATION — always active */}
+                  <div style={{ marginBottom: '4px' }}>
+                    <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                      HALLUCINATION
+                    </div>
+                    <Tooltip text="How aggressively the detector flags AI-generated detail as hallucinated. Higher values catch more false detail but may suppress legitimate reconstruction. Default 1.00." position="bottom">
+                      <ColorSlider label="SENSITIVITY" value={researchConfig.h_sensitivity} onChange={(v) => updateResearchParam('h_sensitivity', v)} min={0} max={3} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                    <Tooltip text="Strength of blending applied to regions flagged as hallucinated. At 1.0, flagged regions are fully replaced with the source. Lower values allow partial AI detail to remain. Default 0.50." position="bottom">
+                      <ColorSlider label="BLEND REDUCTION" value={researchConfig.h_blend_reduction} onChange={(v) => updateResearchParam('h_blend_reduction', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                  </div>
+
+                  {/* 9. SPATIAL ROUTING — always active */}
+                  <div style={{ marginBottom: '4px' }}>
+                    <div style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em', padding: '4px 0 6px', borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: '4px' }}>
+                      SPATIAL ROUTING
+                    </div>
+                    <Tooltip text="How strongly edge-detected regions prefer the structure-preserving model branch. Higher values keep hard edges sharper but may introduce stairstepping on diagonal lines. Default 0.70." position="bottom">
+                      <ColorSlider label="EDGE BIAS" value={researchConfig.edge_model_bias} onChange={(v) => updateResearchParam('edge_model_bias', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                    <Tooltip text="How strongly textured regions prefer the texture-recovery model branch. Increase for richer surface detail in complex areas (foliage, fabric). Default 0.70." position="bottom">
+                      <ColorSlider label="TEXTURE BIAS" value={researchConfig.texture_model_bias} onChange={(v) => updateResearchParam('texture_model_bias', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                    <Tooltip text="Suppresses AI enhancement in flat, low-detail regions (sky, walls) to prevent noise amplification and false texture. Higher values apply more suppression. Default 0.30." position="bottom">
+                      <ColorSlider label="FLAT SUPPRESSION" value={researchConfig.flat_region_suppression} onChange={(v) => updateResearchParam('flat_region_suppression', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                    </Tooltip>
+                  </div>
+
+                  {/* 10. ADVANCED — collapsed by default */}
+                  <div>
+                    <button
+                      onClick={() => setAdvancedOpen(!advancedOpen)}
+                      style={{
+                        width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                        padding: '6px 0', border: 'none', background: 'none', cursor: 'pointer',
+                        borderBottom: '1px solid rgba(255,255,255,0.04)', marginBottom: advancedOpen ? '4px' : '0',
+                      }}
+                    >
+                      <span style={{ fontSize: '8px', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.08em' }}>
+                        ADVANCED
+                      </span>
+                      <span style={{
+                        color: 'var(--text-muted)', transform: advancedOpen ? 'rotate(180deg)' : 'rotate(0deg)',
+                        transition: 'transform 0.15s ease',
+                      }}>
+                        <IconChevronDown />
+                      </span>
+                    </button>
+                    {advancedOpen && (
+                      <div>
+                        <Tooltip text="Gaussian blur sigma for the low-frequency band separation. Larger values capture broader structures in the low band. Increase for smoother tonal rolloff. Default 4.0." position="bottom">
+                          <ColorSlider label="LOW SIGMA" value={researchConfig.freq_low_sigma} onChange={(v) => updateResearchParam('freq_low_sigma', v)} min={0.5} max={10} step={0.1} accentColor="#f59e0b" formatValue={(v) => v.toFixed(1)} />
+                        </Tooltip>
+                        <Tooltip text="Gaussian blur sigma for the mid-frequency band separation. Controls the cutoff between mid and high detail. Lower values shift more content into the high band. Default 1.5." position="bottom">
+                          <ColorSlider label="MID SIGMA" value={researchConfig.freq_mid_sigma} onChange={(v) => updateResearchParam('freq_mid_sigma', v)} min={0.5} max={5} step={0.1} accentColor="#f59e0b" formatValue={(v) => v.toFixed(1)} />
+                        </Tooltip>
+                        <Tooltip text="Gradient magnitude threshold for classifying a pixel as an edge. Pixels above this threshold are routed to the edge model branch. Lower values detect more edges. Default 0.50." position="bottom">
+                          <ColorSlider label="EDGE THRESHOLD" value={researchConfig.edge_threshold} onChange={(v) => updateResearchParam('edge_threshold', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                        </Tooltip>
+                        <Tooltip text="Local variance threshold for classifying a region as textured. Pixels above this threshold are routed to the texture model branch. Lower values classify more area as textured. Default 0.20." position="bottom">
+                          <ColorSlider label="TEXTURE THRESHOLD" value={researchConfig.texture_threshold} onChange={(v) => updateResearchParam('texture_threshold', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                        </Tooltip>
+                        <Tooltip text="Blend ratio between spatial routing and frequency-band routing. At 0.0 only spatial routing is used; at 1.0 only frequency bands drive the blend. Default 0.50." position="bottom">
+                          <ColorSlider label="SPATIAL-FREQ MIX" value={researchConfig.spatial_freq_mix} onChange={(v) => updateResearchParam('spatial_freq_mix', v)} min={0} max={1} step={0.01} accentColor="#f59e0b" formatValue={(v) => v.toFixed(2)} />
+                        </Tooltip>
+
+                        {/* HF Method dropdown */}
+                        <Tooltip text="Algorithm used to extract high-frequency detail. Laplacian: second-order edges, general purpose. Sobel: first-order gradient, sharper edges. Highpass: simple subtraction, fast. FFT: spectral domain, most precise but slowest." position="bottom">
+                          <div style={{
+                            display: 'flex', flexDirection: 'column', gap: '6px',
+                            padding: '10px 12px', background: 'rgba(0,0,0,0.2)', borderRadius: '8px',
+                            border: '1px solid rgba(255,255,255,0.04)',
+                          }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <label style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 600, letterSpacing: '0.03em' }}>
+                                HF METHOD
+                              </label>
+                              <span style={{ fontSize: '11px', fontFamily: 'var(--font-mono)', color: '#f59e0b', fontWeight: 600 }}>
+                                {researchConfig.hf_method.toUpperCase()}
+                              </span>
+                            </div>
+                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '4px' }}>
+                              {HF_METHODS.map(method => (
+                                <button
+                                  key={method}
+                                  onClick={() => updateResearchParam('hf_method', method)}
+                                  style={{
+                                    fontSize: '9px', height: '28px', borderRadius: '5px',
+                                    background: researchConfig.hf_method === method
+                                      ? 'rgba(245,158,11,0.15)' : 'rgba(255,255,255,0.03)',
+                                    border: researchConfig.hf_method === method
+                                      ? '1px solid rgba(245,158,11,0.4)' : '1px solid rgba(255,255,255,0.08)',
+                                    color: researchConfig.hf_method === method ? '#f59e0b' : 'var(--text-muted)',
+                                    fontWeight: researchConfig.hf_method === method ? 700 : 500,
+                                    cursor: 'pointer', transition: 'all 0.15s ease',
+                                    textTransform: 'uppercase', letterSpacing: '0.03em',
+                                  }}
+                                >
+                                  {method === 'highpass' ? 'HP' : method === 'laplacian' ? 'LAP' : method.toUpperCase()}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </Tooltip>
+                      </div>
+                    )}
+                  </div>
+                </PipelineNode>
+              </>
             );
           })()
         }

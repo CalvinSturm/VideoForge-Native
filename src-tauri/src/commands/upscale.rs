@@ -1,0 +1,631 @@
+//! AI upscaling command — orchestrates Python sidecar, SHM ring buffer,
+//! FFmpeg decode/encode, and Zenoh IPC.
+
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::Arc;
+
+use serde_json::json;
+use tauri::{AppHandle, Emitter};
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::{timeout, Duration, Instant};
+use zenoh::Config;
+
+use crate::control::ResearchConfig;
+use crate::edit_config::{build_ffmpeg_filters, calculate_output_dimensions, EditConfig};
+use crate::ipc::{self, protocol::RequestEnvelope};
+use crate::python_env::{
+    get_free_port, resolve_python_environment, ProcessGuard, PYTHON_PIDS,
+};
+use crate::video_pipeline;
+use crate::{shm, commands::export::{get_smart_output_path, is_image_file}};
+
+// ─── upscale_request ─────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn upscale_request(
+    app: AppHandle,
+    research_state: tauri::State<'_, Arc<Mutex<ResearchConfig>>>,
+    input_path: String,
+    mut output_path: String,
+    model: String,
+    edit_config: EditConfig,
+    scale: u32,
+    #[allow(unused_variables)] precision: Option<String>,
+) -> Result<String, String> {
+    let precision = precision.unwrap_or_else(|| "fp32".to_string());
+    let precision = match precision.as_str() {
+        "fp32" | "fp16" | "deterministic" => precision,
+        _ => {
+            return Err(format!(
+                "Invalid precision mode '{}'. Use fp32, fp16, or deterministic.",
+                precision
+            ))
+        }
+    };
+
+    if !Path::new(&input_path).exists() {
+        return Err(format!("Input file not found: {}", input_path));
+    }
+
+    let is_img = is_image_file(&input_path);
+    if output_path.trim().is_empty() {
+        output_path = get_smart_output_path(&input_path, !is_img);
+    }
+
+    // Generate a session-scoped job ID for IPC correlation.
+    let job_id = ipc::protocol::next_request_id();
+
+    tracing::info!(
+        job_id = %job_id,
+        input = %input_path,
+        output = %output_path,
+        model = %model,
+        precision = %precision,
+        is_image = is_img,
+        "Upscale request started"
+    );
+
+    // ── Zenoh setup ──────────────────────────────────────────────────────────
+    let port = get_free_port();
+    let ipc_endpoint = format!("tcp/127.0.0.1:{}", port);
+    let zenoh_prefix = format!("videoforge/ipc/{}", port);
+
+    let mut config = Config::default();
+    config
+        .insert_json5("listen/endpoints", &format!("[\"{}\"]", ipc_endpoint))
+        .map_err(|e| e.to_string())?;
+    let session = zenoh::open(config)
+        .await
+        .map_err(|e: zenoh::Error| e.to_string())?;
+
+    let publisher = session
+        .declare_publisher(format!("{}/req", zenoh_prefix))
+        .await
+        .map_err(|e: zenoh::Error| e.to_string())?;
+    let subscriber = session
+        .declare_subscriber(format!("{}/res", zenoh_prefix))
+        .await
+        .map_err(|e: zenoh::Error| e.to_string())?;
+
+    // ── Spawn Python sidecar ─────────────────────────────────────────────────
+    let (python_bin, script_path) = resolve_python_environment().map_err(|e| e.to_string())?;
+
+    tracing::info!(
+        job_id = %job_id,
+        python = %python_bin,
+        script = %script_path,
+        "Spawning Python worker"
+    );
+
+    let mut cmd = tokio::process::Command::new(&python_bin);
+    cmd.arg(&script_path);
+    cmd.arg("--port").arg(port.to_string());
+    cmd.arg("--parent-pid").arg(std::process::id().to_string());
+    cmd.arg("--precision").arg(&precision);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+
+    let python_child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn Python worker: {}", e))?;
+
+    if let Some(pid) = python_child.id() {
+        PYTHON_PIDS.lock().unwrap().insert(pid);
+        tracing::info!(job_id = %job_id, pid, "Python worker spawned");
+    }
+
+    let mut python_guard = ProcessGuard::new(python_child);
+
+    // Wait for Python startup handshake (first message = ready signal).
+    if timeout(Duration::from_secs(60), subscriber.recv_async())
+        .await
+        .is_err()
+    {
+        return Err("Python worker handshake timeout (60s)".to_string());
+    }
+    tracing::info!(job_id = %job_id, "Python worker handshake received");
+
+    // ── Load model ───────────────────────────────────────────────────────────
+    ipc::put_request(
+        &publisher,
+        RequestEnvelope::new("load_model", &job_id, json!({"model_name": model})),
+    )
+    .await
+    .map_err(|e: zenoh::Error| e.to_string())?;
+
+    let load_msg = timeout(Duration::from_secs(30), subscriber.recv_async())
+        .await
+        .map_err(|_| "Model load timeout (30s)")?
+        .map_err(|e: zenoh::Error| e.to_string())?;
+    let load_data =
+        String::from_utf8(load_msg.payload().to_bytes().to_vec()).map_err(|e| e.to_string())?;
+
+    if !load_data.contains("MODEL_LOADED") {
+        tracing::error!(job_id = %job_id, response = %load_data, "Model load failed");
+        return Err(format!("Failed to load model: {}", load_data));
+    }
+    tracing::info!(job_id = %job_id, model = %model, "Model loaded");
+
+    // ── Push initial research config ─────────────────────────────────────────
+    {
+        let config = research_state.lock().await;
+        let params_req = RequestEnvelope::new(
+            "update_research_params",
+            &job_id,
+            json!({"params": serde_json::to_value(&*config).unwrap_or_default()}),
+        );
+        let _ = ipc::put_request(&publisher, params_req).await;
+        let _ = timeout(Duration::from_secs(2), subscriber.recv_async()).await;
+    }
+
+    // ── Image pipeline ───────────────────────────────────────────────────────
+    if is_img {
+        let research_params = {
+            let guard = research_state.lock().await;
+            serde_json::to_value(&*guard).unwrap_or_default()
+        };
+
+        ipc::put_request(
+            &publisher,
+            RequestEnvelope::new(
+                "upscale_image_file",
+                &job_id,
+                json!({
+                    "id": "single_shot",
+                    "params": {
+                        "input_path": input_path,
+                        "output_path": output_path,
+                        "config": edit_config
+                    },
+                    "research_params": research_params
+                }),
+            ),
+        )
+        .await
+        .map_err(|e: zenoh::Error| e.to_string())?;
+
+        loop {
+            let msg = timeout(Duration::from_secs(300), subscriber.recv_async())
+                .await
+                .map_err(|_| "Image upscale timeout (5 min)")?
+                .map_err(|e: zenoh::Error| e.to_string())?;
+
+            let payload_str = String::from_utf8(msg.payload().to_bytes().to_vec())
+                .map_err(|e| e.to_string())?;
+            let resp: serde_json::Value =
+                serde_json::from_str(&payload_str).map_err(|e| e.to_string())?;
+
+            if resp["status"] == "progress" {
+                let current = resp["current"].as_u64().unwrap_or(0);
+                let total = resp["total"].as_u64().unwrap_or(1);
+                let pct = (current as f64 / total as f64) * 100.0;
+
+                tracing::debug!(
+                    job_id = %job_id,
+                    tile = current,
+                    total_tiles = total,
+                    "Image upscale progress"
+                );
+
+                let _ = app.emit(
+                    "upscale-progress",
+                    json!({
+                        "jobId": "active",
+                        "progress": pct as u32,
+                        "message": format!("Processing Tile {}/{}", current, total)
+                    }),
+                );
+            } else if resp["status"] == "ok" {
+                tracing::info!(job_id = %job_id, output = %output_path, "Image upscale complete");
+                break;
+            } else if resp["status"] == "error" {
+                tracing::error!(job_id = %job_id, error = %resp["message"], "Python error during image upscale");
+                return Err(format!("Python error: {}", resp["message"]));
+            }
+        }
+
+        let _ = ipc::put_request(
+            &publisher,
+            RequestEnvelope::new("shutdown", &job_id, json!({})),
+        )
+        .await;
+
+        if let Some(mut child) = python_guard.disarm() {
+            if let Some(pid) = child.id() {
+                PYTHON_PIDS.lock().unwrap().remove(&pid);
+            }
+            if timeout(Duration::from_secs(10), child.wait())
+                .await
+                .is_err()
+            {
+                tracing::warn!(job_id = %job_id, "Image worker did not exit in time, killing");
+                let _ = child.start_kill();
+            }
+        }
+
+        return Ok(output_path);
+    }
+
+    // ── Video pipeline ───────────────────────────────────────────────────────
+    let probe_res = video_pipeline::probe_video(&input_path).map_err(|e| e.to_string())?;
+    let (input_w, input_h, duration, fps, _total_frames) = probe_res;
+
+    let (process_w, process_h) = calculate_output_dimensions(&edit_config, input_w, input_h);
+    let start_time = edit_config.trim_start;
+    let end_time = if edit_config.trim_end > 0.0 {
+        edit_config.trim_end
+    } else {
+        duration
+    };
+    let process_duration = (end_time - start_time).max(0.1);
+    let process_frames = (process_duration * fps).round() as u64;
+    let scale_factor = scale as usize;
+
+    tracing::info!(
+        job_id = %job_id,
+        width = process_w,
+        height = process_h,
+        fps,
+        frames = process_frames,
+        scale = scale_factor,
+        "Video pipeline starting"
+    );
+
+    // Request Python to create the SHM ring buffer.
+    ipc::put_request(
+        &publisher,
+        RequestEnvelope::new(
+            "create_shm",
+            &job_id,
+            json!({
+                "width": process_w,
+                "height": process_h,
+                "scale": scale_factor,
+                "ring_size": shm::RING_SIZE
+            }),
+        ),
+    )
+    .await
+    .map_err(|e: zenoh::Error| e.to_string())?;
+
+    let shm_msg = timeout(Duration::from_secs(10), subscriber.recv_async())
+        .await
+        .map_err(|_| "SHM creation timeout (10s)")?
+        .map_err(|e: zenoh::Error| e.to_string())?;
+    let shm_data =
+        String::from_utf8(shm_msg.payload().to_bytes().to_vec()).map_err(|e| e.to_string())?;
+    let shm_resp: serde_json::Value =
+        serde_json::from_str(&shm_data).map_err(|e| e.to_string())?;
+
+    if shm_resp["status"] != "SHM_CREATED" {
+        return Err(format!("SHM init failed: {}", shm_resp["message"]));
+    }
+    let shm_path = shm_resp
+        .get("shm_path")
+        .and_then(|s| s.as_str())
+        .unwrap()
+        .to_string();
+
+    let shm = shm::VideoShm::open(&shm_path, process_w, process_h, scale_factor)
+        .map_err(|e| e.to_string())?;
+    shm.reset_all_slots();
+
+    tracing::info!(
+        job_id = %job_id,
+        shm_path = %shm_path,
+        "SHM ring buffer opened and reset"
+    );
+
+    let shared_shm = Mutex::new(shm);
+
+    // Flow-control channels (Rust-only, not cross-process).
+    let (free_tx, mut free_rx) = mpsc::channel::<usize>(shm::RING_SIZE);
+    let (pending_tx, mut pending_rx) = mpsc::channel::<usize>(shm::RING_SIZE);
+    let (enc_tx, mut enc_rx) = mpsc::channel::<usize>(shm::RING_SIZE);
+
+    for i in 0..shm::RING_SIZE {
+        free_tx.send(i).await.map_err(|e| e.to_string())?;
+    }
+
+    // Start Python frame polling loop.
+    let research_config_ref = research_state.inner().clone();
+    {
+        let guard = research_config_ref.lock().await;
+        ipc::put_request(
+            &publisher,
+            RequestEnvelope::new(
+                "start_frame_loop",
+                &job_id,
+                json!({"research_params": serde_json::to_value(&*guard).unwrap_or_default()}),
+            ),
+        )
+        .await
+        .map_err(|e: zenoh::Error| e.to_string())?;
+    }
+
+    let loop_msg = timeout(Duration::from_secs(10), subscriber.recv_async())
+        .await
+        .map_err(|_| "Frame loop start timeout (10s)")?
+        .map_err(|e: zenoh::Error| e.to_string())?;
+    let loop_data =
+        String::from_utf8(loop_msg.payload().to_bytes().to_vec()).map_err(|e| e.to_string())?;
+    if !loop_data.contains("FRAME_LOOP_STARTED") {
+        return Err(format!("Frame loop start failed: {}", loop_data));
+    }
+    tracing::info!(job_id = %job_id, "Python frame loop started (SHM atomic polling)");
+
+    let filters = build_ffmpeg_filters(&edit_config, input_w, input_h);
+
+    // ── Decoder task ─────────────────────────────────────────────────────────
+    let decoder_task = async {
+        let use_nvdec = video_pipeline::probe_nvdec();
+        let mut decoder = video_pipeline::VideoDecoder::new(
+            &input_path,
+            start_time,
+            process_duration,
+            &filters,
+            use_nvdec,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if decoder.using_hwaccel {
+            tracing::info!(job_id = %job_id, "Decoder using NVDEC hardware acceleration");
+        }
+
+        let mut frame_id: u32 = 0;
+        while let Some(slot_idx) = free_rx.recv().await {
+            let mut shm_guard = shared_shm.lock().await;
+            shm_guard.set_slot_state(slot_idx, shm::SLOT_RUST_WRITING);
+
+            let frame_size = {
+                let input_slot = match shm_guard.input_slot_mut(slot_idx) {
+                    Ok(slot) => slot,
+                    Err(e) => {
+                        tracing::error!(job_id = %job_id, slot = slot_idx, error = %e, "SHM input slot error");
+                        break;
+                    }
+                };
+                let size = input_slot.len() as u32;
+                let got_frame = decoder
+                    .read_raw_frame_into(input_slot)
+                    .await
+                    .unwrap_or(false);
+                if got_frame { Some(size) } else { None }
+            };
+
+            if let Some(size) = frame_size {
+                frame_id += 1;
+                shm_guard.set_slot_write_index(slot_idx, frame_id);
+                shm_guard.set_slot_frame_bytes(slot_idx, size);
+                shm_guard.set_slot_state(slot_idx, shm::SLOT_READY_FOR_AI);
+                drop(shm_guard);
+
+                tracing::debug!(
+                    job_id = %job_id,
+                    frame_id,
+                    slot_index = slot_idx,
+                    bytes = size,
+                    "Frame written to SHM → READY_FOR_AI"
+                );
+
+                if pending_tx.send(slot_idx).await.is_err() {
+                    break;
+                }
+            } else {
+                shm_guard.set_slot_state(slot_idx, shm::SLOT_EMPTY);
+                tracing::info!(job_id = %job_id, total_frames = frame_id, "Decoder EOS");
+                break;
+            }
+        }
+        Ok::<(), String>(())
+    };
+
+    // ── Poll task ────────────────────────────────────────────────────────────
+    let poll_task = async {
+        let mut last_params_push = Instant::now();
+
+        while let Some(slot_idx) = pending_rx.recv().await {
+            // Periodically push research params via Zenoh control plane.
+            if last_params_push.elapsed() > Duration::from_millis(500) {
+                let mut guard = research_config_ref.lock().await;
+                let has_reset = guard.reset_temporal;
+                let val = serde_json::to_value(&*guard).unwrap_or_default();
+                if has_reset {
+                    guard.reset_temporal = false;
+                }
+                drop(guard);
+
+                let _ = ipc::put_request(
+                    &publisher,
+                    RequestEnvelope::new(
+                        "update_research_params",
+                        &job_id,
+                        json!({"params": val}),
+                    ),
+                )
+                .await;
+                last_params_push = Instant::now();
+            }
+
+            // Poll SHM slot state until Python signals READY_FOR_ENCODE.
+            let poll_start = Instant::now();
+            loop {
+                {
+                    let shm_guard = shared_shm.lock().await;
+                    if shm_guard.slot_state(slot_idx) == shm::SLOT_READY_FOR_ENCODE {
+                        break;
+                    }
+                }
+                if poll_start.elapsed() > Duration::from_secs(30) {
+                    let shm_guard = shared_shm.lock().await;
+                    shm_guard.set_slot_state(slot_idx, shm::SLOT_EMPTY);
+                    tracing::error!(
+                        job_id = %job_id,
+                        slot_index = slot_idx,
+                        "AI inference timeout (30s) — aborting"
+                    );
+                    return Err("AI processing timeout (30s)".to_string());
+                }
+                tokio::time::sleep(Duration::from_micros(200)).await;
+            }
+
+            tracing::debug!(
+                job_id = %job_id,
+                slot_index = slot_idx,
+                "Slot READY_FOR_ENCODE — forwarding to encoder"
+            );
+
+            if enc_tx.send(slot_idx).await.is_err() {
+                break;
+            }
+        }
+        Ok(())
+    };
+
+    // ── Encoder task ─────────────────────────────────────────────────────────
+    let target_fps = edit_config.fps;
+    let encoder_task = async {
+        let mut encoder = video_pipeline::VideoEncoder::new_with_audio(
+            &output_path,
+            fps as u32,
+            target_fps,
+            process_w * scale_factor,
+            process_h * scale_factor,
+            Some(&input_path),
+            start_time,
+            process_duration,
+            precision == "deterministic",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let mut processed_count = 0u64;
+        let eta_start = Instant::now();
+        let mut last_emit = Instant::now();
+
+        while let Some(slot_idx) = enc_rx.recv().await {
+            let shm_guard = shared_shm.lock().await;
+            shm_guard.set_slot_state(slot_idx, shm::SLOT_ENCODING);
+
+            let output_slot = match shm_guard.output_slot(slot_idx) {
+                Ok(slot) => slot,
+                Err(e) => {
+                    tracing::error!(job_id = %job_id, slot = slot_idx, error = %e, "SHM output slot error");
+                    break;
+                }
+            };
+
+            if let Err(e) = encoder.write_raw_frame(output_slot).await {
+                tracing::error!(job_id = %job_id, slot = slot_idx, error = %e, "Encoder write error");
+                break;
+            }
+
+            shm_guard.set_slot_state(slot_idx, shm::SLOT_EMPTY);
+            drop(shm_guard);
+            let _ = free_tx.send(slot_idx).await;
+
+            processed_count += 1;
+            let is_last_frame = processed_count >= process_frames;
+
+            if last_emit.elapsed() > Duration::from_millis(100) || is_last_frame {
+                let pct =
+                    ((processed_count as f64 / process_frames as f64) * 100.0).min(100.0) as u32;
+                let elapsed = eta_start.elapsed().as_secs_f64();
+                let fps_proc = processed_count as f64 / elapsed;
+                let eta = if fps_proc > 0.0 {
+                    (process_frames.saturating_sub(processed_count) as f64 / fps_proc) as u64
+                } else {
+                    0
+                };
+
+                tracing::debug!(
+                    job_id = %job_id,
+                    frame = processed_count,
+                    total = process_frames,
+                    pct,
+                    "Encode progress"
+                );
+
+                let _ = app.emit(
+                    "upscale-progress",
+                    json!({
+                        "jobId": "active",
+                        "progress": pct,
+                        "message": format!("Processing Frame {}/{}", processed_count, process_frames),
+                        "eta": eta
+                    }),
+                );
+                last_emit = Instant::now();
+            }
+
+            if is_last_frame {
+                break;
+            }
+        }
+
+        encoder.finish().await.map_err(|e| e.to_string())?;
+        tracing::info!(
+            job_id = %job_id,
+            frames_encoded = processed_count,
+            output = %output_path,
+            "Encode complete"
+        );
+        let _ = app.emit(
+            "upscale-progress",
+            json!({
+                "jobId": "active",
+                "progress": 100,
+                "message": "Finalizing...",
+                "outputPath": output_path,
+                "eta": 0
+            }),
+        );
+        Ok(())
+    };
+
+    if let Err(e) = tokio::try_join!(decoder_task, poll_task, encoder_task) {
+        tracing::error!(job_id = %job_id, error = %e, "Pipeline task failed");
+        return Err(e);
+    }
+
+    // ── Graceful shutdown ────────────────────────────────────────────────────
+    let _ = ipc::put_request(
+        &publisher,
+        RequestEnvelope::new("stop_frame_loop", &job_id, json!({})),
+    )
+    .await;
+    let _ = ipc::put_request(
+        &publisher,
+        RequestEnvelope::new("shutdown", &job_id, json!({})),
+    )
+    .await;
+
+    if let Some(mut child) = python_guard.disarm() {
+        if let Some(pid) = child.id() {
+            PYTHON_PIDS.lock().unwrap().remove(&pid);
+        }
+        if timeout(Duration::from_secs(3), child.wait()).await.is_err() {
+            tracing::warn!(job_id = %job_id, "Worker did not exit gracefully, killing");
+            let _ = child.start_kill();
+
+            #[cfg(target_os = "windows")]
+            if let Some(pid) = child.id() {
+                use std::os::windows::process::CommandExt;
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .creation_flags(0x08000000)
+                    .output();
+            }
+        }
+    }
+
+    tracing::info!(job_id = %job_id, output = %output_path, "Upscale request complete");
+    Ok(output_path)
+}

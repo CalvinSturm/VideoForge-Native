@@ -106,6 +106,10 @@ interface AIUpscaleNodeProps {
     pipelineFeatures?: PipelineFeatures;
     /** Callback to toggle a research param */
     onPipelineToggle?: (key: string, value: boolean | number) => void;
+    /** Whether tech specs (including VRAM estimates) should be visible */
+    showTech?: boolean;
+    /** Whether research/pipeline parameters should be visible */
+    showResearchParams?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -360,6 +364,8 @@ export const AIUpscaleNode: React.FC<AIUpscaleNodeProps> = ({
     isLoading,
     pipelineFeatures,
     onPipelineToggle,
+    showTech = false,
+    showResearchParams = true,
 }) => {
     // ─── Store Access ──────────────────────────────────────────────────────────
     const { upscaleConfig, setUpscaleConfig } = useJobStore();
@@ -563,7 +569,7 @@ export const AIUpscaleNode: React.FC<AIUpscaleNodeProps> = ({
                         {sourceWidth > 0 && (
                             <>
                                 {sourceWidth}×{sourceHeight} → {outputDimensions.width}×{outputDimensions.height}
-                                {isHighVRAM && (
+                                {showTech && isHighVRAM && (
                                     <div style={{ color: '#fbbf24', display: 'flex', alignItems: 'center', gap: '4px', justifyContent: 'flex-end', marginTop: '2px' }}>
                                         <IconWarning /> ~{estimatedVRAM.toFixed(1)}GB VRAM
                                     </div>
@@ -636,7 +642,7 @@ export const AIUpscaleNode: React.FC<AIUpscaleNodeProps> = ({
 
                 {/* ─── PRIMARY MODEL ──────────────────────────────────────────────── */}
                 {/* ─── PIPELINE FEATURES ─────────────────────────────────────── */}
-                {pipelineFeatures && onPipelineToggle && (
+                {pipelineFeatures && onPipelineToggle && showResearchParams && (
                     <div style={{
                         display: 'flex',
                         gap: '6px',
@@ -940,8 +946,8 @@ export const AIUpscaleNode: React.FC<AIUpscaleNodeProps> = ({
                         </>
                     )}
 
-                    {/* VRAM warning */}
-                    {isHighVRAM && (
+                    {/* VRAM warning — only visible when tech specs are enabled */}
+                    {showTech && isHighVRAM && (
                         <div style={{
                             display: 'flex',
                             alignItems: 'center',

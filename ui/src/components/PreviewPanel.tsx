@@ -116,7 +116,7 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
                effectiveEnd = start + result.duration - 0.05;
             } else if (videoState.samplePreview) {
                effectiveEnd = start + 2.0;
-            } else if (end > 0 && end < videoState.duration) {
+            } else if (end > 0) {
                effectiveEnd = end;
             } else {
                effectiveEnd = videoState.duration;
@@ -165,6 +165,23 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
                }
             }
          }
+
+          // --- SINGLE-SOURCE TRIM ENFORCEMENT ---
+          // When no result video exists, the dual-source block above is skipped.
+          // We must still enforce trim bounds for single-source playback.
+          if (isPlaying && videoRef.current && (!resultVideoRef.current || !resultVideoRef.current.src)) {
+             const source = videoRef.current;
+             const t = source.currentTime;
+             const singleStart = editState.trimStart;
+             const singleEnd = editState.trimEnd;
+             if (singleEnd > 0 && t >= singleEnd) {
+                source.pause();
+                source.currentTime = singleStart;
+                setIsPlaying(false);
+                videoState.setCurrentTime(singleStart);
+                return;
+             }
+          }
          animationFrameId = requestAnimationFrame(syncLoop);
       };
 
@@ -284,7 +301,16 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
 
    const onTimeUpdate = (e: React.SyntheticEvent<HTMLVideoElement>) => {
       // NOTE: Loop logic moved to syncLoop for precision
-      const t = e.currentTarget.currentTime;
+      let t = e.currentTarget.currentTime;
+      const end = editState.trimEnd;
+      // Clamp playhead to trimEnd — prevents visual overshoot
+      if (end > 0 && t > end) {
+         t = end;
+         // Pause playback since we've reached the trim boundary
+         e.currentTarget.pause();
+         resultVideoRef.current?.pause();
+         setIsPlaying(false);
+      }
       videoState.setCurrentTime(t);
    };
 
@@ -491,7 +517,7 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
                            )}
                         </div>
                         {showTech && inputPreview && <SpatialMapOverlay visible={showTech} imageSrc={convertFileSrc(inputPreview)} />}
-                     {hasResult && (
+                        {hasResult && (
                            <div style={{
                               position: 'absolute', inset: 0, overflow: 'hidden',
                               opacity: (compareMode === 'toggle' && isHoldingCompare) ? 0 : 1

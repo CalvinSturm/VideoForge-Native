@@ -132,6 +132,15 @@ class Config:
     SLOT_READY_FOR_ENCODE = 4
     SLOT_ENCODING = 5
 
+    # --- SHM Global Header (36 bytes at file offset 0) ---
+    # Must match Rust src-tauri/src/shm.rs constants exactly.
+    # Layout: magic[8] | version[4] | header_size[4] | slot_count[4] |
+    #         width[4] | height[4] | scale[4] | pixel_format[4]
+    SHM_MAGIC = b"VFSHM001"
+    SHM_VERSION = 1
+    PIXEL_FORMAT_RGB24 = 1
+    GLOBAL_HEADER_SIZE = 36  # 8 + 7 × 4
+
     # Per-slot header: 4 × u32 = 16 bytes
     SLOT_HEADER_SIZE = 16
     # State field is at byte offset 8 within each slot header
@@ -1298,6 +1307,9 @@ class AIWorker:
         self.header_region_size = 0
         self.output_size = 0
 
+        # IPC correlation — set for the duration of each on_request call.
+        self._current_request = None
+
         # Model state
         self.precision = precision
         self.model_loader = ModelLoader(precision=precision)
@@ -1394,8 +1406,28 @@ class AIWorker:
             self.send_status("error", {"message": f"Load Failed: {str(e)}"})
 
     def send_status(self, status: str, extra: Optional[Dict] = None) -> None:
-        payload = {"status": status}
+        """Publish a response envelope conforming to the IPC protocol.
+
+        Includes protocol fields (version, request_id, job_id, kind) for
+        correlation while preserving top-level backward-compat extra fields.
+        """
+        req = getattr(self, "_current_request", None)
+        payload: Dict[str, Any] = {
+            "version": ZENOH_PREFIX and 1 or 1,  # PROTOCOL_VERSION = 1
+            "request_id": req.request_id if req else "",
+            "job_id": req.job_id if req else "",
+            "kind": "error" if status == "error" else "status",
+            "status": status,
+            "error": None,
+        }
         if extra:
+            # Merge extra at top level for backward compat.
+            # If extra contains an "error" dict, promote it to the error field.
+            if "message" in extra and status == "error":
+                payload["error"] = {
+                    "code": extra.pop("code", "INTERNAL"),
+                    "message": extra.pop("message", ""),
+                }
             payload.update(extra)
         try:
             self.pub.put(json.dumps(payload).encode("utf-8"))
@@ -1404,10 +1436,18 @@ class AIWorker:
 
     def on_request(self, sample) -> None:
         try:
-            payload = json.loads(sample.payload.to_bytes().decode("utf-8"))
-            cmd = payload.get("command")
+            from ipc_protocol import RequestEnvelope as _Envelope
+            raw = json.loads(sample.payload.to_bytes().decode("utf-8"))
+            # Parse into typed envelope — unknown fields silently ignored.
+            env = _Envelope.from_dict(raw)
+            self._current_request = env  # stash for send_status correlation
+            cmd = env.kind
+            payload = raw  # legacy handlers still read from raw dict
+
             if cmd == "create_shm":
-                self.create_shm(payload)
+                # create_shm reads from the raw payload for backward compat
+                p = env.payload if isinstance(env.payload, dict) and env.payload else raw
+                self.create_shm(p)
             elif cmd == "process_frame":
                 self.process_frame(payload)
             elif cmd == "start_frame_loop":
@@ -1415,24 +1455,32 @@ class AIWorker:
             elif cmd == "stop_frame_loop":
                 self.stop_frame_loop(payload)
             elif cmd == "load_model":
-                new_model = payload.get("params", {}).get("model_name")
-                if new_model:
-                    self.load_model(new_model)
+                p = env.payload if isinstance(env.payload, dict) else {}
+                model_name = p.get("model_name") or raw.get("params", {}).get("model_name")
+                if model_name:
+                    self.load_model(model_name)
             elif cmd == "upscale_image_file":
                 self.handle_image_file(payload)
             elif cmd == "analyze_for_auto_grade":
                 self.handle_auto_grade_analysis(payload)
             elif cmd == "update_research_params":
                 self.handle_update_research_params(payload)
-                # Also update cached params for the frame loop
-                self._cached_research_params = payload.get("params")
+                self._cached_research_params = (
+                    env.payload.get("params") if isinstance(env.payload, dict)
+                    else raw.get("params")
+                )
             elif cmd == "shutdown":
                 self.stop_frame_loop()
                 self.running = False
+            else:
+                print(f"[Python Warning] Unknown command kind: {cmd!r}", flush=True)
+                self.send_status("error", {"message": f"Unknown command: {cmd}"})
         except Exception as e:
             print(f"[Python Error] Request failed: {e}", flush=True)
             traceback.print_exc()
             self.send_status("error", {"message": str(e)})
+        finally:
+            self._current_request = None
 
     def handle_auto_grade_analysis(self, payload: Dict[str, Any]) -> None:
         """
@@ -1776,7 +1824,8 @@ class AIWorker:
     def create_shm(self, payload: Dict) -> None:
         """Create shared memory ring buffer for video frame processing.
 
-        Layout:
+        Layout (SHM_VERSION = 1):
+            [ Global Header 36 bytes: magic|version|header_size|slot_count|W|H|S|fmt ]
             [ SlotHeader × ring_size (ring_size × 16 bytes) ]
             [ Slot 0: input (W×H×3) | output (sW×sH×3) ]
             [ Slot 1: input | output ]
@@ -1790,7 +1839,10 @@ class AIWorker:
         self.input_size = width * height * 3
         self.output_size = (width * self.active_scale) * (height * self.active_scale) * 3
         self.slot_byte_size = self.input_size + self.output_size
-        self.header_region_size = Config.SLOT_HEADER_SIZE * self.ring_size
+        # header_region_size = global header + per-slot headers
+        self.header_region_size = (
+            Config.GLOBAL_HEADER_SIZE + Config.SLOT_HEADER_SIZE * self.ring_size
+        )
         total_size = self.header_region_size + self.slot_byte_size * self.ring_size
 
         if self.mmap:
@@ -1804,6 +1856,21 @@ class AIWorker:
             self.shm_file.seek(0)
             self.mmap = mmap.mmap(self.shm_file.fileno(), total_size)
 
+            # Write global header (36 bytes) at offset 0.
+            # Format: <8sIIIIIII  (little-endian: 8-byte magic + 7 × u32)
+            global_header = struct.pack(
+                "<8sIIIIIII",
+                Config.SHM_MAGIC,          # magic[8]
+                Config.SHM_VERSION,        # version u32
+                self.header_region_size,   # header_size u32
+                self.ring_size,            # slot_count u32
+                width,                     # width u32
+                height,                    # height u32
+                self.active_scale,         # scale u32
+                Config.PIXEL_FORMAT_RGB24, # pixel_format u32
+            )
+            self.mmap[0 : Config.GLOBAL_HEADER_SIZE] = global_header
+
             self.input_shape = (height, width, 3)
             self.output_shape = (
                 height * self.active_scale,
@@ -1813,8 +1880,10 @@ class AIWorker:
             self.is_configured = True
             print(
                 f"[Python] SHM created: {total_size} bytes "
-                f"(header={self.header_region_size}, "
-                f"{self.ring_size} slots × {self.slot_byte_size})",
+                f"(global_header={Config.GLOBAL_HEADER_SIZE}, "
+                f"header_region={self.header_region_size}, "
+                f"{self.ring_size} slots × {self.slot_byte_size}), "
+                f"magic=VFSHM001 version={Config.SHM_VERSION}",
                 flush=True,
             )
             self.send_status("SHM_CREATED", {"shm_path": self.shm_path})
@@ -1822,13 +1891,42 @@ class AIWorker:
             traceback.print_exc()
             self.send_status("error", {"message": str(e)})
 
+    def _validate_shm_header(self) -> None:
+        """Validate the SHM global header written by this Python process.
+
+        Called after mmap creation. Raises ValueError with a descriptive
+        message if the header is malformed.
+        """
+        if not self.mmap or len(self.mmap) < Config.GLOBAL_HEADER_SIZE:
+            raise ValueError(
+                f"SHM too small for global header ({Config.GLOBAL_HEADER_SIZE} bytes)"
+            )
+        magic = bytes(self.mmap[0:8])
+        if magic != Config.SHM_MAGIC:
+            raise ValueError(
+                f"SHM magic mismatch: expected {Config.SHM_MAGIC!r}, got {magic!r}"
+            )
+        version = struct.unpack_from("<I", self.mmap, 8)[0]
+        if version != Config.SHM_VERSION:
+            raise ValueError(
+                f"SHM version mismatch: expected {Config.SHM_VERSION}, got {version}"
+            )
+
     # -------------------------------------------------------------------------
     # SHM SLOT STATE HELPERS
     # -------------------------------------------------------------------------
 
     def _slot_state_offset(self, slot_idx: int) -> int:
-        """Byte offset of the state field for a given slot header."""
-        return slot_idx * Config.SLOT_HEADER_SIZE + Config.STATE_FIELD_OFFSET
+        """Byte offset of the state field for a given slot header.
+
+        Accounts for the global header at the start of the file.
+        Matches Rust: GLOBAL_HEADER_SIZE + slot_idx * SLOT_HEADER_SIZE + STATE_OFFSET
+        """
+        return (
+            Config.GLOBAL_HEADER_SIZE
+            + slot_idx * Config.SLOT_HEADER_SIZE
+            + Config.STATE_FIELD_OFFSET
+        )
 
     def _read_slot_state(self, slot_idx: int) -> int:
         """Read the u32 state of a slot from the mmap header."""

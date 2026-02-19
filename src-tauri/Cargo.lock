@@ -5956,6 +5956,8 @@ dependencies = [
  "tauri-plugin-fs",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "zenoh",
  "zip",
 ]

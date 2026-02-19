@@ -4,6 +4,7 @@ use base64::Engine;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::ChildStdout;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 

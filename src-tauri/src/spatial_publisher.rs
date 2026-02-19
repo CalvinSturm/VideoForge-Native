@@ -20,6 +20,7 @@ const HEADER_SIZE: usize = 8; // 2 × u32
 ///
 /// # Example
 /// ```no_run
+/// # use app_lib::spatial_publisher::SpatialMapPublisher;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// let session = zenoh::open(zenoh::Config::default()).await?;
 /// let mut pub_ = SpatialMapPublisher::new(&session).await?;

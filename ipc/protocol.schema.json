@@ -1,0 +1,103 @@
+{
+  "_schema_version": "1",
+  "_description": "VideoForge IPC Protocol — canonical Zenoh pub/sub message contract between Rust orchestrator and Python AI worker.",
+  "_forward_compat": "All receivers MUST ignore unknown fields. New fields added in future versions will have defaults.",
+
+  "protocol_version": 1,
+  "transport": "Zenoh pub/sub over TCP loopback",
+  "topics": {
+    "request":  "videoforge/ipc/{port}/req",
+    "response": "videoforge/ipc/{port}/res",
+    "spatial_map": "videoforge/research/spatial_map"
+  },
+  "encoding": "UTF-8 JSON string",
+
+  "request": {
+    "_description": "Rust → Python. Every command is wrapped in this envelope.",
+    "fields": {
+      "version":    { "type": "uint32", "required": true,  "description": "Protocol version — must equal 1" },
+      "request_id": { "type": "string", "required": true,  "description": "Per-request monotonic counter string. Echoed back in the response." },
+      "job_id":     { "type": "string", "required": true,  "description": "Job identifier — correlates events to a Tauri command invocation." },
+      "kind":       { "type": "string", "required": true,  "description": "Command kind. See commands section." },
+      "payload":    { "type": "object", "required": true,  "description": "Command-specific parameters." }
+    }
+  },
+
+  "response": {
+    "_description": "Python → Rust. Every reply is wrapped in this envelope.",
+    "fields": {
+      "version":    { "type": "uint32", "required": true, "default": 0, "description": "Protocol version of the sender." },
+      "request_id": { "type": "string", "required": true, "default": "", "description": "Echo of the request_id this response is for." },
+      "job_id":     { "type": "string", "required": true, "default": "", "description": "Echo of the job_id." },
+      "kind":       { "type": "string", "required": true, "default": "status", "description": "Response type: 'status' | 'progress' | 'error'." },
+      "status":     { "type": "string", "required": false, "description": "Human-readable status or progress string." },
+      "error": {
+        "type": "object|null",
+        "required": false,
+        "description": "Present only on error responses.",
+        "fields": {
+          "code":    { "type": "string", "description": "Machine-readable error code (SCREAMING_SNAKE_CASE)." },
+          "message": { "type": "string", "description": "Human-readable error message." }
+        }
+      }
+    }
+  },
+
+  "commands": {
+    "load_model": {
+      "payload": { "model_name": { "type": "string", "example": "RCAN_x4" } },
+      "success_status": "MODEL_LOADED",
+      "success_extra":  { "model": "string", "scale": "uint32" }
+    },
+    "create_shm": {
+      "payload": {
+        "width":     { "type": "uint32" },
+        "height":    { "type": "uint32" },
+        "scale":     { "type": "uint32" },
+        "ring_size": { "type": "uint32", "default": 3 }
+      },
+      "success_status": "SHM_CREATED",
+      "success_extra":  { "shm_path": "string" }
+    },
+    "start_frame_loop": {
+      "payload": { "research_params": { "type": "object" } },
+      "success_status": "FRAME_LOOP_STARTED"
+    },
+    "stop_frame_loop": {
+      "payload": {},
+      "success_status": "FRAME_LOOP_STOPPED"
+    },
+    "update_research_params": {
+      "payload": { "params": { "type": "object" } },
+      "success_status": "RESEARCH_PARAMS_UPDATED"
+    },
+    "upscale_image_file": {
+      "payload": {
+        "id":              { "type": "string" },
+        "params": {
+          "input_path":  { "type": "string" },
+          "output_path": { "type": "string" },
+          "config":      { "type": "object" }
+        },
+        "research_params": { "type": "object" }
+      },
+      "responses": [
+        { "kind": "progress", "status": "progress", "extra": { "current": "uint64", "total": "uint64", "message": "string" } },
+        { "kind": "status",   "status": "ok" },
+        { "kind": "error",    "status": "error", "error": { "code": "string", "message": "string" } }
+      ]
+    },
+    "shutdown": {
+      "payload": {},
+      "success_status": "SHUTDOWN_OK"
+    }
+  },
+
+  "error_codes": {
+    "MODEL_NOT_FOUND":     "No weights found for the requested model identifier.",
+    "SHM_CREATE_FAILED":   "Failed to create the shared memory ring buffer.",
+    "INFERENCE_FAILED":    "GPU inference error during frame processing.",
+    "UNKNOWN_COMMAND":     "Received a 'kind' value not in the supported command set.",
+    "INTERNAL":            "Unexpected internal error (see 'message' for details)."
+  }
+}
