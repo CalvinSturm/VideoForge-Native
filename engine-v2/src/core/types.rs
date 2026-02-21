@@ -23,7 +23,7 @@
 //!    `CudaSlice` holds an `Arc<CudaDevice>`.
 
 use std::sync::Arc;
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, DevicePtr};
 
 // ─── Pixel format ────────────────────────────────────────────────────────────
 
@@ -201,15 +201,15 @@ pub struct FrameEnvelope {
     pub is_keyframe: bool,
 }
 
-/// Sentinel envelope that signals end-of-stream (EOS) through pipeline channels.
-/// When a stage receives `None` from its input channel, it must:
-/// 1. Flush any buffered state.
-/// 2. Drop its output sender to propagate EOS downstream.
-/// 3. Return cleanly.
-///
-/// This type is not used directly — we encode EOS as channel closure (sender drop).
-/// The comment exists to document the protocol.
-///
-/// ```text
-/// Decoder closes tx → Preprocess sees None → closes its tx → … → Encoder returns
-/// ```
+// Sentinel envelope that signals end-of-stream (EOS) through pipeline channels.
+// When a stage receives `None` from its input channel, it must:
+// 1. Flush any buffered state.
+// 2. Drop its output sender to propagate EOS downstream.
+// 3. Return cleanly.
+//
+// This type is not used directly — we encode EOS as channel closure (sender drop).
+// The comment exists to document the protocol.
+//
+// ```text
+// Decoder closes tx → Preprocess sees None → closes its tx → … → Encoder returns
+// ```

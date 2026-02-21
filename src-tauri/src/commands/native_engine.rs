@@ -144,14 +144,14 @@ async fn run_native_pipeline(
     use tokio::process::Command;
     use std::process::Stdio;
 
-    use videoforge_engine::backends::tensorrt::{TensorRtBackend, PrecisionPolicy};
-    use videoforge_engine::codecs::nvdec::{BitstreamPacket, BitstreamSource, NvDecDecoder};
+    use videoforge_engine::backends::tensorrt::{BatchConfig, TensorRtBackend, PrecisionPolicy};
+    use videoforge_engine::codecs::nvdec::{BitstreamPacket, BitstreamSource, NvDecoder};
     use videoforge_engine::codecs::nvenc::{BitstreamSink, NvEncConfig};
     use videoforge_engine::core::context::GpuContext;
     use videoforge_engine::core::kernels::{ModelPrecision, PreprocessKernels};
     use videoforge_engine::engine::pipeline::{PipelineConfig, UpscalePipeline};
     use videoforge_engine::error::EngineError;
-    use videoforge_engine::codecs::sys::cudaVideoCodec_enum as CudaCodec;
+    use videoforge_engine::codecs::sys::cudaVideoCodec as CudaCodec;
 
     let make_err = |code: &str, msg: &str| {
         serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap()
@@ -249,7 +249,7 @@ async fn run_native_pipeline(
                 scale,
                 precision,
                 preserve_audio,
-                CudaCodec::cudaVideoCodec_HEVC,
+                CudaCodec::HEVC,
             ).await;
         }
 
@@ -269,7 +269,7 @@ async fn run_native_pipeline(
         scale,
         precision,
         preserve_audio,
-        CudaCodec::cudaVideoCodec_H264,
+        CudaCodec::H264,
     ).await
 }
 
@@ -283,14 +283,15 @@ async fn run_engine_pipeline(
     scale: u32,
     precision: String,
     preserve_audio: bool,
-    codec: videoforge_engine::codecs::sys::cudaVideoCodec_enum,
+    codec: videoforge_engine::codecs::sys::cudaVideoCodec,
 ) -> Result<NativeUpscaleResult, String> {
     use std::sync::Arc;
     use tokio::process::Command;
     use std::process::Stdio;
 
-    use videoforge_engine::backends::tensorrt::{TensorRtBackend, PrecisionPolicy};
-    use videoforge_engine::codecs::nvdec::NvDecDecoder;
+    use videoforge_engine::backends::tensorrt::{BatchConfig, TensorRtBackend, PrecisionPolicy};
+    use videoforge_engine::codecs::nvdec::NvDecoder;
+    use videoforge_engine::codecs::nvenc::NvEncConfig;
     use videoforge_engine::core::context::GpuContext;
     use videoforge_engine::core::kernels::{ModelPrecision, PreprocessKernels};
     use videoforge_engine::engine::pipeline::{PipelineConfig, UpscalePipeline};
@@ -301,9 +302,9 @@ async fn run_engine_pipeline(
 
     // ── Step 2: Initialise GPU context ────────────────────────────────────────
     tracing::info!("Initialising GPU context (device 0)");
+    // GpuContext::new already returns Arc<GpuContext>.
     let ctx = GpuContext::new(0)
         .map_err(|e| make_err("GPU_INIT", &format!("GPU context creation failed: {}", e)))?;
-    let ctx = Arc::new(ctx);
 
     // ── Step 3: Load TensorRT backend ─────────────────────────────────────────
     tracing::info!(model = %model_path, "Loading TensorRT backend");
@@ -311,9 +312,17 @@ async fn run_engine_pipeline(
         "fp16" => PrecisionPolicy::Fp16,
         _      => PrecisionPolicy::Fp32,
     };
-    let backend = TensorRtBackend::new(ctx.clone(), std::path::PathBuf::from(&model_path), precision_policy)
-        .await
-        .map_err(|e| make_err("BACKEND_INIT", &format!("TensorRT backend init failed: {}", e)))?;
+    // TensorRtBackend::new(model_path, ctx, device_id, ring_size, downstream_capacity).
+    // Use with_precision to apply the precision policy.
+    let backend = TensorRtBackend::with_precision(
+        std::path::PathBuf::from(&model_path),
+        ctx.clone(),
+        0,   // device_id
+        8,   // ring_size (≥ downstream_capacity + 2)
+        4,   // downstream_capacity
+        precision_policy,
+        BatchConfig::default(),
+    );
     let backend = Arc::new(backend);
 
     // ── Step 4: Compile kernels ───────────────────────────────────────────────
@@ -326,18 +335,30 @@ async fn run_engine_pipeline(
     let model_prec = if precision == "fp16" { ModelPrecision::F16 } else { ModelPrecision::F32 };
     let source = FileBitstreamSource::new(&input_stream)
         .map_err(|e| make_err("SOURCE_OPEN", &format!("Cannot open elementary stream: {}", e)))?;
-    let decoder = NvDecDecoder::new(ctx.clone(), Box::new(source), codec)
+    let decoder = NvDecoder::new(ctx.clone(), Box::new(source), codec)
         .map_err(|e| make_err("DECODER_INIT", &format!("NVDEC decoder init failed: {}", e)))?;
 
     // ── Step 6: Create encoder with FileBitstreamSink ─────────────────────────
     tracing::info!(path = %engine_output.display(), "Creating NVENC encoder");
 
-    // We will set the actual pitch after the first decoded frame.
-    // Use 0 as a placeholder — the pipeline sets it from the decoder output.
-    let enc_config = NvEncConfig::default_h264(scale);
+    // Encoder config — width/height/pitch are set to 0 as placeholders;
+    // the pipeline overrides them from the first decoded frame.
+    let enc_config = NvEncConfig {
+        width: 0,
+        height: 0,
+        fps_num: 30,
+        fps_den: 1,
+        bitrate: 8_000_000,
+        max_bitrate: 0,
+        gop_length: 30,
+        b_frames: 0,
+        nv12_pitch: 0,
+    };
     let sink = FileBitstreamSink::new(&engine_output)
         .map_err(|e| make_err("SINK_OPEN", &format!("Cannot create output stream: {}", e)))?;
-    let encoder = videoforge_engine::codecs::nvenc::NvEncoder::new(ctx.clone(), enc_config, Box::new(sink))
+    // NvEncoder::new takes (raw_cuda_context: *mut c_void, sink, config).
+    let cuda_ctx = *ctx.device().cu_primary_ctx() as *mut std::ffi::c_void;
+    let encoder = videoforge_engine::codecs::nvenc::NvEncoder::new(cuda_ctx, Box::new(sink), enc_config)
         .map_err(|e| make_err("ENCODER_INIT", &format!("NVENC encoder init failed: {}", e)))?;
 
     // ── Step 7: Run the pipeline ──────────────────────────────────────────────
@@ -510,13 +531,13 @@ impl videoforge_engine::codecs::nvenc::BitstreamSink for FileBitstreamSink {
         use std::io::Write;
         self.file
             .write_all(data)
-            .map_err(|e| videoforge_engine::error::EngineError::Io(e.to_string()))
+            .map_err(|e| videoforge_engine::error::EngineError::Encode(e.to_string()))
     }
 
     fn flush(&mut self) -> videoforge_engine::error::Result<()> {
         use std::io::Write;
         self.file
             .flush()
-            .map_err(|e| videoforge_engine::error::EngineError::Io(e.to_string()))
+            .map_err(|e| videoforge_engine::error::EngineError::Encode(e.to_string()))
     }
 }

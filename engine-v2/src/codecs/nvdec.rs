@@ -39,11 +39,13 @@
 //! This ensures ordering without CPU-blocking sync.
 
 use std::collections::VecDeque;
-use std::ffi::c_void;
+use std::ffi::{c_int, c_short, c_uint, c_ulong, c_ulonglong, c_void};
 use std::ptr;
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use cudarc::driver::DevicePtr;
+
+use tracing::{debug, info};
 
 use crate::codecs::sys::*;
 use crate::core::context::GpuContext;
@@ -420,6 +422,13 @@ impl NvDecoder {
         })
     }
 }
+
+// SAFETY: NvDecoder owns a `CUvideoparser` (opaque raw pointer) that is
+// created and destroyed exclusively from a single thread at a time.  The
+// CUVID parser API is thread-safe for distinct parser handles.  No data races
+// can occur because `NvDecoder` is consumed by `spawn_blocking` which
+// executes on exactly one thread.
+unsafe impl Send for NvDecoder {}
 
 impl FrameDecoder for NvDecoder {
     /// Decode the next frame.

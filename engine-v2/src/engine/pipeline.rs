@@ -58,10 +58,23 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::core::backend::UpscaleBackend;
-use crate::core::context::{GpuContext, PerfStage, StreamOverlapTimer};
+use crate::core::context::{GpuContext, PerfStage};
 use crate::core::kernels::{ModelPrecision, PreprocessKernels, PreprocessPipeline};
 use crate::core::types::{FrameEnvelope, GpuTexture, PixelFormat};
 use crate::error::{EngineError, Result};
+
+// ─── Panic formatting helper ────────────────────────────────────────────────
+
+/// Format a panic payload into a human-readable string.
+fn format_panic(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
 
 // ─── Pipeline stage traits ──────────────────────────────────────────────────
 
@@ -245,9 +258,10 @@ impl UpscalePipeline {
         {
             let cancel = cancel.clone();
             let metrics = metrics.clone();
+            let ctx_decode = ctx.clone();
             tasks.spawn_blocking(move || -> Result<()> {
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    decode_stage(&mut decoder, &tx_decoded, &cancel, &metrics, &ctx.queue_depth)
+                    decode_stage(&mut decoder, &tx_decoded, &cancel, &metrics, &ctx_decode.queue_depth)
                 }));
                 match result {
                     Ok(r) => r,
@@ -267,19 +281,10 @@ impl UpscalePipeline {
             let metrics = metrics.clone();
             let profiler_ctx = if enable_profiler { Some(ctx.clone()) } else { None };
             tasks.spawn(async move {
-                let result = std::panic::catch_unwind(AssertUnwindSafe(async {
-                    preprocess_stage(
-                        rx_decoded, &tx_preprocessed, &kernels, &ctx,
-                        precision, &cancel, &metrics, profiler_ctx.as_deref(),
-                    ).await
-                }));
-                match result {
-                    Ok(task) => task.await,
-                    Err(payload) => Err(EngineError::PanicRecovered {
-                        stage: "Preprocess",
-                        message: format_panic(payload),
-                    }),
-                }
+                preprocess_stage(
+                    rx_decoded, &tx_preprocessed, &kernels, &ctx,
+                    precision, &cancel, &metrics, profiler_ctx.as_deref(),
+                ).await
             });
         }
 
@@ -292,20 +297,11 @@ impl UpscalePipeline {
             let metrics = metrics.clone();
             let profiler_ctx = if enable_profiler { Some(ctx_c.clone()) } else { None };
             tasks.spawn(async move {
-                let result = std::panic::catch_unwind(AssertUnwindSafe(async {
-                    inference_stage(
-                        rx_preprocessed, &tx_upscaled, backend.as_ref(),
-                        &kernels_c, &ctx_c, encoder_pitch, precision,
-                        &cancel, &metrics, profiler_ctx.as_deref(),
-                    ).await
-                }));
-                match result {
-                    Ok(task) => task.await,
-                    Err(payload) => Err(EngineError::PanicRecovered {
-                        stage: "Inference",
-                        message: format_panic(payload),
-                    }),
-                }
+                inference_stage(
+                    rx_preprocessed, &tx_upscaled, backend.as_ref(),
+                    &kernels_c, &ctx_c, encoder_pitch, precision,
+                    &cancel, &metrics, profiler_ctx.as_deref(),
+                ).await
             });
         }
 

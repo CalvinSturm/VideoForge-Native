@@ -36,10 +36,10 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, CudaStream, LaunchAsync, LaunchConfig};
-use tracing::{debug, info};
+use cudarc::driver::{CudaDevice, CudaFunction, CudaStream, DevicePtr, LaunchAsync, LaunchConfig};
+use tracing::info;
 
-use crate::codecs::sys::{self, CUevent, CU_EVENT_DISABLE_TIMING};
+use crate::codecs::sys::{self, CUevent};
 use crate::core::context::GpuContext;
 use crate::core::types::{GpuTexture, PixelFormat};
 use crate::error::{EngineError, Result};
@@ -288,7 +288,9 @@ impl PreprocessKernels {
         let get_fn = |name: &str| -> Result<CudaFunction> {
             device
                 .get_func(MODULE_NAME, name)
-                .ok_or_else(|| EngineError::Cuda(cudarc::driver::DriverError::InvalidKernel))
+                .ok_or_else(|| EngineError::ModelMetadata(format!(
+                    "Kernel '{}' not found in module '{}'", name, MODULE_NAME
+                )))
         };
 
         let kernels = Self {
@@ -702,7 +704,7 @@ impl KernelTimer {
     /// completed) before calling this.
     pub fn elapsed_ms(&self) -> Result<f32> {
         let mut ms: f32 = 0.0;
-        extern "C" {
+        unsafe extern "C" {
             fn cuEventElapsedTime(
                 pMilliseconds: *mut f32,
                 hStart: CUevent,

@@ -38,9 +38,15 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use ort::session::Session;
+use ort::memory::{Allocator, AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
+use ort::tensor::TensorElementType;
+use ort::value::DynTensor;
+use ort::execution_providers::TensorRTExecutionProvider as TrtEP;
+
+use cudarc::driver::DevicePtr;
 
 use crate::core::backend::{ModelMetadata, UpscaleBackend};
 use crate::core::context::GpuContext;
@@ -320,10 +326,10 @@ struct InferenceState {
 }
 
 /// Resolve ORT tensor element type from our PixelFormat.
-fn ort_element_type(format: PixelFormat) -> ort::TensorElementType {
+fn ort_element_type(format: PixelFormat) -> TensorElementType {
     match format {
-        PixelFormat::RgbPlanarF16 => ort::TensorElementType::Float16,
-        _ => ort::TensorElementType::Float32,
+        PixelFormat::RgbPlanarF16 => TensorElementType::Float16,
+        _ => TensorElementType::Float32,
     }
 }
 
@@ -343,7 +349,7 @@ pub struct TensorRtBackend {
     /// Phase 8: batch configuration.
     pub batch_config: BatchConfig,
     /// Cached ORT MemoryInfo — avoids re-creation per frame.
-    cached_mem_info: OnceLock<ort::MemoryInfo>,
+    cached_mem_info: OnceLock<MemoryInfo>,
 }
 
 impl TensorRtBackend {
@@ -399,15 +405,19 @@ impl TensorRtBackend {
     }
 
     /// Get or create cached ORT MemoryInfo (avoids per-frame allocation).
-    fn mem_info(&self) -> Result<&ort::MemoryInfo> {
-        self.cached_mem_info.get_or_try_init(|| {
-            ort::MemoryInfo::new(
-                ort::AllocationDevice::CUDA,
-                0,
-                ort::AllocatorType::Device,
-                ort::MemoryType::Default,
-            ).map_err(|e| EngineError::ModelMetadata(format!("MemoryInfo: {e}")))
-        })
+    fn mem_info(&self) -> Result<&MemoryInfo> {
+        if let Some(info) = self.cached_mem_info.get() {
+            return Ok(info);
+        }
+        let info = MemoryInfo::new(
+            AllocationDevice::CUDA,
+            0,
+            AllocatorType::Device,
+            MemoryType::Default,
+        ).map_err(|e| EngineError::ModelMetadata(format!("MemoryInfo: {e}")))?;
+        // Ignore race — if another thread already set it, discard ours and use theirs.
+        let _ = self.cached_mem_info.set(info);
+        Ok(self.cached_mem_info.get().unwrap())
     }
 
     /// Access ring metrics (if initialized).
@@ -419,8 +429,8 @@ impl TensorRtBackend {
     }
 
     fn extract_metadata(session: &Session) -> Result<ModelMetadata> {
-        let inputs = &session.inputs;
-        let outputs = &session.outputs;
+        let inputs = session.inputs();
+        let outputs = session.outputs();
 
         if inputs.is_empty() || outputs.is_empty() {
             return Err(EngineError::ModelMetadata(
@@ -430,18 +440,22 @@ impl TensorRtBackend {
 
         let input_info = &inputs[0];
         let output_info = &outputs[0];
-        let input_name = input_info.name.clone();
-        let output_name = output_info.name.clone();
+        let input_name = input_info.name().to_string();
+        let output_name = output_info.name().to_string();
 
-        let input_dims = match &input_info.input_type {
-            ort::value::ValueType::Tensor { ty: _, dimensions } => dimensions.clone(),
+        // In ORT 2.0-rc.11, ValueType::Tensor uses `shape: Shape` (SmallVec<[i64;4]>)
+        // where -1 means dynamic. We convert to Vec<Option<i64>> for downstream use.
+        let input_dims: Vec<Option<i64>> = match input_info.dtype() {
+            ort::value::ValueType::Tensor { ty: _, shape, .. } =>
+                shape.iter().map(|&d| if d < 0 { None } else { Some(d) }).collect(),
             other => return Err(EngineError::ModelMetadata(format!(
                 "Expected tensor input, got {:?}", other
             ))),
         };
 
-        let output_dims = match &output_info.output_type {
-            ort::value::ValueType::Tensor { ty: _, dimensions } => dimensions.clone(),
+        let output_dims: Vec<Option<i64>> = match output_info.dtype() {
+            ort::value::ValueType::Tensor { ty: _, shape, .. } =>
+                shape.iter().map(|&d| if d < 0 { None } else { Some(d) }).collect(),
             other => return Err(EngineError::ModelMetadata(format!(
                 "Expected tensor output, got {:?}", other
             ))),
@@ -475,8 +489,9 @@ impl TensorRtBackend {
 
         let name = session
             .metadata()
-            .and_then(|m| m.name().ok())
-            .unwrap_or_else(|_| "unknown".to_string());
+            .ok()
+            .and_then(|m| m.name())
+            .unwrap_or_else(|| "unknown".to_string());
 
         Ok(ModelMetadata {
             name, scale, input_name, output_name, input_channels,
@@ -541,13 +556,13 @@ impl TensorRtBackend {
     }
 
     fn run_io_bound(
-        session: &Session,
+        session: &mut Session,
         meta: &ModelMetadata,
         input: &GpuTexture,
         output_ptr: u64,
         output_bytes: usize,
-        ctx: &GpuContext,
-        cuda_mem_info: &ort::MemoryInfo,
+        _ctx: &GpuContext,
+        cuda_mem_info: &MemoryInfo,
     ) -> Result<()> {
         let in_w = input.width as i64;
         let in_h = input.height as i64;
@@ -569,53 +584,66 @@ impl TensorRtBackend {
             });
         }
 
-        let input_ptr = input.device_ptr();
+        let input_bytes = (input_shape.iter().product::<i64>() as usize) * elem_bytes;
+        let input_src_ptr = input.device_ptr();
 
-        // Phase 7: Pointer identity audit — verify device pointers match.
-        Self::verify_pointer_identity(input_ptr, output_ptr, input, output_ptr);
+        // Create per-inference CUDA allocator and ORT-managed tensors.
+        // ORT allocates device memory via the CUDA EP allocator.
+        // We then D2D-copy our ring-buffer data into these tensors.
+        let cuda_alloc = Allocator::new(session, cuda_mem_info.clone())
+            .map_err(|e| EngineError::ModelMetadata(format!("CUDA allocator: {e}")))?;
 
-        let mut binding = session.create_binding()?;
+        let input_tensor = DynTensor::new(&cuda_alloc, elem_type, input_shape.as_slice())
+            .map_err(|e| EngineError::ModelMetadata(format!("Input tensor alloc: {e}")))?;
+        let output_tensor = DynTensor::new(&cuda_alloc, elem_type, output_shape.as_slice())
+            .map_err(|e| EngineError::ModelMetadata(format!("Output tensor alloc: {e}")))?;
 
-        // SAFETY — ORT IO Binding with raw device pointers:
-        //
-        // 1. `input_ptr`: valid CUDA device pointer from Arc<CudaSlice>.
-        //    Alive for this function call (caller holds Arc reference).
-        //    Byte extent: input_shape.product() × elem_bytes ≤ input.data.len().
-        //
-        // 2. `output_ptr`: valid CUDA device pointer from OutputRing slot.
-        //    Ring::acquire() verified strong_count == 1 (no concurrent reader).
-        //    Byte extent: output_shape.product() × elem_bytes ≤ output_bytes.
-        //
-        // 3. cuda_mem_info identifies both as CUDA device memory.
-        //    ORT will not allocate host staging buffers.
-        //
-        // 4. elem_type matches the pixel format (Float32 or Float16).
+        // Get raw device pointers from ORT-managed tensors for D2D copies.
+        // data_ptr() returns *const c_void directly (infallible in ort rc.11).
+        let ort_in_ptr = input_tensor.data_ptr() as u64;
+        let ort_out_ptr = output_tensor.data_ptr() as u64;
+
+        // D2D copy: our GpuTexture → ORT input tensor (both on same CUDA device).
+        // SAFETY: both pointers are valid CUDA device pointers on the same device.
         unsafe {
-            let input_value = ort::Value::from_raw(
-                cuda_mem_info.clone(),
-                input_ptr as *mut std::ffi::c_void,
-                &input_shape,
-                elem_type,
-            )?;
-            binding.bind_input(&meta.input_name, input_value)?;
-
-            let output_value = ort::Value::from_raw(
-                cuda_mem_info,
-                output_ptr as *mut std::ffi::c_void,
-                &output_shape,
-                elem_type,
-            )?;
-            binding.bind_output(&meta.output_name, output_value)?;
+            cudarc::driver::result::memcpy_dtod_sync(ort_in_ptr, input_src_ptr, input_bytes)
+                .map_err(EngineError::Cuda)?;
         }
 
-        // run_with_binding is synchronous: ORT blocks until all GPU kernels
+        // Phase 7: Pointer identity audit — log the ORT vs ring-slot pointers.
+        // (Not a strict identity check since we now use ORT-managed intermediate buffers.)
+        Self::verify_pointer_identity(ort_in_ptr, ort_out_ptr, input, output_ptr);
+
+        let mut binding = session.create_binding()
+            .map_err(|e| EngineError::ModelMetadata(format!("IO binding: {e}")))?;
+        binding.bind_input(&meta.input_name, &input_tensor)
+            .map_err(|e| EngineError::ModelMetadata(format!("bind_input: {e}")))?;
+        binding.bind_output(&meta.output_name, output_tensor)
+            .map_err(|e| EngineError::ModelMetadata(format!("bind_output: {e}")))?;
+
+        // run_binding is synchronous: ORT blocks until all GPU kernels
         // on its internal stream complete.  Output buffer is fully written
         // when this call returns.  No additional stream sync needed.
-        session.run_with_binding(&binding)?;
+        session.run_binding(&binding)
+            .map_err(|e| EngineError::ModelMetadata(format!("run_binding: {e}")))?;
+
+        // D2D copy: ORT output tensor → our ring slot.
+        // SAFETY: both pointers are valid CUDA device pointers on the same device.
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_sync(output_ptr, ort_out_ptr, expected)
+                .map_err(EngineError::Cuda)?;
+        }
 
         Ok(())
     }
 }
+
+// SAFETY: TensorRtBackend owns a `OnceLock<MemoryInfo>` which contains a
+// `NonNull<OrtMemoryInfo>`.  ORT manages the underlying allocation and the
+// pointer is valid for the lifetime of the session.  Access is serialized
+// through the `Mutex<Option<InferenceState>>` lock so there are no data races.
+unsafe impl Send for TensorRtBackend {}
+unsafe impl Sync for TensorRtBackend {}
 
 #[async_trait]
 impl UpscaleBackend for TensorRtBackend {
@@ -628,7 +656,7 @@ impl UpscaleBackend for TensorRtBackend {
         info!(path = %self.model_path.display(), "Loading ONNX model — TensorRT EP ONLY");
 
         // Build session with TensorRT EP exclusively.
-        let mut trt_ep = ort::TensorRTExecutionProvider::default()
+        let mut trt_ep = TrtEP::default()
             .with_device_id(self.device_id)
             .with_engine_cache(true)
             .with_engine_cache_path(
@@ -653,7 +681,7 @@ impl UpscaleBackend for TensorRtBackend {
                 trt_ep = trt_ep
                     .with_fp16(true)
                     .with_int8(true)
-                    .with_int8_calibration_table(
+                    .with_int8_calibration_table_name(
                         calibration_table.to_string_lossy().to_string(),
                     );
                 info!(
@@ -713,7 +741,7 @@ impl UpscaleBackend for TensorRtBackend {
         // Lazy ring init / realloc.
         match &mut state.ring {
             Some(ring) if ring.needs_realloc(input.width, input.height) => {
-                debug!(old = ?ring.alloc_dims, new = (input.width, input.height),
+                debug!(old = ?ring.alloc_dims, new_w = input.width, new_h = input.height,
                        "Reallocating output ring");
                 ring.reallocate(&self.ctx, input.width, input.height, meta.scale)?;
             }
@@ -746,7 +774,7 @@ impl UpscaleBackend for TensorRtBackend {
 
         let mem_info = self.mem_info()?;
         Self::run_io_bound(
-            &state.session, meta, &input, output_ptr, output_bytes, &self.ctx, mem_info,
+            &mut state.session, meta, &input, output_ptr, output_bytes, &self.ctx, mem_info,
         )?;
 
         let elapsed_us = t_start.elapsed().as_micros() as u64;
