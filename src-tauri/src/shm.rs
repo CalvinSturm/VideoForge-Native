@@ -4,7 +4,7 @@ use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicU32, Ordering};
 use thiserror::Error;
 
-pub const RING_SIZE: usize = 3;
+pub const RING_SIZE: usize = 6;
 
 // =============================================================================
 // SLOT STATE MACHINE
@@ -28,9 +28,9 @@ pub const SLOT_ENCODING: u32 = 5;
 // =============================================================================
 //
 // Offset  0: u8[8]  magic        = b"VFSHM001"
-// Offset  8: u32    version      = SHM_VERSION (1)
-// Offset 12: u32    header_size  = HEADER_REGION_SIZE (84)
-// Offset 16: u32    slot_count   = RING_SIZE (3)
+// Offset  8: u32    version      = SHM_VERSION (2)
+// Offset 12: u32    header_size  = HEADER_REGION_SIZE (132)
+// Offset 16: u32    slot_count   = RING_SIZE (6)
 // Offset 20: u32    width        = frame width in pixels
 // Offset 24: u32    height       = frame height in pixels
 // Offset 28: u32    scale        = upscale factor
@@ -50,16 +50,16 @@ pub const SLOT_ENCODING: u32 = 5;
 
 const GLOBAL_HEADER_SIZE: usize = 36;
 const MAGIC: &[u8; 8] = b"VFSHM001";
-pub const SHM_VERSION: u32 = 1;
+pub const SHM_VERSION: u32 = 2;
 /// Pixel format identifier for RGB24 (3 bytes/pixel, interleaved).
 pub const PIXEL_FORMAT_RGB24: u32 = 1;
 
 const SLOT_HEADER_SIZE: usize = 16; // 4 × u32
-const SLOT_HEADER_REGION: usize = SLOT_HEADER_SIZE * RING_SIZE; // 48
+const SLOT_HEADER_REGION: usize = SLOT_HEADER_SIZE * RING_SIZE; // 96
 
 /// Total bytes reserved for all headers (global + slot headers) at the
 /// start of the SHM file.  Data region begins at this offset.
-pub const HEADER_REGION_SIZE: usize = GLOBAL_HEADER_SIZE + SLOT_HEADER_REGION; // 84
+pub const HEADER_REGION_SIZE: usize = GLOBAL_HEADER_SIZE + SLOT_HEADER_REGION; // 132
 
 // Byte offsets within a single slot header (relative to that slot's base).
 const STATE_OFFSET: usize = 8;
@@ -101,7 +101,7 @@ impl VideoShm {
     /// Layout:
     /// ```text
     /// [ Global Header  36 bytes (magic, version, dimensions) ]
-    /// [ SlotHeader × RING_SIZE  48 bytes ]
+    /// [ SlotHeader × RING_SIZE  96 bytes ]
     /// [ Slot 0: input (W×H×3) | output (sW×sH×3) ]
     /// [ Slot 1: input | output ]
     /// [ Slot 2: input | output ]
@@ -399,10 +399,10 @@ mod tests {
 
     #[test]
     fn header_region_size_constant_is_correct() {
-        // 36 global + 48 slot headers = 84
+        // 36 global + 96 slot headers (16 × 6) = 132
         assert_eq!(GLOBAL_HEADER_SIZE, 36);
-        assert_eq!(SLOT_HEADER_REGION, 48);
-        assert_eq!(HEADER_REGION_SIZE, 84);
+        assert_eq!(SLOT_HEADER_REGION, 96);
+        assert_eq!(HEADER_REGION_SIZE, 132);
     }
 
     #[test]

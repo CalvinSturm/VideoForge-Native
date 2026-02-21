@@ -686,6 +686,258 @@ def _load_module(model_key: str) -> Tuple[nn.Module, int]:
     return model, scale
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# RCAN / EDSR ARCHITECTURE DEFINITIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+# Canonical definitions live here to avoid a circular import with shm_worker.
+# shm_worker re-exports these names for backward compatibility.
+
+_SUPPORTED_SCALES = [2, 3, 4, 8]
+
+
+class ChannelAttention(nn.Module):
+    """Channel Attention with fc1/PReLU/fc2 structure (RCAN+ variant)."""
+    def __init__(self, num_feat: int, squeeze_factor: int = 16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(num_feat, num_feat // squeeze_factor, 1, bias=False)
+        self.relu1 = nn.PReLU(num_feat // squeeze_factor)
+        self.fc2 = nn.Conv2d(num_feat // squeeze_factor, num_feat, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.avg_pool(x)
+        y = self.fc1(y)
+        y = self.relu1(y)
+        y = self.fc2(y)
+        y = self.sigmoid(y)
+        return x * y
+
+
+class SpatialAttention(nn.Module):
+    """Spatial Attention with a single 7x7 conv."""
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 1, 7, padding=3, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        y = self.conv1(avg_out)
+        y = self.sigmoid(y)
+        return x * y
+
+
+class CSAM(nn.Module):
+    """Combined Channel + Spatial Attention Module for RCAN."""
+    def __init__(self, num_feat: int, squeeze_factor: int = 16):
+        super().__init__()
+        self.ca = ChannelAttention(num_feat, squeeze_factor)
+        self.sa = SpatialAttention()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.ca(x)
+        x = self.sa(x)
+        return x
+
+
+class RCAB(nn.Module):
+    """Residual Channel Attention Block with combined CA+SA."""
+    def __init__(self, num_feat: int, squeeze_factor: int = 16, res_scale: float = 0.1):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(num_feat, num_feat, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(num_feat, num_feat, 3, 1, 1),
+            CSAM(num_feat, squeeze_factor)
+        )
+        self.res_scale = res_scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.body(x) * self.res_scale
+
+
+class ResidualGroup(nn.Module):
+    """Residual Group containing multiple RCABs — matches official RCAN naming."""
+    def __init__(self, num_feat: int, num_rcab: int = 20, squeeze_factor: int = 16, res_scale: float = 0.1):
+        super().__init__()
+        self.body = nn.Sequential(
+            *[RCAB(num_feat, squeeze_factor, res_scale) for _ in range(num_rcab)],
+            nn.Conv2d(num_feat, num_feat, 3, 1, 1)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.body(x)
+
+
+class RCAN(nn.Module):
+    """
+    Residual Channel Attention Network for Image Super-Resolution.
+    Architecture matches official implementation for weight compatibility.
+    """
+    def __init__(
+        self,
+        num_in_ch: int = 3,
+        num_out_ch: int = 3,
+        num_feat: int = 64,
+        num_group: int = 10,
+        num_rcab: int = 20,
+        squeeze_factor: int = 16,
+        scale: int = 4
+    ):
+        super().__init__()
+        if scale not in _SUPPORTED_SCALES:
+            raise ValueError(f"Unsupported scale {scale}. Valid scales: {_SUPPORTED_SCALES}")
+        self.scale = scale
+        self.num_in_ch = num_in_ch
+        self.num_out_ch = num_out_ch
+        self.num_feat = num_feat
+        self.head = nn.Sequential(nn.Conv2d(num_in_ch, num_feat, 3, 1, 1))
+        body_modules = [ResidualGroup(num_feat, num_rcab, squeeze_factor, res_scale=0.1) for _ in range(num_group)]
+        body_modules.append(nn.Conv2d(num_feat, num_feat, 3, 1, 1))
+        self.body = nn.Sequential(*body_modules)
+        upsampler = self._make_upsampler(num_feat, scale)
+        self.tail = nn.Sequential(
+            upsampler,
+            nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+        )
+
+    def _make_upsampler(self, num_feat: int, scale: int) -> nn.Sequential:
+        layers = []
+        if scale == 2:
+            layers.append(nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1))
+            layers.append(nn.PixelShuffle(2))
+        elif scale == 3:
+            layers.append(nn.Conv2d(num_feat, num_feat * 9, 3, 1, 1))
+            layers.append(nn.PixelShuffle(3))
+        elif scale == 4:
+            layers.append(nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1))
+            layers.append(nn.PixelShuffle(2))
+            layers.append(nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1))
+            layers.append(nn.PixelShuffle(2))
+        elif scale == 8:
+            for _ in range(3):
+                layers.append(nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1))
+                layers.append(nn.PixelShuffle(2))
+        return nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shallow = self.head(x)
+        deep = self.body(shallow)
+        deep = deep + shallow
+        return self.tail(deep)
+
+
+class EDSRResBlock(nn.Module):
+    """Residual Block without BN — matches official EDSR-PyTorch key format."""
+    def __init__(self, num_feat: int = 256, res_scale: float = 0.1):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True),
+        )
+        self.res_scale = res_scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.body(x) * self.res_scale
+
+
+class EDSR(nn.Module):
+    """
+    Enhanced Deep Residual Network for Image Super-Resolution.
+    Architecture matches the official EDSR-PyTorch repo for weight compatibility.
+    """
+    def __init__(
+        self,
+        num_in_ch: int = 3,
+        num_out_ch: int = 3,
+        num_feat: int = 256,
+        num_block: int = 32,
+        res_scale: float = 0.1,
+        scale: int = 4
+    ):
+        super().__init__()
+        if scale not in _SUPPORTED_SCALES:
+            raise ValueError(f"Unsupported scale {scale}. Valid scales: {_SUPPORTED_SCALES}")
+        self.scale = scale
+        self.num_in_ch = num_in_ch
+        self.num_out_ch = num_out_ch
+        self.num_feat = num_feat
+        self.head = nn.Sequential(nn.Conv2d(num_in_ch, num_feat, 3, 1, 1, bias=True))
+        body_modules = [EDSRResBlock(num_feat, res_scale) for _ in range(num_block)]
+        body_modules.append(nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=True))
+        self.body = nn.Sequential(*body_modules)
+        upsampler = self._make_upsampler(num_feat, scale)
+        self.tail = nn.Sequential(
+            upsampler,
+            nn.Conv2d(num_feat, num_out_ch, 3, 1, 1, bias=True)
+        )
+
+    def _make_upsampler(self, num_feat: int, scale: int) -> nn.Sequential:
+        import math as _math
+        layers = []
+        if (scale & (scale - 1)) == 0:
+            for _ in range(int(_math.log2(scale))):
+                layers.append(nn.Conv2d(num_feat, num_feat * 4, 3, 1, 1, bias=True))
+                layers.append(nn.PixelShuffle(2))
+        elif scale == 3:
+            layers.append(nn.Conv2d(num_feat, num_feat * 9, 3, 1, 1, bias=True))
+            layers.append(nn.PixelShuffle(3))
+        return nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.head(x)
+        body_feat = self.body(feat)
+        feat = feat + body_feat
+        return self.tail(feat)
+
+
+def remap_edsr_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Remap BasicSR-style EDSR keys (conv_first/conv_after_body/upsample/conv_last)
+    to the official EDSR format (head/body/tail) used by our EDSR class.
+
+    Also strips sub_mean/add_mean MeanShift keys.
+    """
+    has_head = any(k.startswith("head.") for k in state_dict)
+    has_tail = any(k.startswith("tail.") for k in state_dict)
+    if has_head and has_tail:
+        return {k: v for k, v in state_dict.items()
+                if not k.startswith("sub_mean.") and not k.startswith("add_mean.")}
+
+    new_dict: Dict[str, torch.Tensor] = {}
+    max_body_idx = -1
+    for key in state_dict:
+        if key.startswith("body.") and ".conv1." in key:
+            parts = key.split(".")
+            if parts[1].isdigit():
+                max_body_idx = max(max_body_idx, int(parts[1]))
+
+    for key, value in state_dict.items():
+        if key.startswith("sub_mean.") or key.startswith("add_mean."):
+            continue
+        if key.startswith("conv_first."):
+            new_key = key.replace("conv_first.", "head.0.")
+        elif key.startswith("body.") and (".conv1." in key or ".conv2." in key):
+            new_key = key.replace(".conv1.", ".body.0.").replace(".conv2.", ".body.2.")
+        elif key.startswith("conv_after_body."):
+            rest = key[len("conv_after_body."):]
+            new_key = f"body.{max_body_idx + 1}.{rest}"
+        elif key.startswith("upsample."):
+            rest = key[len("upsample."):]
+            new_key = f"tail.0.{rest}"
+        elif key.startswith("conv_last."):
+            rest = key[len("conv_last."):]
+            new_key = f"tail.1.{rest}"
+        else:
+            new_key = key
+        new_dict[new_key] = value
+
+    print(f"[ModelManager] Remapped {len(new_dict)} EDSR keys from BasicSR -> official format", flush=True)
+    return new_dict
+
+
 # ── Architecture builders ─────────────────────────────────────────────────
 
 def _build_realesrgan(
@@ -727,14 +979,11 @@ def _build_rcan(
     state_dict: Dict[str, torch.Tensor], model_key: str
 ) -> nn.Module:
     """
-    Build RCAN from shm_worker definitions.
+    Build RCAN from local class definition.
 
     Detects architecture parameters (num_feat, num_group, num_rcab) from the
     state dict keys and tensor shapes so we match the actual checkpoint.
     """
-    sys.path.insert(0, SCRIPT_DIR)
-    from shm_worker import RCAN
-
     # ── Detect scale from model key ─────────────────────────────────
     scale = 4
     for s in (2, 3, 4, 8):
@@ -809,7 +1058,7 @@ def _build_edsr(
     state_dict: Dict[str, torch.Tensor], model_key: str
 ) -> nn.Module:
     """
-    Build EDSR from shm_worker definitions.
+    Build EDSR from local class definition.
 
     Handles two state-dict formats:
       - Official EDSR-PyTorch (head/body/tail) — loads directly
@@ -819,9 +1068,6 @@ def _build_edsr(
     state dict.  The official EDSR .pt files are the *large* model
     (num_feat=256, num_block=32, res_scale=0.1).
     """
-    sys.path.insert(0, SCRIPT_DIR)
-    from shm_worker import EDSR, remap_edsr_keys
-
     # ── Remap BasicSR format if needed ───────────────────────────────
     is_basicsr = any(k.startswith("conv_first.") for k in state_dict)
     if is_basicsr:
