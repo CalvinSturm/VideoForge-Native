@@ -250,8 +250,12 @@ pub async fn run_upscale_job(
                 tracing::info!(job_id = %job_id, output = %output_path, "Image upscale complete");
                 break;
             } else if resp["status"] == "error" {
-                tracing::error!(job_id = %job_id, error = %resp["message"], "Python error during image upscale");
-                return Err(format!("Python error: {}", resp["message"]));
+                let msg = resp["error"]["message"]
+                    .as_str()
+                    .or_else(|| resp["message"].as_str())
+                    .unwrap_or("(no message)");
+                tracing::error!(job_id = %job_id, error = %msg, "Python error during image upscale");
+                return Err(format!("Python error: {}", msg));
             }
         }
 
@@ -329,7 +333,11 @@ pub async fn run_upscale_job(
         serde_json::from_str(&shm_data).map_err(|e| e.to_string())?;
 
     if shm_resp["status"] != "SHM_CREATED" {
-        return Err(format!("SHM init failed: {}", shm_resp["message"]));
+        let msg = shm_resp["error"]["message"]
+            .as_str()
+            .or_else(|| shm_resp["message"].as_str())
+            .unwrap_or("(no message)");
+        return Err(format!("SHM init failed: {}", msg));
     }
     let shm_path = shm_resp
         .get("shm_path")

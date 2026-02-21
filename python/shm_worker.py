@@ -888,7 +888,8 @@ class AIWorker:
                 if model_name:
                     self.load_model(model_name)
             elif cmd == "upscale_image_file":
-                self.handle_image_file(payload)
+                p = env.payload if isinstance(env.payload, dict) else raw
+                self.handle_image_file(p)
             elif cmd == "analyze_for_auto_grade":
                 self.handle_auto_grade_analysis(payload)
             elif cmd == "update_research_params":
@@ -1049,7 +1050,10 @@ class AIWorker:
         if self.model is None:
             raise RuntimeError("No model loaded")
 
-        tile_size = Config.TILE_SIZE
+        # ONNX transformer models (DAT2, etc.) have quadratic attention cost — their
+        # VRAM footprint grows with tile area, not linearly.  Allow the model to
+        # advertise a smaller preferred tile size to avoid VRAM exhaustion.
+        tile_size = getattr(self.model, "preferred_tile_size", Config.TILE_SIZE)
         tile_pad = Config.TILE_PAD
         scale = self.model_scale
 

@@ -354,6 +354,12 @@ def create_adapter(
     ValueError
         If *model_key* cannot be matched to any registered adapter.
     """
+    # ONNX models have all pre/post-processing baked into the graph — skip
+    # every architecture-specific adapter and use a plain pass-through.
+    if getattr(model, "_vf_onnx", False):
+        print(f"[ArchWrappers] ONNX model, using LightweightAdapter (pass-through, FP32)", flush=True)
+        return LightweightAdapter(model=model, scale=scale, use_autocast=False)
+
     # Spandrel-loaded models handle their own padding, mean shift, and cropping.
     # Use a pass-through adapter with autocast disabled — transformer attention
     # layers (SwinIR, HAT, DAT) overflow in FP16, producing NaN.

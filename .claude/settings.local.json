@@ -3,7 +3,17 @@
     "allow": [
       "Bash(wc:*)",
       "Bash(python3:*)",
-      "Bash(/mnt/c/Users/Calvin/VideoForge/venv310/Scripts/python.exe:*)"
+      "Bash(/mnt/c/Users/Calvin/VideoForge/venv310/Scripts/python.exe:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(rustc:*)",
+      "Bash(cargo --version:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo search:*)",
+      "Bash(grep:*)"
     ]
   }
 }

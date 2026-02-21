@@ -11,6 +11,8 @@ pub struct ModelInfo {
     pub scale: u32,
     /// The actual filename on disk (for backend resolution)
     pub filename: String,
+    /// Weight format: "onnx" or "pytorch"
+    pub format: String,
 }
 
 /// Strip weight-file extensions from a filename.
@@ -19,6 +21,7 @@ fn strip_weight_ext(name: &str) -> String {
         .replace(".pt", "")
         .replace(".safetensors", "")
         .replace(".bin", "")
+        .replace(".onnx", "")
 }
 
 /// Extract scale factor from filename using explicit pattern matching.
@@ -70,13 +73,14 @@ fn get_installed_weights_dir() -> Option<PathBuf> {
     }
 }
 
-/// Check if file has a valid weight extension (.pth or .pt)
+/// Check if file has a valid weight extension
 fn is_weight_file(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.ends_with(".pth")
         || lower.ends_with(".pt")
         || lower.ends_with(".safetensors")
         || lower.ends_with(".bin")
+        || lower.ends_with(".onnx")
 }
 
 pub fn list_models() -> Vec<ModelInfo> {
@@ -169,9 +173,16 @@ fn process_weight_file(filename: &str, seen_ids: &HashSet<String>) -> Option<Mod
         return None;
     }
 
+    let format = if filename.to_lowercase().ends_with(".onnx") {
+        "onnx".to_string()
+    } else {
+        "pytorch".to_string()
+    };
+
     Some(ModelInfo {
         id,
         scale,
         filename: filename.to_string(),
+        format,
     })
 }

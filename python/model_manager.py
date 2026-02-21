@@ -67,7 +67,7 @@ def _resolve_weight_path(model_key: str) -> str:
 
     Raises ``FileNotFoundError`` if the file does not exist.
     """
-    exts = [".pth", ".pt", ".safetensors", ".bin"]
+    exts = [".pth", ".pt", ".safetensors", ".bin", ".onnx"]
 
     # Direct name match
     candidates = [os.path.join(WEIGHTS_DIR, f"{model_key}{ext}") for ext in exts]
@@ -518,6 +518,158 @@ def _load_swin2sr_hf(
     return wrapper, scale
 
 
+class OnnxModelWrapper(nn.Module):
+    """
+    Wraps an ONNX Runtime InferenceSession as an nn.Module so ONNX models
+    plug into the same inference pipeline as PyTorch models.
+
+    forward() accepts an (N, 3, H, W) float32 tensor on any device and
+    returns an (N, 3, H*scale, W*scale) float32 tensor on the same device.
+    """
+
+    def __init__(self, session, scale: int, preferred_tile_size: int = 512) -> None:
+        super().__init__()
+        self.session = session
+        self.scale = scale
+        self.preferred_tile_size = preferred_tile_size
+        self._infer_device = torch.device("cpu")
+        self._vf_onnx = True  # sentinel for create_adapter bypass
+
+    def to(self, device=None, dtype=None, **kwargs):
+        if device is not None:
+            self._infer_device = torch.device(device) if isinstance(device, str) else device
+        return self
+
+    def half(self):
+        return self  # ORT manages its own precision
+
+    def eval(self):
+        return self
+
+    def parameters(self, recurse=True):
+        return iter([])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        import numpy as np
+        input_device = x.device
+        inp_info = self.session.get_inputs()[0]
+        # Match the dtype the model was exported with
+        _ORT_TO_NP = {
+            "tensor(float)":   np.float32,
+            "tensor(float16)": np.float16,
+            "tensor(double)":  np.float64,
+        }
+        np_dtype = _ORT_TO_NP.get(inp_info.type, np.float32)
+        np_input = x.cpu().numpy().astype(np_dtype)
+        output_name = self.session.get_outputs()[0].name
+        result = self.session.run([output_name], {inp_info.name: np_input})[0]
+        out = torch.from_numpy(result.astype(np.float32))  # always return fp32
+        if input_device.type != "cpu":
+            out = out.to(input_device, non_blocking=True)
+        return out
+
+
+def _extract_scale_from_stem(stem: str) -> int:
+    """Mirror models.rs extract_scale() — extract upscale factor from filename stem."""
+    lower = stem.lower()
+    for scale in [2, 3, 4, 8]:
+        for pattern in [f"_x{scale}", f"x{scale}plus", f"_{scale}x", f"{scale}x_", f"{scale}x-"]:
+            if pattern in lower:
+                return scale
+    if len(lower) >= 2 and lower[1] == "x" and lower[0] in "2348":
+        return int(lower[0])
+    return 4
+
+
+def _probe_onnx_session(session, inp_info, timeout: float = 20.0) -> bool:
+    """
+    Run a tiny dummy inference in a background thread.
+    Returns True if it completes within *timeout* seconds, False if it hangs.
+    ORT's CUDA EP deadlocks on certain transformer ops (DAT2 deformable/sparse
+    attention); the probe detects this before the real inference blocks forever.
+    """
+    import threading
+    import numpy as np
+
+    _ORT_TO_NP = {
+        "tensor(float)":   np.float32,
+        "tensor(float16)": np.float16,
+        "tensor(double)":  np.float64,
+    }
+    np_dtype = _ORT_TO_NP.get(inp_info.type, np.float32)
+    dummy = np.zeros((1, 3, 64, 64), dtype=np_dtype)
+
+    success = [False]
+
+    def _run():
+        try:
+            session.run(None, {inp_info.name: dummy})
+            success[0] = True
+        except Exception:
+            success[0] = False  # error is better than a hang — at least it returns
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    return success[0] or not t.is_alive()  # False only if thread is still alive (hung)
+
+
+def _load_onnx_model(path: str) -> Tuple[nn.Module, int]:
+    """Load an ONNX file and return (OnnxModelWrapper, scale)."""
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        raise RuntimeError(
+            "onnxruntime package required for .onnx files. "
+            "Install: pip install onnxruntime-gpu"
+        )
+
+    # ORT's CUDA provider needs cudnn64_9.dll which lives inside PyTorch's lib
+    # directory on a standard pip install. Add it to the DLL search path so ORT
+    # can find it without requiring a separate system-wide cuDNN installation.
+    try:
+        import torch as _torch
+        _torch_lib = os.path.join(os.path.dirname(_torch.__file__), "lib")
+        if os.path.isdir(_torch_lib) and hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(_torch_lib)
+    except Exception:
+        pass  # best-effort — ORT will fall back to CPU if cuDNN is still missing
+
+    stem = os.path.splitext(os.path.basename(path))[0]
+    scale = _extract_scale_from_stem(stem)
+
+    # Transformer models (DAT2, SwinIR, HAT, etc.) have quadratic attention cost.
+    # Use 256px tiles to prevent VRAM exhaustion at 512px (attention matrices are
+    # 4× smaller in each dimension → 16× less memory for the attention computation).
+    _TRANSFORMER_KEYS = {"dat", "swin", "hat", "realweb", "omnisr", "lmlt"}
+    preferred_tile_size = 256 if any(k in stem.lower() for k in _TRANSFORMER_KEYS) else 512
+
+    available = ort.get_available_providers()
+
+    # Try CUDA EP first. Some transformer models (DAT2 deformable/sparse attention)
+    # deadlock ORT's CUDA kernels. Probe with a dummy input before committing.
+    if "CUDAExecutionProvider" in available:
+        print(f"[ModelManager] Loading ONNX (CUDA EP probe): {os.path.basename(path)}", flush=True)
+        cuda_session = ort.InferenceSession(
+            path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+        )
+        inp_info = cuda_session.get_inputs()[0]
+        if _probe_onnx_session(cuda_session, inp_info):
+            print(f"[ModelManager] ONNX CUDA EP OK — scale={scale}x tile={preferred_tile_size}px", flush=True)
+            return OnnxModelWrapper(cuda_session, scale, preferred_tile_size), scale
+        else:
+            print(
+                f"[ModelManager] CUDA EP probe timed out for {os.path.basename(path)}, "
+                f"falling back to CPU EP (inference will be slower)",
+                flush=True,
+            )
+
+    print(f"[ModelManager] Loading ONNX (CPU EP): {os.path.basename(path)}", flush=True)
+    cpu_session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    print(f"[ModelManager] ONNX CPU EP loaded — scale={scale}x tile={preferred_tile_size}px", flush=True)
+    return OnnxModelWrapper(cpu_session, scale, preferred_tile_size), scale
+
+
 def _load_module(model_key: str) -> Tuple[nn.Module, int]:
     """
     Load a model from ``weights/{model_key}.pth``, place on CPU, eval mode.
@@ -535,6 +687,10 @@ def _load_module(model_key: str) -> Tuple[nn.Module, int]:
     """
     path = _resolve_weight_path(model_key)
     print(f"[ModelManager] Loading {model_key} from {path}", flush=True)
+
+    # ── ONNX models bypass the PyTorch loading pipeline entirely ──────
+    if path.lower().endswith(".onnx"):
+        return _load_onnx_model(path)
 
     # ── Safetensors files need a different loader ─────────────────────
     if path.lower().endswith(".safetensors"):
