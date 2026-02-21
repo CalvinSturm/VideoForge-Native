@@ -27,6 +27,14 @@ import { EmptyState } from "./components/EmptyState";
 
 import type { Toast, UpscaleMode, Job, VideoState, EditState } from './types';
 
+interface ModelInfo {
+  id: string;
+  scale: number;
+  filename: string;
+  format: string;  // "onnx" | "pytorch"
+  path: string;
+}
+
 // Fallback model list when engine discovery fails
 const DEFAULT_MODELS = ["RCAN_x4", "EDSR_x4", "RealESRGAN_x4plus"];
 
@@ -141,6 +149,7 @@ const App: React.FC = () => {
   const [outputPath, setOutputPath] = useState("");
   const [model, setModel] = useState("RealESRGAN_x4plus.pth");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [modelInfoMap, setModelInfoMap] = useState<Map<string, ModelInfo>>(new Map());
   const [loadingModel, setLoadingModel] = useState(false);
   const [showTechSpecs, setShowTechSpecs] = useState(false);
   const [showResearchParams, setShowResearchParams] = useState(true);
@@ -277,9 +286,9 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (isEngineReady) {
-      invoke<any[]>("get_models").then(models => {
-        const ids = models.map(m => m.id);
-        setAvailableModels(ids.length > 0 ? ids : DEFAULT_MODELS);
+      invoke<ModelInfo[]>("get_models").then(models => {
+        setAvailableModels(models.length > 0 ? models.map(m => m.id) : DEFAULT_MODELS);
+        setModelInfoMap(new Map(models.map(m => [m.id, m])));
       }).catch(() => setAvailableModels(DEFAULT_MODELS));
     } else {
       setAvailableModels(DEFAULT_MODELS);
@@ -385,7 +394,24 @@ const App: React.FC = () => {
     console.debug('[App] Upscale payload:', upscalePayload);
 
     try {
-      const resultPath = await invoke<string>("upscale_request", upscalePayload);
+      const selectedModel = upscaleConfig.primaryModelId || model;
+      const info = modelInfoMap.get(selectedModel);
+
+      let resultPath: string;
+      if (info?.format === "onnx") {
+        // Routes through engine-v2 native pipeline (NVDEC → TensorRT → NVENC).
+        // Returns FEATURE_DISABLED error if not compiled with --features native_engine.
+        resultPath = await invoke<string>("upscale_request_native", {
+          inputPath,
+          outputPath,
+          modelPath: info.path,
+          scale: info.scale,
+          precision: "fp32",
+          audio: true,
+        });
+      } else {
+        resultPath = await invoke<string>("upscale_request", upscalePayload);
+      }
       setLogs(prev => [...prev, `[SYSTEM] Job ${jobId} finished.`]);
       const finishedJob: Job = { ...newJob, status: 'done', progress: 100, outputPath: resultPath, eta: 0 };
       setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));

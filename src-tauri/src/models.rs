@@ -13,6 +13,8 @@ pub struct ModelInfo {
     pub filename: String,
     /// Weight format: "onnx" or "pytorch"
     pub format: String,
+    /// Absolute path to the weight file on disk
+    pub path: String,
 }
 
 /// Strip weight-file extensions from a filename.
@@ -125,7 +127,7 @@ pub fn list_models() -> Vec<ModelInfo> {
 
                 // Handle flat weight files (e.g., weights/RCAN_x4.pt)
                 if path.is_file() && is_weight_file(&filename) {
-                    if let Some(model) = process_weight_file(&filename, &seen_ids) {
+                    if let Some(model) = process_weight_file(&path, &filename, &seen_ids) {
                         seen_ids.insert(model.id.clone());
                         models.push(model);
                     }
@@ -134,9 +136,10 @@ pub fn list_models() -> Vec<ModelInfo> {
                 else if path.is_dir() {
                     if let Ok(sub_entries) = fs::read_dir(&path) {
                         for sub_entry in sub_entries.flatten() {
+                            let sub_path = sub_entry.path();
                             let sub_name = sub_entry.file_name().to_string_lossy().to_string();
                             if is_weight_file(&sub_name) {
-                                if let Some(model) = process_weight_file(&sub_name, &seen_ids) {
+                                if let Some(model) = process_weight_file(&sub_path, &sub_name, &seen_ids) {
                                     seen_ids.insert(model.id.clone());
                                     models.push(model);
                                 }
@@ -155,7 +158,11 @@ pub fn list_models() -> Vec<ModelInfo> {
 }
 
 /// Process a single weight file and return ModelInfo if valid
-fn process_weight_file(filename: &str, seen_ids: &HashSet<String>) -> Option<ModelInfo> {
+fn process_weight_file(
+    full_path: &std::path::Path,
+    filename: &str,
+    seen_ids: &HashSet<String>,
+) -> Option<ModelInfo> {
     let id = strip_weight_ext(filename);
     if id.is_empty() {
         return None;
@@ -184,5 +191,6 @@ fn process_weight_file(filename: &str, seen_ids: &HashSet<String>) -> Option<Mod
         scale,
         filename: filename.to_string(),
         format,
+        path: full_path.to_string_lossy().to_string(),
     })
 }
