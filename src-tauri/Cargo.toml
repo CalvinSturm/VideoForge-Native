@@ -6,6 +6,7 @@ authors = ["you"]
 license = ""
 repository = ""
 edition = "2021"
+default-run = "videoforge"
 
 # --- THIS SECTION IS CRITICAL FOR "app_lib" ERROR ---
 [lib]
@@ -28,7 +29,7 @@ tauri-build = { version = "2.0.0", features = [] }
 # semver `^2.0` requirement.
 #
 # Workaround before enabling this feature:
-#   1. Update engine-v2/Cargo.toml: `ort = { version = "2.0.0-rc.11", features = ["cuda","tensorrt"] }`
+#   1. Update engine-v2/Cargo.toml: `ort = { version = "2.0.0-rc.11", features = ["cuda", "tensorrt"] }`
 #      (or whichever rc is current on crates.io).
 #   2. Uncomment the dep line below.
 #   3. Rebuild: cargo build --features native_engine

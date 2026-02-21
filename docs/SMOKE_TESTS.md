@@ -186,7 +186,49 @@ await window.__TAURI__.core.invoke("upscale_request", {
 
 ---
 
-## C) Native Engine Path
+## C) SHM Roundtrip Smoke (no FFmpeg, no UI, no model weights)
+
+Exercises the full Rust→Python→Rust SHM frame path using a scale=1 passthrough
+(no AI inference, no weights required).  Use this to rule out IPC/SHM issues
+before chasing FFmpeg or model problems.
+
+### Command
+
+```powershell
+cd src-tauri
+cargo build --bin smoke
+.\target\debug\smoke.exe --shm-roundtrip
+```
+
+### Expected output
+
+```
+── SHM Roundtrip ─────────────────────────────────────────────
+[PASS] Zenoh listener
+[PASS] Python spawn
+[PASS] Python Zenoh handshake
+[PASS] SHM created (path: C:\Temp\vf_buffer_XXXXX.bin)
+[PASS] SHM header validated
+[PASS] Synthetic frame written → SLOT_READY_FOR_AI
+[PASS] process_one_frame sent
+[PASS] FRAME_DONE received
+[PASS] Output validated (192 bytes, non-zero)
+─────────────────────────────────────────────────────────────
+Result: ALL CHECKS PASSED
+```
+
+### Failure labels and fixes
+
+| Label | Meaning | Fix |
+|-------|---------|-----|
+| `SHM_CREATE_TIMEOUT` | Python didn't reply to create_shm in 10 s | Check Python env, zenoh port conflict |
+| `SHM_OPEN_FAILED` | Rust can't open temp file | Windows file lock? Check %TEMP% perms |
+| `FRAME_DONE_TIMEOUT` | Python didn't process in 5 s | Python crash — run with stderr visible |
+| `OUTPUT_ALL_ZEROS` | Frame processed but output is zeros | scale=1 passthrough broken — check mmap write |
+
+---
+
+## D) Native Engine Path
 
 > **Status: BLOCKED** — see `docs/NATIVE_ENGINE_MVP.md` for full context.
 
@@ -233,7 +275,7 @@ The `native_engine` feature flag is off by default because `engine-v2` requires
 
 ---
 
-## D) CI Local Equivalents
+## E) CI Local Equivalents
 
 Run these commands locally to replicate what GitHub Actions checks:
 
@@ -264,7 +306,7 @@ test result: ok. 18 passed; 0 failed
 
 ---
 
-## E) RUST_LOG levels
+## F) RUST_LOG levels
 
 Set `RUST_LOG` to control log verbosity:
 

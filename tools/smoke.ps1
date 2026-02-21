@@ -34,10 +34,11 @@
     Requires: Rust toolchain, FFmpeg in PATH, Python venv with torch/zenoh.
 #>
 param(
-    [string]$InputFile  = "",
-    [string]$Model      = "",
-    [string]$Precision  = "fp32",
-    [int]   $Timeout    = 60
+    [string]$InputFile      = "",
+    [string]$Model          = "",
+    [string]$Precision      = "fp32",
+    [int]   $Timeout        = 60,
+    [bool]  $ShmRoundtrip   = $true
 )
 
 Set-StrictMode -Version Latest
@@ -188,7 +189,27 @@ if ($script:anyFailed) {
     }
 }
 
-# ─── 4. Full pipeline (if input file provided) ────────────────────────────────
+# ─── 4. SHM Roundtrip ────────────────────────────────────────────────────────
+
+Section "SHM Roundtrip (no FFmpeg, no UI)"
+
+if ($script:anyFailed) {
+    Skip "SHM roundtrip" "earlier check failed"
+} elseif ($ShmRoundtrip) {
+    $smokeArgs = @("--shm-roundtrip", "--precision", $Precision, "--timeout", $Timeout)
+    Write-Host "  $smokeExe $($smokeArgs -join ' ')"
+    try {
+        & $smokeExe @smokeArgs
+        if ($LASTEXITCODE -eq 0) { Pass "SHM roundtrip" }
+        else { Fail "SHM roundtrip" "smoke binary exited $LASTEXITCODE" }
+    } catch {
+        Fail "SHM roundtrip" $_.Exception.Message
+    }
+} else {
+    Skip "SHM roundtrip" "skipped by -ShmRoundtrip:`$false"
+}
+
+# ─── 5. Full pipeline (if input file provided) ────────────────────────────────
 
 Section "Full pipeline (Python)"
 
@@ -209,7 +230,7 @@ if (-not $InputFile) {
     Skip "Full pipeline" "manual step — see SMOKE_TESTS.md for full walkthrough"
 }
 
-# ─── 5. Native engine ─────────────────────────────────────────────────────────
+# ─── 6. Native engine ─────────────────────────────────────────────────────────
 
 Section "Native engine"
 
@@ -217,7 +238,7 @@ Write-Host "  Status: BLOCKED — ort ^2.0 not published as stable on crates.io.
 Write-Host "  See docs/NATIVE_ENGINE_MVP.md for resolution steps."
 Skip "Native engine" "feature flag off by default (ort dependency unresolved)"
 
-# ─── 6. Summary ───────────────────────────────────────────────────────────────
+# ─── 7. Summary ───────────────────────────────────────────────────────────────
 
 Write-Host ""
 Write-Host "─────────────────────────────────────────────────────────────────" -ForegroundColor Cyan

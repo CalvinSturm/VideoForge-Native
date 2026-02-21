@@ -20,47 +20,72 @@ use crate::python_env::{
 use crate::video_pipeline;
 use crate::{shm, commands::export::{get_smart_output_path, is_image_file}};
 
-// ─── upscale_request ─────────────────────────────────────────────────────────
+// ─── Public types ─────────────────────────────────────────────────────────────
 
-#[tauri::command]
-pub async fn upscale_request(
-    app: AppHandle,
-    research_state: tauri::State<'_, Arc<Mutex<ResearchConfig>>>,
-    input_path: String,
-    mut output_path: String,
-    model: String,
-    edit_config: EditConfig,
-    scale: u32,
-    #[allow(unused_variables)] precision: Option<String>,
-) -> Result<String, String> {
-    let precision = precision.unwrap_or_else(|| "fp32".to_string());
-    let precision = match precision.as_str() {
-        "fp32" | "fp16" | "deterministic" => precision,
+/// Configuration for a single upscale job (no Tauri types).
+pub struct UpscaleJobConfig {
+    pub python_bin: String,
+    pub script_path: String,
+    pub input_path: String,
+    /// Empty string → auto-generate via get_smart_output_path.
+    pub output_path: String,
+    pub model: String,
+    pub scale: u32,
+    pub precision: String,
+    pub edit_config: EditConfig,
+    /// Shared research params — polled live every 500 ms by the poll task.
+    pub research_config: Arc<Mutex<ResearchConfig>>,
+    /// Seconds to wait for Python handshake (default 60).
+    pub zenoh_timeout_secs: u64,
+}
+
+pub struct UpscaleJobReport {
+    pub output_path: String,
+    pub frames_encoded: u64,
+}
+
+/// Single progress tick emitted during the job.
+pub struct JobProgress {
+    pub pct: u32,
+    pub frame: u64,
+    pub message: String,
+    pub output_path: Option<String>,
+    pub eta_secs: u64,
+}
+
+pub type JobProgressFn = Arc<dyn Fn(JobProgress) + Send + Sync + 'static>;
+
+// ─── run_upscale_job ─────────────────────────────────────────────────────────
+
+pub async fn run_upscale_job(
+    config: UpscaleJobConfig,
+    progress: JobProgressFn,
+) -> Result<UpscaleJobReport, String> {
+    let precision = match config.precision.as_str() {
+        "fp32" | "fp16" | "deterministic" => config.precision.clone(),
         _ => {
             return Err(format!(
                 "Invalid precision mode '{}'. Use fp32, fp16, or deterministic.",
-                precision
+                config.precision
             ))
         }
     };
 
-    if !Path::new(&input_path).exists() {
-        return Err(format!("Input file not found: {}", input_path));
-    }
-
-    let is_img = is_image_file(&input_path);
-    if output_path.trim().is_empty() {
-        output_path = get_smart_output_path(&input_path, !is_img);
-    }
+    let is_img = is_image_file(&config.input_path);
+    let output_path = if config.output_path.trim().is_empty() {
+        get_smart_output_path(&config.input_path, !is_img)
+    } else {
+        config.output_path.clone()
+    };
 
     // Generate a session-scoped job ID for IPC correlation.
     let job_id = ipc::protocol::next_request_id();
 
     tracing::info!(
         job_id = %job_id,
-        input = %input_path,
+        input = %config.input_path,
         output = %output_path,
-        model = %model,
+        model = %config.model,
         precision = %precision,
         is_image = is_img,
         "Upscale request started"
@@ -71,11 +96,11 @@ pub async fn upscale_request(
     let ipc_endpoint = format!("tcp/127.0.0.1:{}", port);
     let zenoh_prefix = format!("videoforge/ipc/{}", port);
 
-    let mut config = Config::default();
-    config
+    let mut zenoh_cfg = Config::default();
+    zenoh_cfg
         .insert_json5("listen/endpoints", &format!("[\"{}\"]", ipc_endpoint))
         .map_err(|e| e.to_string())?;
-    let session = zenoh::open(config)
+    let session = zenoh::open(zenoh_cfg)
         .await
         .map_err(|e: zenoh::Error| e.to_string())?;
 
@@ -89,17 +114,15 @@ pub async fn upscale_request(
         .map_err(|e: zenoh::Error| e.to_string())?;
 
     // ── Spawn Python sidecar ─────────────────────────────────────────────────
-    let (python_bin, script_path) = resolve_python_environment().map_err(|e| e.to_string())?;
-
     tracing::info!(
         job_id = %job_id,
-        python = %python_bin,
-        script = %script_path,
+        python = %config.python_bin,
+        script = %config.script_path,
         "Spawning Python worker"
     );
 
-    let mut cmd = tokio::process::Command::new(&python_bin);
-    cmd.arg(&script_path);
+    let mut cmd = tokio::process::Command::new(&config.python_bin);
+    cmd.arg(&config.script_path);
     cmd.arg("--port").arg(port.to_string());
     cmd.arg("--parent-pid").arg(std::process::id().to_string());
     cmd.arg("--precision").arg(&precision);
@@ -123,18 +146,21 @@ pub async fn upscale_request(
     let mut python_guard = ProcessGuard::new(python_child);
 
     // Wait for Python startup handshake (first message = ready signal).
-    if timeout(Duration::from_secs(60), subscriber.recv_async())
+    if timeout(Duration::from_secs(config.zenoh_timeout_secs), subscriber.recv_async())
         .await
         .is_err()
     {
-        return Err("Python worker handshake timeout (60s)".to_string());
+        return Err(format!(
+            "Python worker handshake timeout ({}s)",
+            config.zenoh_timeout_secs
+        ));
     }
     tracing::info!(job_id = %job_id, "Python worker handshake received");
 
     // ── Load model ───────────────────────────────────────────────────────────
     ipc::put_request(
         &publisher,
-        RequestEnvelope::new("load_model", &job_id, json!({"model_name": model})),
+        RequestEnvelope::new("load_model", &job_id, json!({"model_name": config.model})),
     )
     .await
     .map_err(|e: zenoh::Error| e.to_string())?;
@@ -150,15 +176,15 @@ pub async fn upscale_request(
         tracing::error!(job_id = %job_id, response = %load_data, "Model load failed");
         return Err(format!("Failed to load model: {}", load_data));
     }
-    tracing::info!(job_id = %job_id, model = %model, "Model loaded");
+    tracing::info!(job_id = %job_id, model = %config.model, "Model loaded");
 
     // ── Push initial research config ─────────────────────────────────────────
     {
-        let config = research_state.lock().await;
+        let rc = config.research_config.lock().await;
         let params_req = RequestEnvelope::new(
             "update_research_params",
             &job_id,
-            json!({"params": serde_json::to_value(&*config).unwrap_or_default()}),
+            json!({"params": serde_json::to_value(&*rc).unwrap_or_default()}),
         );
         let _ = ipc::put_request(&publisher, params_req).await;
         let _ = timeout(Duration::from_secs(2), subscriber.recv_async()).await;
@@ -167,7 +193,7 @@ pub async fn upscale_request(
     // ── Image pipeline ───────────────────────────────────────────────────────
     if is_img {
         let research_params = {
-            let guard = research_state.lock().await;
+            let guard = config.research_config.lock().await;
             serde_json::to_value(&*guard).unwrap_or_default()
         };
 
@@ -179,9 +205,9 @@ pub async fn upscale_request(
                 json!({
                     "id": "single_shot",
                     "params": {
-                        "input_path": input_path,
+                        "input_path": config.input_path,
                         "output_path": output_path,
-                        "config": edit_config
+                        "config": config.edit_config
                     },
                     "research_params": research_params
                 }),
@@ -213,14 +239,13 @@ pub async fn upscale_request(
                     "Image upscale progress"
                 );
 
-                let _ = app.emit(
-                    "upscale-progress",
-                    json!({
-                        "jobId": "active",
-                        "progress": pct as u32,
-                        "message": format!("Processing Tile {}/{}", current, total)
-                    }),
-                );
+                progress(JobProgress {
+                    pct: pct as u32,
+                    frame: current,
+                    message: format!("Processing Tile {}/{}", current, total),
+                    output_path: None,
+                    eta_secs: 0,
+                });
             } else if resp["status"] == "ok" {
                 tracing::info!(job_id = %job_id, output = %output_path, "Image upscale complete");
                 break;
@@ -249,23 +274,23 @@ pub async fn upscale_request(
             }
         }
 
-        return Ok(output_path);
+        return Ok(UpscaleJobReport { output_path, frames_encoded: 0 });
     }
 
     // ── Video pipeline ───────────────────────────────────────────────────────
-    let probe_res = video_pipeline::probe_video(&input_path).map_err(|e| e.to_string())?;
+    let probe_res = video_pipeline::probe_video(&config.input_path).map_err(|e| e.to_string())?;
     let (input_w, input_h, duration, fps, _total_frames) = probe_res;
 
-    let (process_w, process_h) = calculate_output_dimensions(&edit_config, input_w, input_h);
-    let start_time = edit_config.trim_start;
-    let end_time = if edit_config.trim_end > 0.0 {
-        edit_config.trim_end
+    let (process_w, process_h) = calculate_output_dimensions(&config.edit_config, input_w, input_h);
+    let start_time = config.edit_config.trim_start;
+    let end_time = if config.edit_config.trim_end > 0.0 {
+        config.edit_config.trim_end
     } else {
         duration
     };
     let process_duration = (end_time - start_time).max(0.1);
     let process_frames = (process_duration * fps).round() as u64;
-    let scale_factor = scale as usize;
+    let scale_factor = config.scale as usize;
 
     tracing::info!(
         job_id = %job_id,
@@ -334,7 +359,7 @@ pub async fn upscale_request(
     }
 
     // Start Python frame polling loop.
-    let research_config_ref = research_state.inner().clone();
+    let research_config_ref = config.research_config.clone();
     {
         let guard = research_config_ref.lock().await;
         ipc::put_request(
@@ -360,13 +385,13 @@ pub async fn upscale_request(
     }
     tracing::info!(job_id = %job_id, "Python frame loop started (SHM atomic polling)");
 
-    let filters = build_ffmpeg_filters(&edit_config, input_w, input_h);
+    let filters = build_ffmpeg_filters(&config.edit_config, input_w, input_h);
 
     // ── Decoder task ─────────────────────────────────────────────────────────
     let decoder_task = async {
         let use_nvdec = video_pipeline::probe_nvdec();
         let mut decoder = video_pipeline::VideoDecoder::new(
-            &input_path,
+            &config.input_path,
             start_time,
             process_duration,
             &filters,
@@ -490,7 +515,7 @@ pub async fn upscale_request(
     };
 
     // ── Encoder task ─────────────────────────────────────────────────────────
-    let target_fps = edit_config.fps;
+    let target_fps = config.edit_config.fps;
     let encoder_task = async {
         let mut encoder = video_pipeline::VideoEncoder::new_with_audio(
             &output_path,
@@ -498,7 +523,7 @@ pub async fn upscale_request(
             target_fps,
             process_w * scale_factor,
             process_h * scale_factor,
-            Some(&input_path),
+            Some(&config.input_path),
             start_time,
             process_duration,
             precision == "deterministic",
@@ -553,15 +578,13 @@ pub async fn upscale_request(
                     "Encode progress"
                 );
 
-                let _ = app.emit(
-                    "upscale-progress",
-                    json!({
-                        "jobId": "active",
-                        "progress": pct,
-                        "message": format!("Processing Frame {}/{}", processed_count, process_frames),
-                        "eta": eta
-                    }),
-                );
+                progress(JobProgress {
+                    pct,
+                    frame: processed_count,
+                    message: format!("Processing Frame {}/{}", processed_count, process_frames),
+                    output_path: None,
+                    eta_secs: eta,
+                });
                 last_emit = Instant::now();
             }
 
@@ -577,23 +600,21 @@ pub async fn upscale_request(
             output = %output_path,
             "Encode complete"
         );
-        let _ = app.emit(
-            "upscale-progress",
-            json!({
-                "jobId": "active",
-                "progress": 100,
-                "message": "Finalizing...",
-                "outputPath": output_path,
-                "eta": 0
-            }),
-        );
-        Ok(())
+        progress(JobProgress {
+            pct: 100,
+            frame: processed_count,
+            message: "Finalizing...".to_string(),
+            output_path: Some(output_path.clone()),
+            eta_secs: 0,
+        });
+        Ok::<u64, String>(processed_count)
     };
 
-    if let Err(e) = tokio::try_join!(decoder_task, poll_task, encoder_task) {
-        tracing::error!(job_id = %job_id, error = %e, "Pipeline task failed");
-        return Err(e);
-    }
+    let (_, _, frames_encoded) = tokio::try_join!(decoder_task, poll_task, encoder_task)
+        .map_err(|e| {
+            tracing::error!(job_id = %job_id, error = %e, "Pipeline task failed");
+            e
+        })?;
 
     // ── Graceful shutdown ────────────────────────────────────────────────────
     let _ = ipc::put_request(
@@ -627,5 +648,55 @@ pub async fn upscale_request(
     }
 
     tracing::info!(job_id = %job_id, output = %output_path, "Upscale request complete");
-    Ok(output_path)
+    Ok(UpscaleJobReport { output_path, frames_encoded })
+}
+
+// ─── upscale_request (thin Tauri wrapper) ────────────────────────────────────
+
+#[tauri::command]
+pub async fn upscale_request(
+    app: AppHandle,
+    research_state: tauri::State<'_, Arc<Mutex<ResearchConfig>>>,
+    input_path: String,
+    output_path: String,
+    model: String,
+    edit_config: EditConfig,
+    scale: u32,
+    #[allow(unused_variables)] precision: Option<String>,
+) -> Result<String, String> {
+    if !Path::new(&input_path).exists() {
+        return Err(format!("Input file not found: {}", input_path));
+    }
+
+    let (python_bin, script_path) = resolve_python_environment().map_err(|e| e.to_string())?;
+
+    let app_clone = app.clone();
+    let progress: JobProgressFn = Arc::new(move |p: JobProgress| {
+        let mut j = json!({
+            "jobId": "active",
+            "progress": p.pct,
+            "message": p.message,
+            "eta": p.eta_secs
+        });
+        if let Some(op) = &p.output_path {
+            j["outputPath"] = json!(op);
+        }
+        let _ = app_clone.emit("upscale-progress", j);
+    });
+
+    let job_config = UpscaleJobConfig {
+        python_bin,
+        script_path,
+        input_path,
+        output_path,
+        model,
+        scale,
+        precision: precision.unwrap_or_else(|| "fp32".to_string()),
+        edit_config,
+        research_config: research_state.inner().clone(),
+        zenoh_timeout_secs: 60,
+    };
+
+    let report = run_upscale_job(job_config, progress).await?;
+    Ok(report.output_path)
 }

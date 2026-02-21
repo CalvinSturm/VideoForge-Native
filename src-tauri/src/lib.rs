@@ -15,11 +15,11 @@ use tokio::time::Duration;
 // --- MODULES ---
 pub mod commands;
 pub mod control;
-mod edit_config;
+pub mod edit_config;
 pub mod ipc;
 mod models;
 pub mod python_env;
-mod shm;
+pub mod shm;
 pub mod spatial_map;
 pub mod spatial_publisher;
 mod video_pipeline;

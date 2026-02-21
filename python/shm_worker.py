@@ -1450,8 +1450,12 @@ class AIWorker:
                 self.create_shm(p)
             elif cmd == "process_frame":
                 self.process_frame(payload)
+            elif cmd == "process_one_frame":
+                p = env.payload if isinstance(env.payload, dict) else {}
+                self.process_one_frame(p)
             elif cmd == "start_frame_loop":
-                self.start_frame_loop(payload)
+                p = env.payload if isinstance(env.payload, dict) else {}
+                self.start_frame_loop(p)
             elif cmd == "stop_frame_loop":
                 self.stop_frame_loop(payload)
             elif cmd == "load_model":
@@ -2107,6 +2111,41 @@ class AIWorker:
             traceback.print_exc()
             self.send_status("error", {"message": str(e)})
 
+    def process_one_frame(self, payload: Dict) -> None:
+        """Single-frame SHM roundtrip used by the smoke test.
+
+        Handles full state transition: READY_FOR_AI → AI_PROCESSING → READY_FOR_ENCODE.
+        Works with scale=1 (passthrough) even without a model loaded, so the smoke
+        test has no model-weight dependency.
+        """
+        if not self.is_configured:
+            self.send_status("error", {"message": "Not configured: send create_shm first"})
+            return
+        if self.model is None and self.active_scale != 1:
+            self.send_status("error", {"message": "No model loaded for scale != 1"})
+            return
+
+        # Find first READY_FOR_AI slot
+        slot_idx = None
+        for i in range(self.ring_size):
+            if self._read_slot_state(i) == Config.SLOT_READY_FOR_AI:
+                slot_idx = i
+                break
+        if slot_idx is None:
+            self.send_status("error", {"message": "No slot in READY_FOR_AI state"})
+            return
+
+        self._write_slot_state(slot_idx, Config.SLOT_AI_PROCESSING)
+        try:
+            self._process_slot(slot_idx)
+        except Exception as e:
+            traceback.print_exc()
+            self._write_slot_state(slot_idx, Config.SLOT_EMPTY)
+            self.send_status("error", {"message": str(e)})
+            return
+        self._write_slot_state(slot_idx, Config.SLOT_READY_FOR_ENCODE)
+        self.send_status("FRAME_DONE", {"slot": slot_idx})
+
     # -------------------------------------------------------------------------
     # SHM ATOMIC FRAME LOOP (replaces per-frame Zenoh signaling)
     # -------------------------------------------------------------------------
@@ -2318,6 +2357,10 @@ class AIWorker:
                 except Exception as e:
                     print(f"[Python Error] Batch processing failed: {e}", flush=True)
                     traceback.print_exc()
+                    for idx in batch:
+                        self._write_slot_state(idx, Config.SLOT_EMPTY)
+                    next_slot = (batch[-1] + 1) % self.ring_size
+                    continue     # skip READY_FOR_ENCODE transition
 
                 # Transition all batch slots: AI_PROCESSING → READY_FOR_ENCODE
                 for idx in batch:

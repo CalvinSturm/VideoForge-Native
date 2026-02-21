@@ -16,6 +16,14 @@
 //!                      If omitted, the model-load check is skipped.
 //! --precision <mode>   fp32 | fp16 | deterministic  (default: fp32)
 //! --timeout <secs>     Zenoh handshake timeout in seconds  (default: 60)
+//! --shm-roundtrip      Run the SHM roundtrip check
+//! --e2e-python         Run the full FFmpeg E2E pipeline check
+//! --input <path>       Input file for E2E check
+//! --output <path>      Output file for E2E check (optional, auto-generated)
+//! --e2e-model <name>   Model name for E2E check (default: RCAN_x4)
+//! --e2e-scale <n>      Scale factor for E2E check (default: 1)
+//! --timeout-ms <N>     E2E job timeout in milliseconds (default: 600000)
+//! --keep-temp          Keep E2E output file instead of deleting it
 //! ```
 //!
 //! # Exit codes
@@ -89,6 +97,39 @@ fn check_python_env() -> Option<(String, String)> {
             None
         }
     }
+}
+
+// ─── ffprobe helpers ─────────────────────────────────────────────────────────
+
+/// Returns (width, height) of first video stream or None on failure.
+fn ffprobe_dims(path: &str) -> Option<(usize, usize)> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8(out.stdout).ok()?;
+    let mut it = s.lines();
+    Some((it.next()?.trim().parse().ok()?, it.next()?.trim().parse().ok()?))
+}
+
+/// Returns duration in seconds of the file or None on failure.
+fn ffprobe_duration(path: &str) -> Option<f64> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
 }
 
 // ─── Zenoh handshake + optional model load ───────────────────────────────────
@@ -233,12 +274,425 @@ async fn shutdown_python(
     }
 }
 
+// ─── SHM Roundtrip ───────────────────────────────────────────────────────────
+
+async fn check_shm_roundtrip(
+    python_bin: &str,
+    script_path: &str,
+    precision: &str,
+    handshake_timeout_secs: u64,
+    width: u32,
+    height: u32,
+    scale: u32,
+    roundtrip_timeout_ms: u64,
+) -> bool {
+    use app_lib::shm::{VideoShm, RING_SIZE, SLOT_READY_FOR_AI};
+
+    let port = get_free_port();
+    let ipc_endpoint = format!("tcp/127.0.0.1:{}", port);
+    let zenoh_prefix = format!("videoforge/ipc/{}", port);
+
+    // ── Open Zenoh listener ──────────────────────────────────────────────────
+    let mut config = ZenohConfig::default();
+    if config
+        .insert_json5("listen/endpoints", &format!("[\"{}\"]", ipc_endpoint))
+        .is_err()
+    {
+        return check("Zenoh listener", false, "failed to configure endpoint");
+    }
+    let session = match zenoh::open(config).await {
+        Ok(s) => s,
+        Err(e) => return check("Zenoh listener", false, &e.to_string()),
+    };
+    let publisher = match session
+        .declare_publisher(format!("{}/req", zenoh_prefix))
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return check("Zenoh publisher", false, &e.to_string()),
+    };
+    let subscriber = match session
+        .declare_subscriber(format!("{}/res", zenoh_prefix))
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => return check("Zenoh subscriber", false, &e.to_string()),
+    };
+    check("Zenoh listener", true, "");
+
+    // ── Spawn Python (stderr visible so exceptions surface) ──────────────────
+    let mut cmd = tokio::process::Command::new(python_bin);
+    cmd.arg(script_path);
+    cmd.arg("--port").arg(port.to_string());
+    cmd.arg("--parent-pid").arg(std::process::id().to_string());
+    cmd.arg("--precision").arg(precision);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::inherit());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let python_child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return check("Python spawn", false, &e.to_string()),
+    };
+    if let Some(pid) = python_child.id() {
+        PYTHON_PIDS.lock().unwrap().insert(pid);
+    }
+    let mut guard = ProcessGuard::new(python_child);
+    check("Python spawn", true, "");
+
+    // ── Handshake ────────────────────────────────────────────────────────────
+    let handshake_ok = timeout(
+        Duration::from_secs(handshake_timeout_secs),
+        subscriber.recv_async(),
+    )
+    .await
+    .is_ok();
+    if !check(
+        "Python Zenoh handshake",
+        handshake_ok,
+        &format!("no message received within {}s", handshake_timeout_secs),
+    ) {
+        shutdown_python(&publisher, &mut guard).await;
+        return false;
+    }
+
+    // ── create_shm ───────────────────────────────────────────────────────────
+    let job_id = app_lib::ipc::protocol::next_request_id();
+    if let Err(e) = ipc::put_request(
+        &publisher,
+        RequestEnvelope::new(
+            "create_shm",
+            &job_id,
+            json!({
+                "width": width,
+                "height": height,
+                "scale": scale,
+                "ring_size": RING_SIZE
+            }),
+        ),
+    )
+    .await
+    {
+        check("SHM create send", false, &e.to_string());
+        shutdown_python(&publisher, &mut guard).await;
+        return false;
+    }
+
+    // Wait for SHM_CREATED
+    let shm_path = match timeout(Duration::from_secs(10), subscriber.recv_async()).await {
+        Err(_) => {
+            check(
+                "SHM created",
+                false,
+                "SHM_CREATE_TIMEOUT: no response within 10s",
+            );
+            shutdown_python(&publisher, &mut guard).await;
+            return false;
+        }
+        Ok(Err(e)) => {
+            check("SHM created", false, &e.to_string());
+            shutdown_python(&publisher, &mut guard).await;
+            return false;
+        }
+        Ok(Ok(msg)) => {
+            let raw =
+                String::from_utf8_lossy(&msg.payload().to_bytes()).to_string();
+            let v: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    check("SHM created", false, &format!("JSON parse error: {}", e));
+                    shutdown_python(&publisher, &mut guard).await;
+                    return false;
+                }
+            };
+            if v["status"].as_str() != Some("SHM_CREATED") {
+                check(
+                    "SHM created",
+                    false,
+                    &format!(
+                        "SHM_CREATE_FAILED: status={}",
+                        v["status"].as_str().unwrap_or("<missing>")
+                    ),
+                );
+                shutdown_python(&publisher, &mut guard).await;
+                return false;
+            }
+            match v["shm_path"].as_str() {
+                Some(p) => p.to_string(),
+                None => {
+                    check("SHM created", false, "SHM_CREATE_FAILED: missing shm_path field");
+                    shutdown_python(&publisher, &mut guard).await;
+                    return false;
+                }
+            }
+        }
+    };
+    check("SHM created", true, &format!("path: {}", shm_path));
+
+    // ── Open SHM ─────────────────────────────────────────────────────────────
+    let mut shm = match VideoShm::open(
+        &shm_path,
+        width as usize,
+        height as usize,
+        scale as usize,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            check(
+                "SHM header validated",
+                false,
+                &format!("SHM_OPEN_FAILED: {}", e),
+            );
+            shutdown_python(&publisher, &mut guard).await;
+            return false;
+        }
+    };
+    check("SHM header validated", true, "");
+
+    // ── Write synthetic frame ─────────────────────────────────────────────────
+    shm.reset_all_slots();
+    {
+        let input = shm.input_slot_mut(0).expect("slot 0 in bounds");
+        for (i, b) in input.iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+    }
+    shm.set_slot_frame_bytes(0, (width * height * 3) as u32);
+    shm.set_slot_write_index(0, 1);
+    shm.set_slot_state(0, SLOT_READY_FOR_AI);
+    check("Synthetic frame written \u{2192} SLOT_READY_FOR_AI", true, "");
+
+    // ── process_one_frame ─────────────────────────────────────────────────────
+    let job_id2 = app_lib::ipc::protocol::next_request_id();
+    if let Err(e) = ipc::put_request(
+        &publisher,
+        RequestEnvelope::new("process_one_frame", &job_id2, json!({})),
+    )
+    .await
+    {
+        check("process_one_frame sent", false, &e.to_string());
+        shutdown_python(&publisher, &mut guard).await;
+        return false;
+    }
+    check("process_one_frame sent", true, "");
+
+    // Wait for FRAME_DONE
+    let frame_ok = match timeout(
+        Duration::from_millis(roundtrip_timeout_ms),
+        subscriber.recv_async(),
+    )
+    .await
+    {
+        Err(_) => {
+            check(
+                "FRAME_DONE received",
+                false,
+                &format!(
+                    "FRAME_DONE_TIMEOUT: no response within {}ms",
+                    roundtrip_timeout_ms
+                ),
+            );
+            shutdown_python(&publisher, &mut guard).await;
+            return false;
+        }
+        Ok(Err(e)) => {
+            check("FRAME_DONE received", false, &e.to_string());
+            shutdown_python(&publisher, &mut guard).await;
+            return false;
+        }
+        Ok(Ok(msg)) => {
+            let raw =
+                String::from_utf8_lossy(&msg.payload().to_bytes()).to_string();
+            let v: serde_json::Value =
+                serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+            v["status"].as_str() == Some("FRAME_DONE")
+        }
+    };
+    if !check("FRAME_DONE received", frame_ok, "unexpected status in response") {
+        shutdown_python(&publisher, &mut guard).await;
+        return false;
+    }
+
+    // ── Validate output ───────────────────────────────────────────────────────
+    let expected_len = (width * scale * height * scale * 3) as usize;
+    let output_ok = match shm.output_slot(0) {
+        Err(e) => {
+            check("Output validated", false, &format!("SHM_OPEN_FAILED: {}", e));
+            shutdown_python(&publisher, &mut guard).await;
+            return false;
+        }
+        Ok(output) => {
+            if output.len() != expected_len {
+                check(
+                    "Output validated",
+                    false,
+                    &format!(
+                        "OUTPUT_SIZE_MISMATCH: expected {} bytes, got {}",
+                        expected_len,
+                        output.len()
+                    ),
+                );
+                shutdown_python(&publisher, &mut guard).await;
+                return false;
+            }
+            if output.iter().all(|&b| b == 0) {
+                check(
+                    "Output validated",
+                    false,
+                    "OUTPUT_ALL_ZEROS: output slot is all zeros",
+                );
+                shutdown_python(&publisher, &mut guard).await;
+                return false;
+            }
+            true
+        }
+    };
+    check(
+        &format!("Output validated ({} bytes, non-zero)", expected_len),
+        output_ok,
+        "",
+    );
+
+    // ── Graceful shutdown ─────────────────────────────────────────────────────
+    shutdown_python(&publisher, &mut guard).await;
+    true
+}
+
+// ─── Python E2E (FFmpeg path) ─────────────────────────────────────────────────
+
+async fn check_e2e_python(
+    python_bin: &str,
+    script_path: &str,
+    input_path: &str,
+    output_path: Option<&str>,
+    model: &str,
+    scale: u32,
+    precision: &str,
+    timeout_ms: u64,
+    keep_temp: bool,
+) -> bool {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use app_lib::commands::upscale::{run_upscale_job, JobProgress, JobProgressFn, UpscaleJobConfig};
+    use app_lib::control::ResearchConfig;
+    use app_lib::edit_config::EditConfig;
+
+    // A) Input prereq checks
+    if !std::path::Path::new(input_path).exists() {
+        return check("Input file exists", false,
+            &format!("E2E_INPUT_NOT_FOUND: {}", input_path));
+    }
+    check("Input file exists", true, "");
+
+    let (in_w, in_h) = match ffprobe_dims(input_path) {
+        Some(d) => { check(&format!("Probe input ({}×{})", d.0, d.1), true, ""); d }
+        None => return check("Probe input", false, "E2E_FFPROBE_PROBE: ffprobe failed"),
+    };
+
+    // B) Build config
+    let research_config = Arc::new(Mutex::new(ResearchConfig::default()));
+    let out = output_path.unwrap_or("").to_string();
+    let config = UpscaleJobConfig {
+        python_bin: python_bin.to_string(),
+        script_path: script_path.to_string(),
+        input_path: input_path.to_string(),
+        output_path: out,
+        model: model.to_string(),
+        scale,
+        precision: precision.to_string(),
+        edit_config: EditConfig::default(),
+        research_config,
+        zenoh_timeout_secs: (timeout_ms / 1000).max(60),
+    };
+
+    // C) Progress callback
+    let last_pct = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let last_pct_clone = last_pct.clone();
+    let progress: JobProgressFn = Arc::new(move |p: JobProgress| {
+        let prev = last_pct_clone.swap(p.pct, std::sync::atomic::Ordering::Relaxed);
+        if p.pct >= 100 || p.pct / 10 > prev / 10 {
+            println!("  [progress] {}% frame={} {}", p.pct, p.frame, p.message);
+        }
+        if let Some(op) = &p.output_path {
+            println!("  → output: {}", op);
+        }
+    });
+
+    // D) Run job with timeout
+    let result = tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        run_upscale_job(config, progress),
+    ).await;
+
+    let report = match result {
+        Err(_) => return check("Job completed", false,
+            &format!("E2E_TIMEOUT: exceeded {}ms", timeout_ms)),
+        Ok(Err(e)) => return check("Job completed", false, &e),
+        Ok(Ok(r)) => r,
+    };
+    check("Job completed", true, "");
+    let actual_out = &report.output_path;
+
+    // E) Validate output
+    let size = std::fs::metadata(actual_out)
+        .map(|m| m.len()).unwrap_or(0);
+    if size < 4096 {
+        return check("Output file size", false,
+            &format!("E2E_OUTPUT_MISSING: {} bytes at {}", size, actual_out));
+    }
+    check("Output file size", true, &format!("> 4 KB ({} bytes)", size));
+
+    let (out_w, out_h) = match ffprobe_dims(actual_out) {
+        Some(d) => d,
+        None => return check("Output dimensions", false, "E2E_FFPROBE_VALIDATE"),
+    };
+    let exp_w = in_w * scale as usize;
+    let exp_h = in_h * scale as usize;
+    if out_w != exp_w || out_h != exp_h {
+        return check("Output dimensions", false,
+            &format!("E2E_DIM_MISMATCH: expected {}×{}, got {}×{}", exp_w, exp_h, out_w, out_h));
+    }
+    check(&format!("Output dimensions ({}×{})", out_w, out_h), true, "");
+
+    let dur = ffprobe_duration(actual_out).unwrap_or(0.0);
+    if dur <= 0.0 {
+        return check("Output duration", false, "E2E_ZERO_DURATION");
+    }
+    check(&format!("Output duration ({:.2}s > 0)", dur), true, "");
+
+    // F) Cleanup
+    if !keep_temp {
+        let _ = std::fs::remove_file(actual_out);
+    } else {
+        println!("  → kept: {}", actual_out);
+    }
+
+    true
+}
+
 // ─── Argument parsing ────────────────────────────────────────────────────────
 
 struct Args {
     model: Option<String>,
     precision: String,
     timeout_secs: u64,
+    shm_roundtrip: bool,
+    shm_width: u32,
+    shm_height: u32,
+    shm_scale: u32,
+    roundtrip_timeout_ms: u64,
+    // E2E Python mode
+    e2e_python: bool,
+    e2e_input: Option<String>,
+    e2e_output: Option<String>,
+    e2e_model: String,
+    e2e_scale: u32,
+    e2e_timeout_ms: u64,
+    keep_temp: bool,
 }
 
 fn parse_args() -> Args {
@@ -246,6 +700,18 @@ fn parse_args() -> Args {
     let mut model = None;
     let mut precision = "fp32".to_string();
     let mut timeout_secs = 60u64;
+    let mut shm_roundtrip = false;
+    let mut shm_width = 8u32;
+    let mut shm_height = 8u32;
+    let mut shm_scale = 1u32;
+    let mut roundtrip_timeout_ms = 5000u64;
+    let mut e2e_python = false;
+    let mut e2e_input: Option<String> = None;
+    let mut e2e_output: Option<String> = None;
+    let mut e2e_model = "RCAN_x4".to_string();
+    let mut e2e_scale = 1u32;
+    let mut e2e_timeout_ms = 600_000u64;
+    let mut keep_temp = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -262,10 +728,76 @@ fn parse_args() -> Args {
                     timeout_secs = t.parse().unwrap_or(60);
                 }
             }
+            "--shm-roundtrip" => {
+                shm_roundtrip = true;
+            }
+            "--width" => {
+                if let Some(w) = args.next() {
+                    shm_width = w.parse().unwrap_or(8);
+                }
+            }
+            "--height" => {
+                if let Some(h) = args.next() {
+                    shm_height = h.parse().unwrap_or(8);
+                }
+            }
+            "--scale" => {
+                if let Some(s) = args.next() {
+                    shm_scale = s.parse().unwrap_or(1);
+                }
+            }
+            "--roundtrip-timeout-ms" => {
+                if let Some(t) = args.next() {
+                    roundtrip_timeout_ms = t.parse().unwrap_or(5000);
+                }
+            }
+            "--e2e-python" => {
+                e2e_python = true;
+            }
+            "--input" => {
+                e2e_input = args.next();
+            }
+            "--output" => {
+                e2e_output = args.next();
+            }
+            "--e2e-model" => {
+                if let Some(m) = args.next() {
+                    e2e_model = m;
+                }
+            }
+            "--e2e-scale" => {
+                if let Some(s) = args.next() {
+                    e2e_scale = s.parse().unwrap_or(1);
+                }
+            }
+            "--timeout-ms" => {
+                if let Some(t) = args.next() {
+                    e2e_timeout_ms = t.parse().unwrap_or(600_000);
+                }
+            }
+            "--keep-temp" => {
+                keep_temp = true;
+            }
             _ => {}
         }
     }
-    Args { model, precision, timeout_secs }
+    Args {
+        model,
+        precision,
+        timeout_secs,
+        shm_roundtrip,
+        shm_width,
+        shm_height,
+        shm_scale,
+        roundtrip_timeout_ms,
+        e2e_python,
+        e2e_input,
+        e2e_output,
+        e2e_model,
+        e2e_scale,
+        e2e_timeout_ms,
+        keep_temp,
+    }
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -308,6 +840,41 @@ async fn main() {
         )
         .await;
         all_passed &= ipc_ok;
+
+        if args.shm_roundtrip {
+            println!();
+            println!("── SHM Roundtrip ─────────────────────────────────────────────");
+            let ok = check_shm_roundtrip(
+                &python_bin,
+                &script_path,
+                &args.precision,
+                args.timeout_secs,
+                args.shm_width,
+                args.shm_height,
+                args.shm_scale,
+                args.roundtrip_timeout_ms,
+            )
+            .await;
+            all_passed &= ok;
+        }
+
+        if args.e2e_python {
+            println!();
+            println!("── Python E2E (FFmpeg path) ──────────────────────────────────");
+            let ok = check_e2e_python(
+                &python_bin,
+                &script_path,
+                args.e2e_input.as_deref().unwrap_or(""),
+                args.e2e_output.as_deref(),
+                &args.e2e_model,
+                args.e2e_scale,
+                &args.precision,
+                args.e2e_timeout_ms,
+                args.keep_temp,
+            )
+            .await;
+            all_passed &= ok;
+        }
     }
 
     // 4. Native engine status
