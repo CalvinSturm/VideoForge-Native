@@ -502,56 +502,58 @@ unsafe extern "C" fn sequence_callback(
     user_data: *mut c_void,
     format: *mut CUVIDEOFORMAT,
 ) -> c_int {
-    let state = &mut *(user_data as *mut CallbackState);
-    let fmt = &*format;
+    unsafe {
+        let state = &mut *(user_data as *mut CallbackState);
+        let fmt = &*format;
 
-    state.format = Some(*fmt);
+        state.format = Some(*fmt);
 
-    // Determine required decode surfaces.
-    let num_surfaces = (fmt.min_num_decode_surfaces as u32).max(8);
-    state.max_decode_surfaces = num_surfaces;
+        // Determine required decode surfaces.
+        let num_surfaces = (fmt.min_num_decode_surfaces as u32).max(8);
+        state.max_decode_surfaces = num_surfaces;
 
-    // Destroy existing decoder if resolution changed.
-    if state.decoder_created && !state.decoder.is_null() {
-        cuvidDestroyDecoder(state.decoder);
-        state.decoder = ptr::null_mut();
-        state.decoder_created = false;
+        // Destroy existing decoder if resolution changed.
+        if state.decoder_created && !state.decoder.is_null() {
+            cuvidDestroyDecoder(state.decoder);
+            state.decoder = ptr::null_mut();
+            state.decoder_created = false;
+        }
+
+        // Create decoder.
+        let mut create_info: CUVIDDECODECREATEINFO = std::mem::zeroed();
+        create_info.ulWidth = fmt.coded_width as c_ulong;
+        create_info.ulHeight = fmt.coded_height as c_ulong;
+        create_info.ulNumDecodeSurfaces = num_surfaces as c_ulong;
+        create_info.CodecType = state.codec;
+        create_info.ChromaFormat = fmt.chroma_format;
+        create_info.ulCreationFlags = cudaVideoCreateFlags::PreferCUVID as c_ulong;
+        create_info.bitDepthMinus8 = fmt.bit_depth_luma_minus8 as c_ulong;
+        create_info.ulIntraDecodeOnly = 0;
+        create_info.ulMaxWidth = fmt.coded_width as c_ulong;
+        create_info.ulMaxHeight = fmt.coded_height as c_ulong;
+        create_info.display_area = CUVIDDECODECREATEINFO_display_area {
+            left: 0,
+            top: 0,
+            right: fmt.coded_width as c_short,
+            bottom: fmt.coded_height as c_short,
+        };
+        create_info.OutputFormat = cudaVideoSurfaceFormat::NV12;
+        create_info.DeinterlaceMode = cudaVideoDeinterlaceMode::Adaptive;
+        create_info.ulTargetWidth = fmt.coded_width as c_ulong;
+        create_info.ulTargetHeight = fmt.coded_height as c_ulong;
+        create_info.ulNumOutputSurfaces = 2;
+
+        let result = cuvidCreateDecoder(&mut state.decoder, &mut create_info);
+        if result != CUDA_SUCCESS {
+            // Return 0 to signal failure to the parser.
+            return 0;
+        }
+
+        state.decoder_created = true;
+
+        // Return the number of decode surfaces to indicate success.
+        num_surfaces as c_int
     }
-
-    // Create decoder.
-    let mut create_info: CUVIDDECODECREATEINFO = std::mem::zeroed();
-    create_info.ulWidth = fmt.coded_width as c_ulong;
-    create_info.ulHeight = fmt.coded_height as c_ulong;
-    create_info.ulNumDecodeSurfaces = num_surfaces as c_ulong;
-    create_info.CodecType = state.codec;
-    create_info.ChromaFormat = fmt.chroma_format;
-    create_info.ulCreationFlags = cudaVideoCreateFlags::PreferCUVID as c_ulong;
-    create_info.bitDepthMinus8 = fmt.bit_depth_luma_minus8 as c_ulong;
-    create_info.ulIntraDecodeOnly = 0;
-    create_info.ulMaxWidth = fmt.coded_width as c_ulong;
-    create_info.ulMaxHeight = fmt.coded_height as c_ulong;
-    create_info.display_area = CUVIDDECODECREATEINFO_display_area {
-        left: 0,
-        top: 0,
-        right: fmt.coded_width as c_short,
-        bottom: fmt.coded_height as c_short,
-    };
-    create_info.OutputFormat = cudaVideoSurfaceFormat::NV12;
-    create_info.DeinterlaceMode = cudaVideoDeinterlaceMode::Adaptive;
-    create_info.ulTargetWidth = fmt.coded_width as c_ulong;
-    create_info.ulTargetHeight = fmt.coded_height as c_ulong;
-    create_info.ulNumOutputSurfaces = 2;
-
-    let result = cuvidCreateDecoder(&mut state.decoder, &mut create_info);
-    if result != CUDA_SUCCESS {
-        // Return 0 to signal failure to the parser.
-        return 0;
-    }
-
-    state.decoder_created = true;
-
-    // Return the number of decode surfaces to indicate success.
-    num_surfaces as c_int
 }
 
 /// Called when a picture has been decoded — enqueue for GPU processing.
@@ -559,18 +561,20 @@ unsafe extern "C" fn decode_callback(
     user_data: *mut c_void,
     pic_params: *mut CUVIDPICPARAMS,
 ) -> c_int {
-    let state = &mut *(user_data as *mut CallbackState);
+    unsafe {
+        let state = &mut *(user_data as *mut CallbackState);
 
-    if !state.decoder_created || state.decoder.is_null() {
-        return 0;
+        if !state.decoder_created || state.decoder.is_null() {
+            return 0;
+        }
+
+        let result = cuvidDecodePicture(state.decoder, pic_params);
+        if result != CUDA_SUCCESS {
+            return 0;
+        }
+
+        1 // Success.
     }
-
-    let result = cuvidDecodePicture(state.decoder, pic_params);
-    if result != CUDA_SUCCESS {
-        return 0;
-    }
-
-    1 // Success.
 }
 
 /// Called when a decoded picture is ready for display (reordered).
@@ -578,16 +582,18 @@ unsafe extern "C" fn display_callback(
     user_data: *mut c_void,
     disp_info: *mut CUVIDPARSERDISPINFO,
 ) -> c_int {
-    let state = &mut *(user_data as *mut CallbackState);
+    unsafe {
+        let state = &mut *(user_data as *mut CallbackState);
 
-    if disp_info.is_null() {
-        // Null means EOS from parser.
-        return 1;
+        if disp_info.is_null() {
+            // Null means EOS from parser.
+            return 1;
+        }
+
+        state.pending_display.push_back(*disp_info);
+
+        1 // Success.
     }
-
-    state.pending_display.push_back(*disp_info);
-
-    1 // Success.
 }
 
 // ─── Raw stream handle extraction ────────────────────────────────────────

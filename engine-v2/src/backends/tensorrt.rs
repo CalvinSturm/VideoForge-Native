@@ -291,7 +291,7 @@ impl OutputRing {
         }
 
         // Free old slots — decrement VRAM accounting.
-        for slot in &self.slots {
+        for _ in &self.slots {
             ctx.vram_dec(self.slot_bytes);
         }
 
@@ -503,7 +503,7 @@ impl TensorRtBackend {
     ///
     /// ORT may silently fall back to CPU EP if a graph node is unsupported
     /// by TensorRT.  This check makes that failure explicit.
-    fn validate_providers(session: &Session) -> Result<()> {
+    fn validate_providers(_session: &Session) -> Result<()> {
         // Session was created with ONLY TensorRT EP — no CUDA EP, no CPU EP.
         // If TensorRT cannot handle a node and no fallback is available, ORT
         // returns an error during session creation.

@@ -919,8 +919,10 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
   const isAIActive = upscaleConfig.isEnabled;
   const modelFamily = extractFamily(upscaleConfig.primaryModelId);
   const upscaleFactor = upscaleConfig.scaleFactor;
+  const useNativeEngine = upscaleConfig.useNativeEngine;
 
   const setIsAIActive = (enabled: boolean) => setUpscaleConfig({ isEnabled: enabled });
+  const setUseNativeEngine = (enabled: boolean) => setUpscaleConfig({ useNativeEngine: enabled });
 
   // Local UI state (not persisted)
   const [toastState, setToastState] = useState<{ msg: string; visible: boolean }>({ msg: '', visible: false });
@@ -1302,6 +1304,59 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
                   boxShadow: '0 1px 2px rgba(0,0,0,0.3)'
                 }} />
               </div>
+
+              {/* Engine selector — only visible when AI is active */}
+              {isAIActive && (
+                <>
+                  <div style={{ width: '1px', height: '14px', background: 'rgba(255,255,255,0.12)', margin: '0 2px' }} />
+                  <span style={{
+                    fontSize: '9px',
+                    color: useNativeEngine ? '#fbbf24' : 'var(--text-muted)',
+                    fontWeight: 700,
+                    letterSpacing: '0.05em'
+                  }}>
+                    {useNativeEngine ? 'NATIVE' : 'PYTHON'}
+                  </span>
+                  <div
+                    role="switch"
+                    aria-checked={useNativeEngine}
+                    aria-label="Toggle Native Engine"
+                    tabIndex={0}
+                    onClick={(e) => { e.stopPropagation(); setUseNativeEngine(!useNativeEngine); }}
+                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); setUseNativeEngine(!useNativeEngine); } }}
+                    style={{
+                      width: '36px',
+                      height: '20px',
+                      borderRadius: '10px',
+                      background: useNativeEngine
+                        ? 'linear-gradient(135deg, #fbbf24, rgba(251,191,36,0.7))'
+                        : 'rgba(255,255,255,0.08)',
+                      border: useNativeEngine
+                        ? '1px solid #fbbf24'
+                        : '1px solid rgba(255,255,255,0.1)',
+                      position: 'relative',
+                      cursor: 'pointer',
+                      transition: 'all 0.2s ease',
+                      boxShadow: useNativeEngine
+                        ? '0 2px 8px rgba(251,191,36,0.3)'
+                        : 'inset 0 1px 3px rgba(0,0,0,0.3)',
+                      outline: 'none'
+                    }}
+                  >
+                    <div style={{
+                      width: '16px',
+                      height: '16px',
+                      borderRadius: '50%',
+                      background: '#fff',
+                      position: 'absolute',
+                      top: '1px',
+                      left: useNativeEngine ? '17px' : '1px',
+                      transition: 'left 0.2s cubic-bezier(0.4, 0.0, 0.2, 1)',
+                      boxShadow: '0 1px 2px rgba(0,0,0,0.3)'
+                    }} />
+                  </div>
+                </>
+              )}
             </div>
           }
         >

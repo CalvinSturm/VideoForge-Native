@@ -859,10 +859,7 @@ async fn preprocess_stage(
     metrics: &PipelineMetrics,
     profiler_ctx: Option<&GpuContext>,
 ) -> Result<()> {
-    let mut preprocess = PreprocessPipeline::new(
-        PreprocessKernels::compile(ctx.device())?,
-        precision,
-    );
+    let mut preprocess = PreprocessPipeline::new(kernels.clone(), precision);
 
     loop {
         let frame = tokio::select! {
@@ -960,10 +957,7 @@ async fn inference_stage<B: UpscaleBackend>(
     metrics: &PipelineMetrics,
     profiler_ctx: Option<&GpuContext>,
 ) -> Result<()> {
-    let preprocess = PreprocessPipeline::new(
-        PreprocessKernels::compile(ctx.device())?,
-        precision,
-    );
+    let preprocess = PreprocessPipeline::new(kernels.clone(), precision);
 
     loop {
         if cancel.is_cancelled() {

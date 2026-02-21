@@ -1584,3 +1584,86 @@ def reset_temporal() -> None:
     """Clear all temporal EMA buffers (call on seek, new video, etc.)."""
     clear_temporal_buffers()
     print("[ModelManager] Temporal buffers cleared", flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DETERMINISTIC MODEL LOADER (Moved from shm_worker.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ModelLoader:
+    """
+    Deterministic model loader with explicit architecture verification.
+
+    Guarantees:
+    - strict=True for state dict loading (no silent partial loads)
+    - Scale verified from weight tensor shapes (no filename parsing)
+    - EDSR fallback if RCAN unavailable
+    - FP32 default, FP16 only if explicitly requested
+    """
+
+    def __init__(self, precision: str = "fp32"):
+        self.precision = precision
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model: Optional[torch.nn.Module] = None
+        self.model_name: Optional[str] = None
+        self.model_scale: int = 4
+        # Some models were trained on BGR, others on RGB
+        # Set True if model expects RGB input (standard), False for BGR
+        self.expects_rgb: bool = True
+
+        # Log precision mode
+        if precision == "fp16":
+            print("[Python WARNING] FP16 mode enabled - determinism not guaranteed across hardware", flush=True)
+
+    def load(self, model_identifier: str) -> Tuple[torch.nn.Module, int]:
+        """
+        Load any model by identifier.
+
+        Uses model_manager._load_module() as the single universal loader.
+        It handles:
+          - Full model objects (torch.save(model, path))
+          - State-dict checkpoints via spandrel (30+ architectures)
+          - Legacy RCAN / EDSR builders as fallback
+        Also creates an architecture adapter for proper pre/post processing
+        (window padding for transformers, output clamping, etc.)
+        """
+        print(f"[Python] Loading model: '{model_identifier}'", flush=True)
+
+        # Use the internal loader
+        model, scale = _load_module(model_identifier)
+        model = self._prepare_model(model)
+
+        # Create adapter for proper pre/post processing during inference
+        self.adapter = create_adapter(model_identifier, model, scale, self.device)
+
+        self.model = model
+        self.model_name = model_identifier
+        self.model_scale = scale
+        self.expects_rgb = True
+
+        return model, scale
+
+    def _prepare_model(self, model: torch.nn.Module) -> torch.nn.Module:
+        """
+        Prepare model for deterministic inference.
+
+        CRITICAL: This method ensures determinism by:
+        1. Setting eval() mode (disables dropout, uses running stats for BN)
+        2. Moving to correct device
+        3. Applying precision settings
+        """
+        # CRITICAL: Set eval mode - disables any training-time randomness
+        model.eval()
+
+        # Move to device
+        model = model.to(self.device)
+
+        # Apply precision
+        if self.precision == "fp16" and self.device.type == "cuda":
+            model = model.half()
+
+        # Ensure all parameters are not tracking gradients
+        for param in model.parameters():
+            param.requires_grad = False
+
+        return model

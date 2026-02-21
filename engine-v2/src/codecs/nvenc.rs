@@ -163,7 +163,7 @@ impl NvEncoder {
         open_params.version = nvenc_struct_version(1);
         open_params.deviceType = NV_ENC_DEVICE_TYPE::CUDA;
         open_params.device = cuda_context;
-        open_params.apiVersion = (NVENCAPI_MAJOR_VERSION << 4) | NVENCAPI_MINOR_VERSION;
+        open_params.apiVersion = NVENCAPI_VERSION;
 
         let mut encoder: *mut c_void = ptr::null_mut();
         let open_fn = fns

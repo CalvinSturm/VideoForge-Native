@@ -674,6 +674,98 @@ async fn check_e2e_python(
     true
 }
 
+// ─── Native Engine E2E ────────────────────────────────────────────────────────
+
+#[cfg(feature = "native_engine")]
+async fn check_e2e_native(
+    input_path: &str,
+    output_path: Option<&str>,
+    model_path: &str,
+    scale: u32,
+    precision: &str,
+    keep_temp: bool,
+) -> bool {
+    use app_lib::commands::native_engine::upscale_request_native;
+
+    // A) Input prereq checks
+    if !std::path::Path::new(input_path).exists() {
+        return check("Input file exists", false,
+            &format!("E2E_INPUT_NOT_FOUND: {}", input_path));
+    }
+    check("Input file exists", true, "");
+
+    let (in_w, in_h) = match ffprobe_dims(input_path) {
+        Some(d) => { check(&format!("Probe input ({}×{})", d.0, d.1), true, ""); d }
+        None => return check("Probe input", false, "E2E_FFPROBE_PROBE: ffprobe failed"),
+    };
+
+    if !std::path::Path::new(model_path).exists() {
+        return check("Model file exists", false,
+            &format!("E2E_MODEL_NOT_FOUND: {}", model_path));
+    }
+    check("Model file exists", true, model_path);
+
+    let out = output_path.unwrap_or("").to_string();
+    
+    // B) Run pipeline
+    println!("  Running native pipeline (this may take time)...");
+    let result = upscale_request_native(
+        input_path.to_string(),
+        out,
+        model_path.to_string(),
+        scale,
+        Some(precision.to_string()),
+        Some(true), // audio
+    ).await;
+
+    let report = match result {
+        Ok(r) => r,
+        Err(e) => {
+            // Error is a JSON string
+            return check("Native pipeline completed", false, &e);
+        }
+    };
+    
+    check("Native pipeline completed", true, &format!("frames={}", report.frames_processed));
+    let actual_out = &report.output_path;
+
+    // C) Validate output
+    let size = std::fs::metadata(actual_out)
+        .map(|m| m.len()).unwrap_or(0);
+    if size < 4096 {
+        return check("Output file size", false,
+            &format!("E2E_OUTPUT_MISSING: {} bytes at {}", size, actual_out));
+    }
+    check("Output file size", true, &format!("> 4 KB ({} bytes)", size));
+
+    let (out_w, out_h) = match ffprobe_dims(actual_out) {
+        Some(d) => d,
+        None => return check("Output dimensions", false, "E2E_FFPROBE_VALIDATE"),
+    };
+    let exp_w = in_w * scale as usize;
+    let exp_h = in_h * scale as usize;
+    if out_w != exp_w || out_h != exp_h {
+        return check("Output dimensions", false,
+            &format!("E2E_DIM_MISMATCH: expected {}×{}, got {}×{}", exp_w, exp_h, out_w, out_h));
+    }
+    check(&format!("Output dimensions ({}×{})", out_w, out_h), true, "");
+
+    let dur = ffprobe_duration(actual_out).unwrap_or(0.0);
+    if dur <= 0.0 {
+        return check("Output duration", false, "E2E_ZERO_DURATION");
+    }
+    check(&format!("Output duration ({:.2}s > 0)", dur), true, "");
+
+    // D) Cleanup
+    if !keep_temp {
+        let _ = std::fs::remove_file(actual_out);
+    } else {
+        println!("  → kept: {}", actual_out);
+    }
+
+    true
+}
+
 // ─── Argument parsing ────────────────────────────────────────────────────────
 
 struct Args {
@@ -693,6 +785,9 @@ struct Args {
     e2e_scale: u32,
     e2e_timeout_ms: u64,
     keep_temp: bool,
+    // E2E Native mode
+    e2e_native: bool,
+    e2e_onnx: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -712,6 +807,8 @@ fn parse_args() -> Args {
     let mut e2e_scale = 1u32;
     let mut e2e_timeout_ms = 600_000u64;
     let mut keep_temp = false;
+    let mut e2e_native = false;
+    let mut e2e_onnx: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -778,6 +875,12 @@ fn parse_args() -> Args {
             "--keep-temp" => {
                 keep_temp = true;
             }
+            "--e2e-native" => {
+                e2e_native = true;
+            }
+            "--e2e-onnx" => {
+                e2e_onnx = args.next();
+            }
             _ => {}
         }
     }
@@ -797,6 +900,8 @@ fn parse_args() -> Args {
         e2e_scale,
         e2e_timeout_ms,
         keep_temp,
+        e2e_native,
+        e2e_onnx,
     }
 }
 
@@ -822,58 +927,67 @@ async fn main() {
     all_passed &= check_ffprobe();
 
     // 2. Python environment
-    println!();
-    println!("── Python Environment ────────────────────────────────────────");
-    let python_env = check_python_env();
-    all_passed &= python_env.is_some();
-
-    // 3. Python IPC (only if env resolved)
-    if let Some((python_bin, script_path)) = python_env {
+    // Only verify Python if we're running Python tests or NOT running native-only
+    let run_python_tests = args.model.is_some() || args.shm_roundtrip || args.e2e_python;
+    let native_only = args.e2e_native && !run_python_tests;
+    
+    let mut python_env = None;
+    if !native_only {
         println!();
-        println!("── Python IPC Handshake ──────────────────────────────────────");
-        let ipc_ok = check_python_ipc(
-            &python_bin,
-            &script_path,
-            args.model.as_deref(),
-            &args.precision,
-            args.timeout_secs,
-        )
-        .await;
-        all_passed &= ipc_ok;
+        println!("── Python Environment ────────────────────────────────────────");
+        python_env = check_python_env();
+        all_passed &= python_env.is_some();
+    }
 
-        if args.shm_roundtrip {
+    // 3. Python IPC
+    if let Some((python_bin, script_path)) = python_env {
+        if run_python_tests {
             println!();
-            println!("── SHM Roundtrip ─────────────────────────────────────────────");
-            let ok = check_shm_roundtrip(
+            println!("── Python IPC Handshake ──────────────────────────────────────");
+            let ipc_ok = check_python_ipc(
                 &python_bin,
                 &script_path,
+                args.model.as_deref(),
                 &args.precision,
                 args.timeout_secs,
-                args.shm_width,
-                args.shm_height,
-                args.shm_scale,
-                args.roundtrip_timeout_ms,
             )
             .await;
-            all_passed &= ok;
-        }
+            all_passed &= ipc_ok;
 
-        if args.e2e_python {
-            println!();
-            println!("── Python E2E (FFmpeg path) ──────────────────────────────────");
-            let ok = check_e2e_python(
-                &python_bin,
-                &script_path,
-                args.e2e_input.as_deref().unwrap_or(""),
-                args.e2e_output.as_deref(),
-                &args.e2e_model,
-                args.e2e_scale,
-                &args.precision,
-                args.e2e_timeout_ms,
-                args.keep_temp,
-            )
-            .await;
-            all_passed &= ok;
+            if args.shm_roundtrip {
+                println!();
+                println!("── SHM Roundtrip ─────────────────────────────────────────────");
+                let ok = check_shm_roundtrip(
+                    &python_bin,
+                    &script_path,
+                    &args.precision,
+                    args.timeout_secs,
+                    args.shm_width,
+                    args.shm_height,
+                    args.shm_scale,
+                    args.roundtrip_timeout_ms,
+                )
+                .await;
+                all_passed &= ok;
+            }
+
+            if args.e2e_python {
+                println!();
+                println!("── Python E2E (FFmpeg path) ──────────────────────────────────");
+                let ok = check_e2e_python(
+                    &python_bin,
+                    &script_path,
+                    args.e2e_input.as_deref().unwrap_or(""),
+                    args.e2e_output.as_deref(),
+                    &args.e2e_model,
+                    args.e2e_scale,
+                    &args.precision,
+                    args.e2e_timeout_ms,
+                    args.keep_temp,
+                )
+                .await;
+                all_passed &= ok;
+            }
         }
     }
 
@@ -881,12 +995,39 @@ async fn main() {
     println!();
     println!("── Native Engine ─────────────────────────────────────────────");
     #[cfg(feature = "native_engine")]
-    println!("[INFO] native_engine feature: ENABLED");
+    {
+        println!("[INFO] native_engine feature: ENABLED");
+        if args.e2e_native {
+            println!();
+            println!("── Native E2E (engine-v2) ────────────────────────────────────");
+            let input = args.e2e_input.as_deref().unwrap_or("");
+            let model = args.e2e_onnx.as_deref().unwrap_or("");
+            if input.is_empty() || model.is_empty() {
+                eprintln!("[FAIL] --e2e-native requires --input and --e2e-onnx");
+                all_passed = false;
+            } else {
+                let ok = check_e2e_native(
+                    input,
+                    args.e2e_output.as_deref(),
+                    model,
+                    args.e2e_scale,
+                    &args.precision,
+                    args.keep_temp,
+                ).await;
+                all_passed &= ok;
+            }
+        }
+    }
     #[cfg(not(feature = "native_engine"))]
-    println!(
-        "[SKIP] native_engine feature: BLOCKED (ort ^2.0 not on crates.io as stable release). \
-         See docs/NATIVE_ENGINE_MVP.md for resolution steps."
-    );
+    {
+        println!(
+            "[SKIP] native_engine feature: BLOCKED / DISABLED."
+        );
+        if args.e2e_native {
+            eprintln!("[FAIL] --e2e-native requested but feature is disabled.");
+            all_passed = false;
+        }
+    }
 
     // 5. Summary
     println!();

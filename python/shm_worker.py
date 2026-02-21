@@ -124,7 +124,7 @@ class Config:
     ZENOH_PREFIX = "videoforge/ipc"
 
     # --- SHM Slot State Machine ---
-    # Must match Rust src-tauri/src/shm.rs constants exactly.
+    # Defaults; overwritten by load_shm_protocol()
     SLOT_EMPTY = 0
     SLOT_RUST_WRITING = 1
     SLOT_READY_FOR_AI = 2
@@ -132,20 +132,15 @@ class Config:
     SLOT_READY_FOR_ENCODE = 4
     SLOT_ENCODING = 5
 
-    # --- SHM Global Header (36 bytes at file offset 0) ---
-    # Must match Rust src-tauri/src/shm.rs constants exactly.
-    # Layout: magic[8] | version[4] | header_size[4] | slot_count[4] |
-    #         width[4] | height[4] | scale[4] | pixel_format[4]
+    # --- SHM Global Header ---
     SHM_MAGIC = b"VFSHM001"
     SHM_VERSION = 2
     PIXEL_FORMAT_RGB24 = 1
-    GLOBAL_HEADER_SIZE = 36  # 8 + 7 × 4; slot header region = SLOT_HEADER_SIZE × RING_SIZE = 96 bytes → 132 total (SHM_VERSION 2)
-
-    # Per-slot header: 4 × u32 = 16 bytes
+    GLOBAL_HEADER_SIZE = 36
     SLOT_HEADER_SIZE = 16
-    # State field is at byte offset 8 within each slot header
+
+    # Offsets
     STATE_FIELD_OFFSET = 8
-    # frame_bytes field is at byte offset 12
     FRAME_BYTES_FIELD_OFFSET = 12
 
     # Micro-batching: max frames to batch in a single GPU forward pass.
@@ -165,6 +160,43 @@ class Config:
     # Default precision - FP32 for determinism
     DEFAULT_PRECISION = "fp32"
 
+    @classmethod
+    def load_shm_protocol(cls):
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            # Adjust path: script is in python/, protocol is in ipc/
+            # If script is in root/python/, then root/ipc/shm_protocol.json
+            protocol_path = os.path.join(os.path.dirname(script_dir), "ipc", "shm_protocol.json")
+            
+            with open(protocol_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            cls.RING_SIZE = data["ring_size"]
+            cls.SHM_MAGIC = data["magic"].encode("utf-8")
+            cls.SHM_VERSION = data["version"]
+            cls.PIXEL_FORMAT_RGB24 = data["pixel_format_rgb24"]
+            cls.GLOBAL_HEADER_SIZE = data["global_header_size"]
+            cls.SLOT_HEADER_SIZE = data["slot_header_size"]
+            
+            states = data.get("slot_states", {})
+            cls.SLOT_EMPTY = states.get("EMPTY", 0)
+            cls.SLOT_RUST_WRITING = states.get("RUST_WRITING", 1)
+            cls.SLOT_READY_FOR_AI = states.get("READY_FOR_AI", 2)
+            cls.SLOT_AI_PROCESSING = states.get("AI_PROCESSING", 3)
+            cls.SLOT_READY_FOR_ENCODE = states.get("READY_FOR_ENCODE", 4)
+            cls.SLOT_ENCODING = states.get("ENCODING", 5)
+            
+            offsets = data.get("offsets", {})
+            cls.STATE_FIELD_OFFSET = offsets.get("state", 8)
+            cls.FRAME_BYTES_FIELD_OFFSET = offsets.get("frame_bytes", 12)
+            
+            print(f"[Python] Loaded SHM protocol from {protocol_path}", flush=True)
+            
+        except Exception as e:
+            print(f"[Python Warning] Failed to load SHM protocol: {e}. Using defaults.", flush=True)
+
+# Load protocol immediately
+Config.load_shm_protocol()
 
 ZENOH_PREFIX = Config.ZENOH_PREFIX
 SPATIAL_MAP_TOPIC = "videoforge/research/spatial_map"
@@ -182,7 +214,7 @@ WEIGHTS_DIRS = [
 # =============================================================================
 # Re-exported here for backward compatibility with smoke tests and any code
 # that imports these names directly from shm_worker.
-from model_manager import RCAN, EDSR, remap_edsr_keys  # noqa: E402
+from model_manager import RCAN, EDSR, remap_edsr_keys, ModelLoader  # noqa: E402
 
 
 # =============================================================================
@@ -199,198 +231,6 @@ def suppress_stdout():
             yield
         finally:
             sys.stdout = old_stdout
-
-
-def find_weight_file(model_id: str) -> Optional[str]:
-    """
-    Find weight file for a given model identifier.
-
-    Handles various naming conventions:
-    - Canonical: RCAN_x4 -> RCAN_4x.pt, RCAN_4x.pth
-    - Canonical: EDSR_x3 -> EDSR_Mx3_*.pth, EDSR_3x_*.pth
-    - Direct: RealESRGAN_x4plus.pth
-    """
-    # Normalize the model ID
-    model_id = model_id.strip()
-
-    # Build search patterns based on model family
-    patterns = []
-
-    upper_id = model_id.upper()
-
-    if upper_id.startswith("RCAN"):
-        # Extract scale from RCAN_xN format
-        scale = None
-        for s in [2, 3, 4, 8]:
-            if f"_X{s}" in upper_id or f"X{s}" in upper_id:
-                scale = s
-                break
-
-        if scale:
-            # RCAN weight file patterns (actual files use _Nx format, e.g., RCAN_2x.pt)
-            patterns = [
-                f"RCAN_{scale}x.pt",
-                f"RCAN_{scale}x.pth",
-                f"RCAN_x{scale}.pt",
-                f"RCAN_x{scale}.pth",
-                f"RCAN_{scale}x_BI.pt",  # Bicubic degradation variant
-                f"RCAN_{scale}x_BD.pt",  # Blur-downscale degradation variant
-            ]
-
-    elif upper_id.startswith("EDSR"):
-        # Extract scale from EDSR_xN format
-        scale = None
-        for s in [2, 3, 4]:
-            if f"_X{s}" in upper_id or f"X{s}" in upper_id:
-                scale = s
-                break
-
-        if scale:
-            # EDSR weight file patterns (actual files have complex names)
-            # Try medium model (M) first, then large (L)
-            patterns = [
-                f"EDSR_Mx{scale}_*.pth",  # Medium model
-                f"EDSR_{scale}x_*.pth",   # Alternative naming
-                f"EDSR_Lx{scale}_*.pth",  # Large model
-                f"EDSR_x{scale}.pth",     # Simple naming
-                f"EDSR_x{scale}.pt",
-            ]
-
-    else:
-        # RealESRGAN or other models - use direct filename
-        base = model_id.replace(".pth", "").replace(".pt", "")
-        patterns = [
-            f"{base}.pth",
-            f"{base}.pt",
-            model_id,  # Try as-is
-        ]
-
-    # Search in all weight directories
-    for d in WEIGHTS_DIRS:
-        if not os.path.exists(d):
-            continue
-
-        for pattern in patterns:
-            if '*' in pattern:
-                # Glob pattern matching
-                import glob
-                matches = glob.glob(os.path.join(d, pattern))
-                if matches:
-                    # Return first match (prefer M over L for EDSR)
-                    matches.sort()  # Alphabetical, M comes before L
-                    return matches[0]
-            else:
-                # Exact match
-                candidate = os.path.join(d, pattern)
-                if os.path.exists(candidate):
-                    return candidate
-
-                # Check nested directory
-                nested = os.path.join(d, pattern.replace(".pth", "").replace(".pt", ""), pattern)
-                if os.path.exists(nested):
-                    return nested
-
-    return None
-
-
-def extract_state_dict(loaded: Any) -> Dict[str, torch.Tensor]:
-    """
-    Extract model state dict from various checkpoint formats.
-
-    Handles:
-    - Direct state dict
-    - {'params': state_dict}
-    - {'params_ema': state_dict} (preferred if available)
-    - {'state_dict': state_dict}
-    - Full model object (torch.save(model, path))
-    """
-    # If loaded is a model object (saved with torch.save(model, ...))
-    if isinstance(loaded, torch.nn.Module):
-        print("[Python] Detected full model object, extracting state_dict", flush=True)
-        return loaded.state_dict()
-
-    # If not a dict, we can't extract state_dict
-    if not isinstance(loaded, dict):
-        raise ValueError(f"Unexpected checkpoint type: {type(loaded)}")
-
-    # Prefer EMA weights if available (more stable)
-    if 'params_ema' in loaded:
-        print("[Python] Using EMA weights (params_ema)", flush=True)
-        return loaded['params_ema']
-    if 'params' in loaded:
-        return loaded['params']
-    if 'state_dict' in loaded:
-        return loaded['state_dict']
-    if 'model' in loaded:
-        # Some checkpoints store model state under 'model' key
-        if isinstance(loaded['model'], dict):
-            return loaded['model']
-        elif isinstance(loaded['model'], torch.nn.Module):
-            return loaded['model'].state_dict()
-
-    # Check if it's already a state dict (has tensor values)
-    if any(isinstance(v, torch.Tensor) for v in loaded.values()):
-        return loaded
-
-    # Recursive search for nested state dicts
-    for key, value in loaded.items():
-        if isinstance(value, dict):
-            # Check if this nested dict looks like a state dict
-            if any(isinstance(v, torch.Tensor) for v in value.values()):
-                print(f"[Python] Found state_dict under key '{key}'", flush=True)
-                return value
-
-    return loaded  # Return as-is and let strict loading catch issues
-
-
-def remap_rcan_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """
-    Strip MeanShift keys from official RCAN state dicts.
-
-    Our RCAN architecture uses the same head/body/tail naming as the official
-    EDSR-PyTorch repo, so no key renaming is needed — only sub_mean/add_mean
-    removal (these are handled by the EDSRRCANAdapter instead).
-    """
-    new_dict = {k: v for k, v in state_dict.items()
-                if not k.startswith("sub_mean.") and not k.startswith("add_mean.")}
-
-    removed = len(state_dict) - len(new_dict)
-    if removed > 0:
-        print(f"[Python] Stripped {removed} MeanShift keys from RCAN state dict", flush=True)
-
-    return new_dict
-
-
-def verify_scale_from_weights(state_dict: Dict[str, torch.Tensor], expected_scale: int) -> bool:
-    """
-    Verify model scale by inspecting weight tensor shapes.
-
-    For PixelShuffle-based upsampling:
-    - x2: upsample has conv with out_channels = num_feat * 4 (one PixelShuffle(2))
-    - x4: upsample has two convs with out_channels = num_feat * 4 (two PixelShuffle(2))
-
-    Returns True if scale matches, False otherwise.
-    """
-    # Count PixelShuffle upsampling convolutions
-    # They have pattern: upsample.N.weight where output channels = num_feat * 4
-    upsample_convs = 0
-    for key in state_dict.keys():
-        # Check for RCAN/EDSR style upsample
-        if 'upsample' in key and 'weight' in key and 'bias' not in key:
-            shape = state_dict[key].shape
-            if len(shape) == 4 and shape[0] == shape[1] * 4:
-                upsample_convs += 1
-        # Check for RealESRGAN style upsample (conv_up1, conv_up2)
-        elif 'conv_up' in key and 'weight' in key:
-            upsample_convs += 1
-
-    detected_scale = 2 ** upsample_convs if upsample_convs > 0 else 1
-
-    if detected_scale != expected_scale:
-        print(f"[Python] Scale verification: detected {detected_scale}x from weights, expected {expected_scale}x", flush=True)
-        return False
-
-    return True
 
 
 # =============================================================================
@@ -435,91 +275,6 @@ def start_watchdog(parent_pid: int) -> None:
         return
     t = threading.Thread(target=watchdog_loop, args=(parent_pid,), daemon=True)
     t.start()
-
-
-# =============================================================================
-# MODEL LOADER - Deterministic with Strict Validation
-# =============================================================================
-
-class ModelLoader:
-    """
-    Deterministic model loader with explicit architecture verification.
-
-    Guarantees:
-    - strict=True for state dict loading (no silent partial loads)
-    - Scale verified from weight tensor shapes (no filename parsing)
-    - EDSR fallback if RCAN unavailable
-    - FP32 default, FP16 only if explicitly requested
-    """
-
-    def __init__(self, precision: str = "fp32"):
-        self.precision = precision
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model: Optional[torch.nn.Module] = None
-        self.model_name: Optional[str] = None
-        self.model_scale: int = 4
-        # Some models were trained on BGR, others on RGB
-        # Set True if model expects RGB input (standard), False for BGR
-        self.expects_rgb: bool = True
-
-        # Log precision mode
-        if precision == "fp16":
-            print("[Python WARNING] FP16 mode enabled - determinism not guaranteed across hardware", flush=True)
-
-    def load(self, model_identifier: str) -> Tuple[torch.nn.Module, int]:
-        """
-        Load any model by identifier.
-
-        Uses model_manager._load_module() as the single universal loader.
-        It handles:
-          - Full model objects (torch.save(model, path))
-          - State-dict checkpoints via spandrel (30+ architectures)
-          - Legacy RCAN / EDSR builders as fallback
-        Also creates an architecture adapter for proper pre/post processing
-        (window padding for transformers, output clamping, etc.)
-        """
-        print(f"[Python] Loading model: '{model_identifier}'", flush=True)
-
-        from model_manager import _load_module
-        from arch_wrappers import create_adapter
-
-        model, scale = _load_module(model_identifier)
-        model = self._prepare_model(model)
-
-        # Create adapter for proper pre/post processing during inference
-        self.adapter = create_adapter(model_identifier, model, scale, self.device)
-
-        self.model = model
-        self.model_name = model_identifier
-        self.model_scale = scale
-        self.expects_rgb = True
-
-        return model, scale
-
-    def _prepare_model(self, model: torch.nn.Module) -> torch.nn.Module:
-        """
-        Prepare model for deterministic inference.
-
-        CRITICAL: This method ensures determinism by:
-        1. Setting eval() mode (disables dropout, uses running stats for BN)
-        2. Moving to correct device
-        3. Applying precision settings
-        """
-        # CRITICAL: Set eval mode - disables any training-time randomness
-        model.eval()
-
-        # Move to device
-        model = model.to(self.device)
-
-        # Apply precision
-        if self.precision == "fp16" and self.device.type == "cuda":
-            model = model.half()
-
-        # Ensure all parameters are not tracking gradients
-        for param in model.parameters():
-            param.requires_grad = False
-
-        return model
 
 
 # =============================================================================

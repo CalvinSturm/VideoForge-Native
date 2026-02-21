@@ -140,26 +140,20 @@ async fn run_native_pipeline(
     precision: String,
     preserve_audio: bool,
 ) -> Result<NativeUpscaleResult, String> {
-    use std::sync::Arc;
-    use tokio::process::Command;
     use std::process::Stdio;
+    use tokio::process::Command;
 
-    use videoforge_engine::backends::tensorrt::{BatchConfig, TensorRtBackend, PrecisionPolicy};
-    use videoforge_engine::codecs::nvdec::{BitstreamPacket, BitstreamSource, NvDecoder};
-    use videoforge_engine::codecs::nvenc::{BitstreamSink, NvEncConfig};
-    use videoforge_engine::core::context::GpuContext;
-    use videoforge_engine::core::kernels::{ModelPrecision, PreprocessKernels};
-    use videoforge_engine::engine::pipeline::{PipelineConfig, UpscalePipeline};
-    use videoforge_engine::error::EngineError;
     use videoforge_engine::codecs::sys::cudaVideoCodec as CudaCodec;
 
-    let make_err = |code: &str, msg: &str| {
-        serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap()
-    };
+    let make_err =
+        |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
 
     // Validate model path.
     if !Path::new(&model_path).exists() {
-        return Err(make_err("MODEL_NOT_FOUND", &format!("Model not found: {}", model_path)));
+        return Err(make_err(
+            "MODEL_NOT_FOUND",
+            &format!("Model not found: {}", model_path),
+        ));
     }
 
     // Generate output path.
@@ -207,11 +201,15 @@ async fn run_native_pipeline(
         .args([
             "-y",
             "-hide_banner",
-            "-loglevel", "warning",
-            "-i", &input_path,
-            "-vcodec", "copy",
-            "-an",                        // no audio in elementary stream
-            "-bsf:v", "h264_mp4toannexb", // convert to Annex B
+            "-loglevel",
+            "warning",
+            "-i",
+            &input_path,
+            "-vcodec",
+            "copy",
+            "-an", // no audio in elementary stream
+            "-bsf:v",
+            "h264_mp4toannexb", // convert to Annex B
             elementary_stream_path.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
@@ -225,11 +223,17 @@ async fn run_native_pipeline(
         let hevc_path = tmp_dir.join(format!("vf_native_input_{}.hevc", ts));
         let hevc_status = Command::new("ffmpeg")
             .args([
-                "-y", "-hide_banner", "-loglevel", "warning",
-                "-i", &input_path,
-                "-vcodec", "copy",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-i",
+                &input_path,
+                "-vcodec",
+                "copy",
                 "-an",
-                "-bsf:v", "hevc_mp4toannexb",
+                "-bsf:v",
+                "hevc_mp4toannexb",
                 hevc_path.to_str().unwrap(),
             ])
             .stdout(Stdio::null())
@@ -250,7 +254,8 @@ async fn run_native_pipeline(
                 precision,
                 preserve_audio,
                 CudaCodec::HEVC,
-            ).await;
+            )
+            .await;
         }
 
         return Err(make_err(
@@ -270,7 +275,8 @@ async fn run_native_pipeline(
         precision,
         preserve_audio,
         CudaCodec::H264,
-    ).await
+    )
+    .await
 }
 
 #[cfg(feature = "native_engine")]
@@ -285,20 +291,42 @@ async fn run_engine_pipeline(
     preserve_audio: bool,
     codec: videoforge_engine::codecs::sys::cudaVideoCodec,
 ) -> Result<NativeUpscaleResult, String> {
+    use std::process::Stdio;
     use std::sync::Arc;
     use tokio::process::Command;
-    use std::process::Stdio;
 
-    use videoforge_engine::backends::tensorrt::{BatchConfig, TensorRtBackend, PrecisionPolicy};
+    use videoforge_engine::backends::tensorrt::{BatchConfig, PrecisionPolicy, TensorRtBackend};
     use videoforge_engine::codecs::nvdec::NvDecoder;
     use videoforge_engine::codecs::nvenc::NvEncConfig;
     use videoforge_engine::core::context::GpuContext;
     use videoforge_engine::core::kernels::{ModelPrecision, PreprocessKernels};
     use videoforge_engine::engine::pipeline::{PipelineConfig, UpscalePipeline};
 
-    let make_err = |code: &str, msg: &str| {
-        serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap()
-    };
+    let make_err =
+        |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
+
+    // ── Step 1.5: Probe input for dimensions ──────────────────────────────────
+    // encoder_nv12_pitch and encoder width/height must be set before
+    // UpscalePipeline::new() — the pipeline asserts pitch > 0.
+    tracing::info!(path = %original_input, "Probing input video dimensions");
+    let (input_w, input_h, _duration, fps, _) = crate::video_pipeline::probe_video(&original_input)
+        .map_err(|e| make_err("PROBE_FAILED", &format!("ffprobe probe failed: {}", e)))?;
+    let output_w = input_w.saturating_mul(scale as usize);
+    let output_h = input_h.saturating_mul(scale as usize);
+    // NV12 row stride must be 256-byte aligned (NVENC hardware requirement).
+    let encoder_nv12_pitch = (output_w + 255) / 256 * 256;
+    // Express fps as a rational with 1000 as denominator — handles 23.976, 29.97, etc.
+    let fps_num = (fps * 1000.0).round() as u32;
+    let fps_den = 1000u32;
+    tracing::info!(
+        input_w,
+        input_h,
+        output_w,
+        output_h,
+        encoder_nv12_pitch,
+        fps,
+        "Video dimensions resolved"
+    );
 
     // ── Step 2: Initialise GPU context ────────────────────────────────────────
     tracing::info!("Initialising GPU context (device 0)");
@@ -310,16 +338,16 @@ async fn run_engine_pipeline(
     tracing::info!(model = %model_path, "Loading TensorRT backend");
     let precision_policy = match precision.as_str() {
         "fp16" => PrecisionPolicy::Fp16,
-        _      => PrecisionPolicy::Fp32,
+        _ => PrecisionPolicy::Fp32,
     };
     // TensorRtBackend::new(model_path, ctx, device_id, ring_size, downstream_capacity).
     // Use with_precision to apply the precision policy.
     let backend = TensorRtBackend::with_precision(
         std::path::PathBuf::from(&model_path),
         ctx.clone(),
-        0,   // device_id
-        8,   // ring_size (≥ downstream_capacity + 2)
-        4,   // downstream_capacity
+        0, // device_id
+        8, // ring_size (≥ downstream_capacity + 2)
+        4, // downstream_capacity
         precision_policy,
         BatchConfig::default(),
     );
@@ -332,38 +360,54 @@ async fn run_engine_pipeline(
 
     // ── Step 5: Create decoder with FileBitstreamSource ───────────────────────
     tracing::info!(path = %input_stream.display(), "Creating NVDEC decoder");
-    let model_prec = if precision == "fp16" { ModelPrecision::F16 } else { ModelPrecision::F32 };
-    let source = FileBitstreamSource::new(&input_stream)
-        .map_err(|e| make_err("SOURCE_OPEN", &format!("Cannot open elementary stream: {}", e)))?;
+    let model_prec = if precision == "fp16" {
+        ModelPrecision::F16
+    } else {
+        ModelPrecision::F32
+    };
+    let source = FileBitstreamSource::new(&input_stream).map_err(|e| {
+        make_err(
+            "SOURCE_OPEN",
+            &format!("Cannot open elementary stream: {}", e),
+        )
+    })?;
     let decoder = NvDecoder::new(ctx.clone(), Box::new(source), codec)
         .map_err(|e| make_err("DECODER_INIT", &format!("NVDEC decoder init failed: {}", e)))?;
 
     // ── Step 6: Create encoder with FileBitstreamSink ─────────────────────────
     tracing::info!(path = %engine_output.display(), "Creating NVENC encoder");
 
-    // Encoder config — width/height/pitch are set to 0 as placeholders;
-    // the pipeline overrides them from the first decoded frame.
     let enc_config = NvEncConfig {
-        width: 0,
-        height: 0,
-        fps_num: 30,
-        fps_den: 1,
+        width: output_w as u32,
+        height: output_h as u32,
+        fps_num,
+        fps_den,
         bitrate: 8_000_000,
         max_bitrate: 0,
         gop_length: 30,
         b_frames: 0,
-        nv12_pitch: 0,
+        nv12_pitch: encoder_nv12_pitch as u32,
     };
     let sink = FileBitstreamSink::new(&engine_output)
         .map_err(|e| make_err("SINK_OPEN", &format!("Cannot create output stream: {}", e)))?;
     // NvEncoder::new takes (raw_cuda_context: *mut c_void, sink, config).
-    let cuda_ctx = *ctx.device().cu_primary_ctx() as *mut std::ffi::c_void;
-    let encoder = videoforge_engine::codecs::nvenc::NvEncoder::new(cuda_ctx, Box::new(sink), enc_config)
-        .map_err(|e| make_err("ENCODER_INIT", &format!("NVENC encoder init failed: {}", e)))?;
+    // Bind the primary context to this thread, then retrieve whatever is
+    // current via cuCtxGetCurrent — the NVENC-canonical approach (matches
+    // NVIDIA SDK samples).
+    ctx.device()
+        .bind_to_thread()
+        .map_err(|e| make_err("ENCODER_INIT", &format!("Failed to bind CUDA context: {:?}", e)))?;
+    let cuda_ctx = ctx
+        .current_context_ptr()
+        .map_err(|e| make_err("ENCODER_INIT", &format!("cuCtxGetCurrent failed: {}", e)))?;
+    let encoder =
+        videoforge_engine::codecs::nvenc::NvEncoder::new(cuda_ctx, Box::new(sink), enc_config)
+            .map_err(|e| make_err("ENCODER_INIT", &format!("NVENC encoder init failed: {}", e)))?;
 
     // ── Step 7: Run the pipeline ──────────────────────────────────────────────
     let config = PipelineConfig {
         model_precision: model_prec,
+        encoder_nv12_pitch,
         ..PipelineConfig::default()
     };
     let pipeline = UpscalePipeline::new(ctx.clone(), kernels, config);
@@ -374,7 +418,10 @@ async fn run_engine_pipeline(
         .await
         .map_err(|e| make_err("PIPELINE", &format!("Pipeline error: {}", e)))?;
 
-    let frames = pipeline.metrics().frames_encoded.load(std::sync::atomic::Ordering::Relaxed);
+    let frames = pipeline
+        .metrics()
+        .frames_encoded
+        .load(std::sync::atomic::Ordering::Relaxed);
     tracing::info!(frames_encoded = frames, "engine-v2 pipeline complete");
 
     // ── Step 8: FFmpeg mux video + audio ──────────────────────────────────────
@@ -388,9 +435,11 @@ async fn run_engine_pipeline(
     let mut mux_args = vec![
         "-y".to_string(),
         "-hide_banner".to_string(),
-        "-loglevel".to_string(), "warning".to_string(),
+        "-loglevel".to_string(),
+        "warning".to_string(),
         // video from native engine output
-        "-i".to_string(), engine_output.to_str().unwrap().to_string(),
+        "-i".to_string(),
+        engine_output.to_str().unwrap().to_string(),
     ];
 
     if preserve_audio {
@@ -399,22 +448,24 @@ async fn run_engine_pipeline(
         mux_args.push(original_input.clone());
     }
 
-    mux_args.extend([
-        "-c:v".to_string(), "copy".to_string(),
-    ]);
+    mux_args.extend(["-c:v".to_string(), "copy".to_string()]);
 
     if preserve_audio {
         mux_args.extend([
-            "-c:a".to_string(), "copy".to_string(),
-            "-map".to_string(), "0:v:0".to_string(),
-            "-map".to_string(), "1:a?".to_string(), // optional audio — won't fail if absent
+            "-c:a".to_string(),
+            "copy".to_string(),
+            "-map".to_string(),
+            "0:v:0".to_string(),
+            "-map".to_string(),
+            "1:a?".to_string(), // optional audio — won't fail if absent
         ]);
     } else {
         mux_args.push("-an".to_string());
     }
 
     mux_args.extend([
-        "-movflags".to_string(), "+faststart".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
         final_output.clone(),
     ]);
 
@@ -463,7 +514,11 @@ struct FileBitstreamSource {
 impl FileBitstreamSource {
     fn new(path: &Path) -> std::io::Result<Self> {
         let data = std::fs::read(path)?;
-        Ok(Self { data, pos: 0, pts_counter: 0 })
+        Ok(Self {
+            data,
+            pos: 0,
+            pts_counter: 0,
+        })
     }
 }
 
@@ -471,9 +526,8 @@ impl FileBitstreamSource {
 impl videoforge_engine::codecs::nvdec::BitstreamSource for FileBitstreamSource {
     fn read_packet(
         &mut self,
-    ) -> videoforge_engine::error::Result<
-        Option<videoforge_engine::codecs::nvdec::BitstreamPacket>,
-    > {
+    ) -> videoforge_engine::error::Result<Option<videoforge_engine::codecs::nvdec::BitstreamPacket>>
+    {
         if self.pos >= self.data.len() {
             return Ok(None);
         }

@@ -168,6 +168,22 @@ impl GpuContext {
         &self.device
     }
 
+    /// Return the raw `CUcontext` handle that is currently bound to this
+    /// thread as a `*mut c_void` suitable for NVENC / NVDEC session open.
+    ///
+    /// The caller must ensure the context is current (call
+    /// [`CudaDevice::bind_to_thread`] first).  This uses `cuCtxGetCurrent`
+    /// rather than the stored primary-context field so the value is always
+    /// the live handle on the calling thread's context stack.
+    pub fn current_context_ptr(&self) -> Result<*mut std::ffi::c_void> {
+        let ctx = cudarc::driver::result::ctx::get_current()?
+            .ok_or_else(|| crate::error::EngineError::InvariantViolation(
+                "cuCtxGetCurrent returned None — call bind_to_thread before current_context_ptr"
+                    .into(),
+            ))?;
+        Ok(ctx as *mut std::ffi::c_void)
+    }
+
     /// Allocate `size` bytes of device memory, preferring a pooled buffer.
     ///
     /// The returned buffer may be **larger** than `size` due to bucket

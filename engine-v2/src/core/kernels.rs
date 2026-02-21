@@ -50,6 +50,8 @@ use crate::error::{EngineError, Result};
 ///
 /// Compiled to PTX once via NVRTC at engine initialization.
 const PREPROCESS_CUDA_SRC: &str = r#"
+#include <cuda_fp16.h>
+
 // ============================================================================
 // BT.709 NV12 → RGB Planar Float32 (NCHW, [0,1])
 // ============================================================================
@@ -252,8 +254,9 @@ const KERNEL_NAMES: &[&str] = &[
 ///
 /// Created once during engine initialization, reused for every frame.
 /// **No per-frame PTX recompilation.**
+#[derive(Clone)]
 pub struct PreprocessKernels {
-    device: Arc<CudaDevice>,
+    _device: Arc<CudaDevice>, // held to keep the compiled CUDA module alive
     nv12_to_rgb_f32: CudaFunction,
     nv12_to_rgb_f16: CudaFunction,
     f32_to_f16: CudaFunction,
@@ -273,12 +276,18 @@ impl PreprocessKernels {
     /// Returns [`EngineError::Cuda`] if module loading fails.
     pub fn compile(device: &Arc<CudaDevice>) -> Result<Self> {
         // Compile with FP16 support enabled.
+        // Find CUDA include path for <cuda_fp16.h>
+        let cuda_include = std::env::var("CUDA_PATH").unwrap_or_else(|_| {
+            "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6".into()
+        }) + "\\include";
+
         let ptx = cudarc::nvrtc::compile_ptx_with_opts(
             PREPROCESS_CUDA_SRC,
             cudarc::nvrtc::CompileOptions {
                 ftz: Some(true),        // Flush denorms to zero.
                 prec_div: Some(false),  // Fast division.
                 prec_sqrt: Some(false), // Fast sqrt.
+                include_paths: vec![cuda_include],
                 ..Default::default()
             },
         )?;
@@ -286,15 +295,16 @@ impl PreprocessKernels {
         device.load_ptx(ptx, MODULE_NAME, KERNEL_NAMES)?;
 
         let get_fn = |name: &str| -> Result<CudaFunction> {
-            device
-                .get_func(MODULE_NAME, name)
-                .ok_or_else(|| EngineError::ModelMetadata(format!(
-                    "Kernel '{}' not found in module '{}'", name, MODULE_NAME
-                )))
+            device.get_func(MODULE_NAME, name).ok_or_else(|| {
+                EngineError::ModelMetadata(format!(
+                    "Kernel '{}' not found in module '{}'",
+                    name, MODULE_NAME
+                ))
+            })
         };
 
         let kernels = Self {
-            device: Arc::clone(device),
+            _device: Arc::clone(device),
             nv12_to_rgb_f32: get_fn("nv12_to_rgb_planar_f32")?,
             nv12_to_rgb_f16: get_fn("nv12_to_rgb_planar_f16")?,
             f32_to_f16: get_fn("f32_to_f16")?,
@@ -346,7 +356,7 @@ impl PreprocessKernels {
         let uv_ptr = y_ptr + (input.pitch * h) as u64;
         let out_ptr = *output_buf.device_ptr() as u64;
 
-        let (config, block) = launch_config_2d(input.width, input.height);
+        let (config, _block) = launch_config_2d(input.width, input.height);
 
         // SAFETY:
         // - All pointers are valid device pointers from the same CudaDevice.
@@ -633,7 +643,7 @@ impl ModelInput {
                 return Err(EngineError::FormatMismatch {
                     expected: PixelFormat::RgbPlanarF32,
                     actual: other,
-                })
+                });
             }
         };
 
@@ -826,7 +836,7 @@ impl PreprocessPipeline {
                 return Err(EngineError::FormatMismatch {
                     expected: PixelFormat::RgbPlanarF32,
                     actual: other,
-                })
+                });
             }
         };
 

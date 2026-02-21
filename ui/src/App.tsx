@@ -398,17 +398,25 @@ const App: React.FC = () => {
       const info = modelInfoMap.get(selectedModel);
 
       let resultPath: string;
-      if (info?.format === "onnx") {
-        // Routes through engine-v2 native pipeline (NVDEC → TensorRT → NVENC).
-        // Returns FEATURE_DISABLED error if not compiled with --features native_engine.
-        resultPath = await invoke<string>("upscale_request_native", {
-          inputPath,
-          outputPath,
-          modelPath: info.path,
-          scale: info.scale,
-          precision: "fp32",
-          audio: true,
-        });
+      if (upscaleConfig.useNativeEngine) {
+        if (info?.format === "onnx") {
+          // GPU-native pipeline: NVDEC → TensorRT → NVENC (zero host copies).
+          resultPath = await invoke<string>("upscale_request_native", {
+            inputPath,
+            outputPath,
+            modelPath: info.path,
+            scale: info.scale,
+            precision: "fp32",
+            audio: true,
+          });
+        } else {
+          // Native engine selected but current model is not ONNX — fall back.
+          addToast(
+            `Native engine requires an ONNX model. "${selectedModel}" is PyTorch-only — using Python pipeline.`,
+            "warning"
+          );
+          resultPath = await invoke<string>("upscale_request", upscalePayload);
+        }
       } else {
         resultPath = await invoke<string>("upscale_request", upscalePayload);
       }

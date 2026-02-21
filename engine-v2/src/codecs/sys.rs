@@ -298,7 +298,7 @@ unsafe extern "C" {
     ) -> CUresult;
 
     pub fn cuvidDecodePicture(decoder: CUvideodecoder, pic_params: *mut CUVIDPICPARAMS)
-        -> CUresult;
+    -> CUresult;
 
     pub fn cuvidMapVideoFrame64(
         decoder: CUvideodecoder,
@@ -456,14 +456,18 @@ pub enum NV_ENC_TUNING_INFO {
 
 // ─── NVENC params structs ────────────────────────────────────────────────
 
-/// API version macro: (major << 4) | minor.
 pub const NVENCAPI_MAJOR_VERSION: u32 = 12;
 pub const NVENCAPI_MINOR_VERSION: u32 = 2;
 
-/// Helper to compute struct version field.
+/// NVENC API version: `MAJOR | (MINOR << 24)`.
+/// Matches the SDK macro `NVENCAPI_VERSION`.
+pub const NVENCAPI_VERSION: u32 = NVENCAPI_MAJOR_VERSION | (NVENCAPI_MINOR_VERSION << 24);
+
+/// Compute a struct version field: `NVENCAPI_VERSION | (struct_ver << 16) | (0x7 << 28)`.
+/// Matches the SDK macro `NVENC_STRUCT_VERSION(ver)`.
 #[inline]
 pub const fn nvenc_struct_version(struct_ver: u32) -> u32 {
-    struct_ver | ((NVENCAPI_MAJOR_VERSION << 4) | NVENCAPI_MINOR_VERSION) << 24
+    NVENCAPI_VERSION | (struct_ver << 16) | (0x7 << 28)
 }
 
 /// Session open params.

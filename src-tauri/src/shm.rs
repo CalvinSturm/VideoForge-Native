@@ -4,67 +4,7 @@ use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicU32, Ordering};
 use thiserror::Error;
 
-pub const RING_SIZE: usize = 6;
-
-// =============================================================================
-// SLOT STATE MACHINE
-// =============================================================================
-
-/// Slot is free — decoder may write.
-pub const SLOT_EMPTY: u32 = 0;
-/// Rust decoder is writing a frame into this slot.
-pub const SLOT_RUST_WRITING: u32 = 1;
-/// Frame is ready for Python AI inference.
-pub const SLOT_READY_FOR_AI: u32 = 2;
-/// Python is processing this slot.
-pub const SLOT_AI_PROCESSING: u32 = 3;
-/// AI output is ready — encoder may read.
-pub const SLOT_READY_FOR_ENCODE: u32 = 4;
-/// Rust encoder is reading from this slot.
-pub const SLOT_ENCODING: u32 = 5;
-
-// =============================================================================
-// GLOBAL HEADER LAYOUT (36 bytes at offset 0)
-// =============================================================================
-//
-// Offset  0: u8[8]  magic        = b"VFSHM001"
-// Offset  8: u32    version      = SHM_VERSION (2)
-// Offset 12: u32    header_size  = HEADER_REGION_SIZE (132)
-// Offset 16: u32    slot_count   = RING_SIZE (6)
-// Offset 20: u32    width        = frame width in pixels
-// Offset 24: u32    height       = frame height in pixels
-// Offset 28: u32    scale        = upscale factor
-// Offset 32: u32    pixel_format = PIXEL_FORMAT_RGB24 (1)
-//                                  ── 36 bytes ──
-//
-// =============================================================================
-// SLOT HEADER LAYOUT (per slot, 16 bytes each — starts at offset 36)
-// =============================================================================
-//
-// Offset 0:  u32  write_index   — frame counter (set by Rust decoder)
-// Offset 4:  u32  read_index    — frame counter (set by Rust encoder)
-// Offset 8:  u32  state         — atomic state machine value
-// Offset 12: u32  frame_bytes   — actual frame data size in bytes
-//
-// All fields use SeqCst ordering for cross-process visibility.
-
-const GLOBAL_HEADER_SIZE: usize = 36;
-const MAGIC: &[u8; 8] = b"VFSHM001";
-pub const SHM_VERSION: u32 = 2;
-/// Pixel format identifier for RGB24 (3 bytes/pixel, interleaved).
-pub const PIXEL_FORMAT_RGB24: u32 = 1;
-
-const SLOT_HEADER_SIZE: usize = 16; // 4 × u32
-const SLOT_HEADER_REGION: usize = SLOT_HEADER_SIZE * RING_SIZE; // 96
-
-/// Total bytes reserved for all headers (global + slot headers) at the
-/// start of the SHM file.  Data region begins at this offset.
-pub const HEADER_REGION_SIZE: usize = GLOBAL_HEADER_SIZE + SLOT_HEADER_REGION; // 132
-
-// Byte offsets within a single slot header (relative to that slot's base).
-const STATE_OFFSET: usize = 8;
-const FRAME_BYTES_OFFSET: usize = 12;
-const WRITE_INDEX_OFFSET: usize = 0;
+include!(concat!(env!("OUT_DIR"), "/shm_constants.rs"));
 
 // =============================================================================
 // SHM ERROR
