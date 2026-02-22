@@ -615,72 +615,110 @@ class AIWorker:
             self.send_status("error", {"message": f"Load Failed: {str(e)}"})
 
     def send_status(self, status: str, extra: Optional[Dict] = None) -> None:
-        """Publish a response envelope conforming to the IPC protocol.
+        """Publish status/error response.
 
-        Includes protocol fields (version, request_id, job_id, kind) for
-        correlation while preserving top-level backward-compat extra fields.
+        Typed mode emits envelopes via python/ipc_protocol.py.
+        Legacy mode keeps the existing dict JSON shape.
         """
         req = getattr(self, "_current_request", None)
-        payload: Dict[str, Any] = {
-            "version": ZENOH_PREFIX and 1 or 1,  # PROTOCOL_VERSION = 1
-            "request_id": req.request_id if req else "",
-            "job_id": req.job_id if req else "",
-            "kind": "error" if status == "error" else "status",
-            "status": status,
-            "error": None,
-        }
-        if extra:
-            # Merge extra at top level for backward compat.
-            # If extra contains an "error" dict, promote it to the error field.
-            if "message" in extra and status == "error":
-                payload["error"] = {
-                    "code": extra.pop("code", "INTERNAL"),
-                    "message": extra.pop("message", ""),
-                }
-            payload.update(extra)
+        extras = dict(extra or {})
         try:
+            if self.use_typed_ipc:
+                from ipc_protocol import ResponseEnvelope
+
+                if status == "error":
+                    err_code = extras.pop("code", "INTERNAL")
+                    err_msg = extras.pop("message", "")
+                    env = ResponseEnvelope.error_response(
+                        code=err_code,
+                        message=err_msg,
+                        req=req,
+                        extra=extras,
+                    )
+                else:
+                    env = ResponseEnvelope.status_response(
+                        status=status,
+                        req=req,
+                        extra=extras,
+                    )
+                payload = env.to_json()
+            else:
+                payload = {
+                    "version": ZENOH_PREFIX and 1 or 1,  # PROTOCOL_VERSION = 1
+                    "request_id": req.request_id if req else "",
+                    "job_id": req.job_id if req else "",
+                    "kind": "error" if status == "error" else "status",
+                    "status": status,
+                    "error": None,
+                }
+                if extras:
+                    if "message" in extras and status == "error":
+                        payload["error"] = {
+                            "code": extras.pop("code", "INTERNAL"),
+                            "message": extras.pop("message", ""),
+                        }
+                    payload.update(extras)
+
             self.pub.put(json.dumps(payload).encode("utf-8"))
         except Exception as e:
             log.warning(f"Failed to send status: {e}")
 
     def on_request(self, sample) -> None:
         try:
-            from ipc_protocol import RequestEnvelope as _Envelope
             raw = json.loads(sample.payload.to_bytes().decode("utf-8"))
-            # Parse into typed envelope — unknown fields silently ignored.
-            env = _Envelope.from_dict(raw)
-            self._current_request = env  # stash for send_status correlation
-            cmd = env.kind
-            payload = raw  # legacy handlers still read from raw dict
+            env = None
+            payload = raw
+
+            if self.use_typed_ipc:
+                from ipc_protocol import RequestEnvelope
+
+                try:
+                    env = RequestEnvelope.from_json(raw)
+                except ValueError as e:
+                    log.error(f"Typed IPC parse failed: {e}")
+                    self.send_status(
+                        "error",
+                        {
+                            "code": "IPC_PARSE_ERROR",
+                            "message": str(e),
+                        },
+                    )
+                    return
+                self._current_request = env  # stash for send_status correlation
+                cmd = env.kind
+                payload = env.payload
+            else:
+                cmd = raw.get("kind") or raw.get("command")
+                payload = raw.get("payload", raw) if isinstance(raw, dict) else raw
+                self._current_request = None
 
             if cmd == "create_shm":
-                # create_shm reads from the raw payload for backward compat
-                p = env.payload if isinstance(env.payload, dict) and env.payload else raw
+                p = payload if isinstance(payload, dict) and payload else raw
                 self.create_shm(p)
             elif cmd == "process_frame":
                 self.process_frame(payload)
             elif cmd == "process_one_frame":
-                p = env.payload if isinstance(env.payload, dict) else {}
+                p = payload if isinstance(payload, dict) else {}
                 self.process_one_frame(p)
             elif cmd == "start_frame_loop":
-                p = env.payload if isinstance(env.payload, dict) else {}
+                p = payload if isinstance(payload, dict) else {}
                 self.start_frame_loop(p)
             elif cmd == "stop_frame_loop":
                 self.stop_frame_loop(payload)
             elif cmd == "load_model":
-                p = env.payload if isinstance(env.payload, dict) else {}
+                p = payload if isinstance(payload, dict) else {}
                 model_name = p.get("model_name") or raw.get("params", {}).get("model_name")
                 if model_name:
                     self.load_model(model_name)
             elif cmd == "upscale_image_file":
-                p = env.payload if isinstance(env.payload, dict) else raw
+                p = payload if isinstance(payload, dict) else raw
                 self.handle_image_file(p)
             elif cmd == "analyze_for_auto_grade":
                 self.handle_auto_grade_analysis(payload)
             elif cmd == "update_research_params":
                 self.handle_update_research_params(payload)
                 self._cached_research_params = (
-                    env.payload.get("params") if isinstance(env.payload, dict)
+                    payload.get("params") if isinstance(payload, dict)
                     else raw.get("params")
                 )
             elif cmd == "shutdown":
