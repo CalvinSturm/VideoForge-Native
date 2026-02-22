@@ -16,6 +16,7 @@ Author: VideoForge Team
 import argparse
 import importlib
 import json
+import logging
 import mmap
 import os
 import struct
@@ -33,6 +34,9 @@ from typing import Optional, Tuple, Dict, Any
 # at module level — configure_precision() is the single source of truth.
 
 import torch
+from logging_setup import setup_logging
+
+log = setup_logging(None)
 
 # Global precision mode — set by configure_precision(), read by inference()
 _PRECISION_MODE: str = "fp32"
@@ -68,14 +72,14 @@ def configure_precision(mode: str = "fp32") -> None:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         torch.use_deterministic_algorithms(True)
-        print(f"[Python] Precision: DETERMINISTIC (TF32=off, strict_deterministic=on)", flush=True)
+        log.info(f"Precision: DETERMINISTIC (TF32=off, strict_deterministic=on)")
     else:
         # fp32 / fp16: enable TF32 for 2-4× speedup on Ampere+
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.use_deterministic_algorithms(False)
         tag = "FP16 (autocast)" if mode == "fp16" else "FP32"
-        print(f"[Python] Precision: {tag} (TF32=on, cuDNN_deterministic=on)", flush=True)
+        log.info(f"Precision: {tag} (TF32=on, cuDNN_deterministic=on)")
 
 
 # Apply safe defaults immediately (overridden by configure_precision() at startup)
@@ -89,7 +93,7 @@ try:
     import cv2
     import numpy as np
 except ImportError as e:
-    print(f"[Python Critical] Missing Dependency: {e}", flush=True)
+    log.error(f"Missing Dependency: {e}")
     sys.exit(1)
 
 
@@ -113,7 +117,7 @@ try:
     HAS_RESEARCH_LAYER = True
 except ImportError:
     HAS_RESEARCH_LAYER = False
-    print("[Python] Research layer not available — running vanilla inference only", flush=True)
+    log.info("Research layer not available — running vanilla inference only")
 
 # Blender engine (optional — SR pipeline post-processing)
 try:
@@ -121,7 +125,7 @@ try:
     HAS_BLENDER = True
 except ImportError:
     HAS_BLENDER = False
-    print("[Python] Blender engine not available — SR pipeline post-processing disabled", flush=True)
+    log.info("Blender engine not available — SR pipeline post-processing disabled")
 
 # =============================================================================
 # CONFIGURATION
@@ -200,10 +204,10 @@ class Config:
             cls.STATE_FIELD_OFFSET = offsets.get("state", 8)
             cls.FRAME_BYTES_FIELD_OFFSET = offsets.get("frame_bytes", 12)
             
-            print(f"[Python] Loaded SHM protocol from {protocol_path}", flush=True)
+            log.info(f"Loaded SHM protocol from {protocol_path}")
             
         except Exception as e:
-            print(f"[Python Warning] Failed to load SHM protocol: {e}. Using defaults.", flush=True)
+            log.warning(f"Failed to load SHM protocol: {e}. Using defaults.")
 
 # Load protocol immediately
 Config.load_shm_protocol()
@@ -266,16 +270,16 @@ def is_pid_alive(pid: int) -> bool:
         ctypes.windll.kernel32.CloseHandle(handle)
         return False
     except Exception as e:
-        print(f"[Python Warning] PID check failed: {e}", flush=True)
+        log.warning(f"PID check failed: {e}")
         return False
 
 
 def watchdog_loop(parent_pid: int) -> None:
     """Monitor parent process. If it dies, we die."""
-    print(f"[Python] Watchdog started for Parent PID: {parent_pid}", flush=True)
+    log.info(f"Watchdog started for Parent PID: {parent_pid}")
     while True:
         if not is_pid_alive(parent_pid):
-            print(f"[Python] Parent {parent_pid} died. Committing seppuku...", flush=True)
+            log.info(f"Parent {parent_pid} died. Committing seppuku...")
             os._exit(0)
         time.sleep(Config.PARENT_CHECK_INTERVAL)
 
@@ -425,10 +429,10 @@ def inference_batch(
     except RuntimeError as e:
         # OOM or other failure — fall back to sequential
         if "out of memory" in str(e).lower():
-            print(f"[Python] Batch OOM (N={len(imgs_rgb)}), falling back to sequential", flush=True)
+            log.info(f"Batch OOM (N={len(imgs_rgb)}), falling back to sequential")
             torch.cuda.empty_cache()
         else:
-            print(f"[Python] Batch forward failed: {e}, falling back to sequential", flush=True)
+            log.info(f"Batch forward failed: {e}, falling back to sequential")
         return [inference(model, img, device, half=half, adapter=adapter) for img in imgs_rgb]
 
     # Split batch output back to list of numpy arrays
@@ -457,15 +461,16 @@ class AIWorker:
         prealloc_tensors: bool = False,
         deterministic: bool = False,
     ):
+        self.log = logging.getLogger("videoforge")
         # Deterministic mode forces batch_size=1 for bit-exact output
         if precision == "deterministic":
             Config.MAX_BATCH_SIZE = 1
-            print(f"[Python] Deterministic mode: batch_size forced to 1", flush=True)
+            log.info(f"Deterministic mode: batch_size forced to 1")
 
-        print(f"[Python] Initializing Zenoh on Port {port}...", flush=True)
-        print(f"[Python] Precision mode: {precision}", flush=True)
-        print(f"[Python] CUDNN deterministic: {torch.backends.cudnn.deterministic}", flush=True)
-        print(f"[Python] CUDNN benchmark: {torch.backends.cudnn.benchmark}", flush=True)
+        log.info(f"Initializing Zenoh on Port {port}...")
+        log.info(f"Precision mode: {precision}")
+        log.debug(f"CUDNN deterministic: {torch.backends.cudnn.deterministic}")
+        log.debug(f"CUDNN benchmark: {torch.backends.cudnn.benchmark}")
 
         zenoh = _require_zenoh()
         conf = zenoh.Config()
@@ -473,9 +478,9 @@ class AIWorker:
 
         try:
             self.session = zenoh.open(conf)
-            print("[Python] Zenoh connected successfully", flush=True)
+            log.info("Zenoh connected successfully")
         except Exception as e:
-            print(f"[Python CRITICAL] Zenoh connection failed: {e}", flush=True)
+            log.error(f"Zenoh connection failed: {e}")
             sys.exit(1)
 
         unique_prefix = f"{ZENOH_PREFIX}/{port}"
@@ -486,7 +491,7 @@ class AIWorker:
                 f"{unique_prefix}/req", self.on_request
             )
         except Exception as e:
-            print(f"[Python CRITICAL] Zenoh pub/sub setup failed: {e}", flush=True)
+            log.error(f"Zenoh pub/sub setup failed: {e}")
             sys.exit(1)
 
         self.shm_file = None
@@ -535,41 +540,41 @@ class AIWorker:
         if HAS_RESEARCH_LAYER:
             try:
                 self.spatial_pub = self.session.declare_publisher(SPATIAL_MAP_TOPIC)
-                print("[Python] Spatial map publisher ready", flush=True)
+                log.info("Spatial map publisher ready")
             except Exception as e:
-                print(f"[Python Warning] Spatial map publisher failed: {e}", flush=True)
+                log.warning(f"Spatial map publisher failed: {e}")
 
         # Load default model
         default_model = "rcan_4x"
-        print(f"[Python] Attempting initial load: {default_model}", flush=True)
+        log.info(f"Attempting initial load: {default_model}")
         self.load_model(default_model)
         self.loop()
 
     def loop(self) -> None:
-        print("[Python] Ready...", flush=True)
+        log.info("Ready...")
         while self.running:
             time.sleep(0.1)
         self.cleanup()
 
     def cleanup(self) -> None:
-        print("[Python] Cleanup...", flush=True)
+        log.info("Cleanup...")
         if self.mmap:
             try:
                 self.mmap.close()
             except Exception as e:
-                print(f"[Python Warning] mmap close failed: {e}", flush=True)
+                log.warning(f"mmap close failed: {e}")
         if self.shm_file:
             try:
                 self.shm_file.close()
                 if self.shm_path and os.path.exists(self.shm_path):
                     os.unlink(self.shm_path)
             except Exception as e:
-                print(f"[Python Warning] SHM file cleanup failed: {e}", flush=True)
+                log.warning(f"SHM file cleanup failed: {e}")
         if self.session:
             try:
                 self.session.close()
             except Exception as e:
-                print(f"[Python Warning] Zenoh session close failed: {e}", flush=True)
+                log.warning(f"Zenoh session close failed: {e}")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -583,9 +588,8 @@ class AIWorker:
             self.expects_rgb = self.model_loader.expects_rgb
             self.adapter = getattr(self.model_loader, 'adapter', None)
 
-            print(
-                f"[Python] Loaded: {self.model_name} (Scale: x{self.model_scale}, expects_rgb={self.expects_rgb})",
-                flush=True,
+            log.info(
+                f"Loaded: {self.model_name} (Scale: x{self.model_scale}, expects_rgb={self.expects_rgb})"
             )
 
             # Register with research layer
@@ -596,9 +600,9 @@ class AIWorker:
                         scale=self.model_scale,
                         device=self.device,
                     )
-                    print(f"[Python] Research layer initialized with {self.model_name} as structure model", flush=True)
+                    log.info(f"Research layer initialized with {self.model_name} as structure model")
                 except Exception as e:
-                    print(f"[Python Warning] Research layer init failed: {e}", flush=True)
+                    log.warning(f"Research layer init failed: {e}")
                     self.research_layer = None
 
             self.send_status(
@@ -606,8 +610,8 @@ class AIWorker:
             )
 
         except Exception as e:
-            print(f"[Python CRITICAL] Load Error: {e}", flush=True)
-            traceback.print_exc()
+            log.error(f"Load Error: {e}")
+            log.exception("Load failed")
             self.send_status("error", {"message": f"Load Failed: {str(e)}"})
 
     def send_status(self, status: str, extra: Optional[Dict] = None) -> None:
@@ -637,7 +641,7 @@ class AIWorker:
         try:
             self.pub.put(json.dumps(payload).encode("utf-8"))
         except Exception as e:
-            print(f"[Python Warning] Failed to send status: {e}", flush=True)
+            log.warning(f"Failed to send status: {e}")
 
     def on_request(self, sample) -> None:
         try:
@@ -683,11 +687,11 @@ class AIWorker:
                 self.stop_frame_loop()
                 self.running = False
             else:
-                print(f"[Python Warning] Unknown command kind: {cmd!r}", flush=True)
+                log.warning(f"Unknown command kind: {cmd!r}")
                 self.send_status("error", {"message": f"Unknown command: {cmd}"})
         except Exception as e:
-            print(f"[Python Error] Request failed: {e}", flush=True)
-            traceback.print_exc()
+            log.error(f"Request failed: {e}")
+            log.exception("Request handler exception")
             self.send_status("error", {"message": str(e)})
         finally:
             self._current_request = None
@@ -734,7 +738,7 @@ class AIWorker:
                 self.send_status("error", {"message": f"Could not load image: {image_path}"})
                 return
             
-            print(f"[Python] Auto-grade analysis for: {image_path}", flush=True)
+            log.info(f"Auto-grade analysis for: {image_path}")
             
             # Run analysis
             result = analyze_frame_for_auto_grade(frame, protect_skin, conservative_mode)
@@ -757,11 +761,11 @@ class AIWorker:
                 }
             })
             
-            print(f"[Python] Auto-grade complete: confidence={result['confidence']:.2f}, summary={result['summary']}", flush=True)
+            log.info(f"Auto-grade complete: confidence={result['confidence']:.2f}, summary={result['summary']}")
             
         except Exception as e:
-            print(f"[Python Error] Auto-grade analysis failed: {e}", flush=True)
-            traceback.print_exc()
+            log.error(f"Auto-grade analysis failed: {e}")
+            log.exception("Auto-grade exception")
             self.send_status("error", {"message": f"Auto-grade failed: {str(e)}"})
 
     def handle_update_research_params(self, payload: Dict[str, Any]) -> None:
@@ -772,10 +776,10 @@ class AIWorker:
         try:
             params = payload.get("params", {})
             self.research_layer.update_params(params)
-            print(f"[Python] Research params updated: {list(params.keys())}", flush=True)
+            log.info(f"Research params updated: {list(params.keys())}")
             self.send_status("RESEARCH_PARAMS_UPDATED", {"keys": list(params.keys())})
         except Exception as e:
-            print(f"[Python Error] Research params update failed: {e}", flush=True)
+            log.error(f"Research params update failed: {e}")
             self.send_status("error", {"message": f"Params update failed: {str(e)}"})
 
     def _publish_spatial_map(self, lr_rgb: np.ndarray) -> None:
@@ -807,7 +811,7 @@ class AIWorker:
             buf = struct.pack("<II", w, h) + classification.tobytes()
             self.spatial_pub.put(buf)
         except Exception as e:
-            print(f"[Python Warning] Spatial map publish failed: {e}", flush=True)
+            log.warning(f"Spatial map publish failed: {e}")
 
     # -------------------------------------------------------------------------
     # TILING LOGIC - Tile-invariant, Crop-invariant, No Seam Artifacts
@@ -942,7 +946,7 @@ class AIWorker:
             try:
                 self.research_layer.update_params(research_params)
             except Exception as e:
-                print(f"[Python Warning] Research params update failed: {e}", flush=True)
+                log.warning(f"Research params update failed: {e}")
 
         try:
             params = payload["params"]
@@ -1031,7 +1035,7 @@ class AIWorker:
             self.send_status("ok", {"id": req_id})
 
         except Exception as e:
-            traceback.print_exc()
+            log.exception("Image upscale failed")
             self.send_status("error", {"id": req_id, "message": str(e)})
 
     def create_shm(self, payload: Dict) -> None:
@@ -1101,17 +1105,16 @@ class AIWorker:
                 self._pinned_input = None
 
             self.is_configured = True
-            print(
-                f"[Python] SHM created: {total_size} bytes "
+            log.info(
+                f"SHM created: {total_size} bytes "
                 f"(global_header={Config.GLOBAL_HEADER_SIZE}, "
                 f"header_region={self.header_region_size}, "
-                f"{self.ring_size} slots × {self.slot_byte_size}), "
-                f"magic=VFSHM001 version={Config.SHM_VERSION}",
-                flush=True,
+                f"{self.ring_size} slots x {self.slot_byte_size}), "
+                f"magic=VFSHM001 version={Config.SHM_VERSION}"
             )
             self.send_status("SHM_CREATED", {"shm_path": self.shm_path})
         except Exception as e:
-            traceback.print_exc()
+            log.exception("Failed to create SHM")
             self.send_status("error", {"message": str(e)})
 
     def _validate_shm_header(self) -> None:
@@ -1226,7 +1229,7 @@ class AIWorker:
             try:
                 out_for_rust = self.research_layer.process_frame_numpy(img_input)
             except Exception as e:
-                print(f"[Python Warning] Research layer failed, using vanilla: {e}", flush=True)
+                log.warning(f"Research layer failed, using vanilla: {e}")
 
         # Publish spatial routing map for UI overlay
         self._publish_spatial_map(img_input)
@@ -1238,7 +1241,7 @@ class AIWorker:
 
                 if sr.get("reset_temporal"):
                     clear_temporal_buffers()
-                    print("[Python] Temporal buffers cleared by user request", flush=True)
+                    log.info("Temporal buffers cleared by user request")
 
                 adr_on = bool(sr.get("adr_enabled", False))
                 detail_str = float(sr.get("detail_strength", 0.0))
@@ -1295,7 +1298,7 @@ class AIWorker:
                         .numpy()
                     )
             except Exception as e:
-                print(f"[Python Warning] SR pipeline post-processing failed: {e}", flush=True)
+                log.warning(f"SR pipeline post-processing failed: {e}")
 
         # Handle scale mismatch (resize output if needed)
         h, w = out_for_rust.shape[:2]
@@ -1321,14 +1324,14 @@ class AIWorker:
             try:
                 self.research_layer.update_params(research_params)
             except Exception as e:
-                print(f"[Python Warning] Research params update failed: {e}", flush=True)
+                log.warning(f"Research params update failed: {e}")
 
         slot_idx = payload.get("slot", 0)
         try:
             self._process_slot(slot_idx, research_params)
             self.send_status("FRAME_DONE", {"slot": slot_idx})
         except Exception as e:
-            traceback.print_exc()
+            log.exception("Request failed")
             self.send_status("error", {"message": str(e)})
 
     def process_one_frame(self, payload: Dict) -> None:
@@ -1359,7 +1362,7 @@ class AIWorker:
         try:
             self._process_slot(slot_idx)
         except Exception as e:
-            traceback.print_exc()
+            log.exception("Single frame processing failed")
             self._write_slot_state(slot_idx, Config.SLOT_EMPTY)
             self.send_status("error", {"message": str(e)})
             return
@@ -1455,7 +1458,7 @@ class AIWorker:
                     img_input = in_view.copy()
                     out_for_rust = self.research_layer.process_frame_numpy(img_input)
                 except Exception as e:
-                    print(f"[Python Warning] Research layer failed, using vanilla: {e}", flush=True)
+                    log.warning(f"Research layer failed, using vanilla: {e}")
 
             # Spatial map (only for first frame in batch to reduce overhead)
             if i == 0:
@@ -1472,7 +1475,7 @@ class AIWorker:
 
                     if sr.get("reset_temporal") and i == 0:
                         clear_temporal_buffers()
-                        print("[Python] Temporal buffers cleared by user request", flush=True)
+                        log.info("Temporal buffers cleared by user request")
 
                     adr_on = bool(sr.get("adr_enabled", False))
                     detail_str = float(sr.get("detail_strength", 0.0))
@@ -1529,7 +1532,7 @@ class AIWorker:
                             .numpy()
                         )
                 except Exception as e:
-                    print(f"[Python Warning] SR pipeline post-processing failed: {e}", flush=True)
+                    log.warning(f"SR pipeline post-processing failed: {e}")
 
             # Handle scale mismatch
             h, w = out_for_rust.shape[:2]
@@ -1554,7 +1557,7 @@ class AIWorker:
         Slots are processed in strict sequential order (0 → 1 → 2 → 0 → …)
         to preserve frame ordering.
         """
-        print("[Python] Frame loop started (SHM atomic polling, micro-batch)", flush=True)
+        log.info("Frame loop started (SHM atomic polling, micro-batch)")
         next_slot = 0
         idle_spins = 0
 
@@ -1575,8 +1578,8 @@ class AIWorker:
                 try:
                     self._process_batch(batch, self._cached_research_params)
                 except Exception as e:
-                    print(f"[Python Error] Batch processing failed: {e}", flush=True)
-                    traceback.print_exc()
+                    log.error(f"Batch processing failed: {e}")
+                    log.exception("Batch processing failed")
                     for idx in batch:
                         self._write_slot_state(idx, Config.SLOT_EMPTY)
                     next_slot = (batch[-1] + 1) % self.ring_size
@@ -1597,13 +1600,13 @@ class AIWorker:
                 else:
                     time.sleep(0.005)   # 5ms deep idle
 
-        print("[Python] Frame loop stopped", flush=True)
+        log.info("Frame loop stopped")
 
     def start_frame_loop(self, payload: Dict) -> None:
         """Start the SHM atomic frame polling loop in a background thread."""
         if hasattr(self, '_frame_loop_thread') and self._frame_loop_thread is not None:
             if self._frame_loop_thread.is_alive():
-                print("[Python] Frame loop already running", flush=True)
+                log.info("Frame loop already running")
                 return
 
         # Cache initial research params
@@ -1640,7 +1643,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-level",
         choices=["debug", "info", "warning", "error", "critical"],
         default=None,
-        help="Parsed only (plumbing); runtime behavior unchanged"
+        help="Logger verbosity for stderr output (default: info)"
     )
     parser.add_argument("--use-typed-ipc", action="store_true", help="Parsed only (plumbing)")
     parser.add_argument("--use-events", action="store_true", help="Parsed only (plumbing)")
@@ -1650,10 +1653,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_worker(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level)
     try:
         _require_zenoh()
     except RuntimeError as e:
-        print(f"[Python Critical] {e}", flush=True)
+        log.error(f"{e}")
         return 1
 
     # Configure precision BEFORE any model loading or CUDA ops
@@ -1686,3 +1690,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

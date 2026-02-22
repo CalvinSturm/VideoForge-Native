@@ -15,6 +15,7 @@ Adapter taxonomy:
 
 from __future__ import annotations
 
+import logging
 import math
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -22,6 +23,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+log = logging.getLogger("videoforge")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -357,14 +360,14 @@ def create_adapter(
     # ONNX models have all pre/post-processing baked into the graph — skip
     # every architecture-specific adapter and use a plain pass-through.
     if getattr(model, "_vf_onnx", False):
-        print(f"[ArchWrappers] ONNX model, using LightweightAdapter (pass-through, FP32)", flush=True)
+        log.info(f"ONNX model, using LightweightAdapter (pass-through, FP32)")
         return LightweightAdapter(model=model, scale=scale, use_autocast=False)
 
     # Spandrel-loaded models handle their own padding, mean shift, and cropping.
     # Use a pass-through adapter with autocast disabled — transformer attention
     # layers (SwinIR, HAT, DAT) overflow in FP16, producing NaN.
     if getattr(model, "_vf_spandrel", False):
-        print(f"[ArchWrappers] Spandrel model, using LightweightAdapter (pass-through, FP32)", flush=True)
+        log.info(f"Spandrel model, using LightweightAdapter (pass-through, FP32)")
         if scale <= 0:
             scale = BaseAdapter.infer_scale(model, device)
         return LightweightAdapter(model=model, scale=scale, use_autocast=False)
@@ -372,7 +375,7 @@ def create_adapter(
     # If the model was loaded as-is with MeanShift layers intact,
     # use ScaledRangeAdapter to avoid double mean subtraction.
     if getattr(model, "_vf_has_mean_shift", False):
-        print(f"[ArchWrappers] Model has MeanShift, using ScaledRangeAdapter", flush=True)
+        log.info(f"Model has MeanShift, using ScaledRangeAdapter")
         if scale <= 0:
             scale = BaseAdapter.infer_scale(model, device)
         return ScaledRangeAdapter(model=model, scale=scale)
@@ -380,19 +383,20 @@ def create_adapter(
     key = _match_adapter_key(model_key)
     if key is None:
         # Fallback to LightweightAdapter (plain conv, no special padding)
-        print(
-            f"[ArchWrappers] No adapter match for '{model_key}', "
-            f"falling back to LightweightAdapter", flush=True
+        log.warning(
+            f"No adapter match for '{model_key}', "
+            f"falling back to LightweightAdapter"
         )
         if scale <= 0:
             scale = BaseAdapter.infer_scale(model, device)
         return LightweightAdapter(model=model, scale=scale)
 
     adapter_cls, extra_kwargs = _ADAPTER_REGISTRY[key]
-    print(f"[ArchWrappers] Matched '{model_key}' -> {key} ({adapter_cls.__name__})", flush=True)
+    log.info(f"Matched '{model_key}' -> {key} ({adapter_cls.__name__})")
 
     if scale <= 0:
         scale = BaseAdapter.infer_scale(model, device)
-        print(f"[ArchWrappers] Auto-detected scale: {scale}x", flush=True)
+        log.info(f"Auto-detected scale: {scale}x")
 
     return adapter_cls(model=model, scale=scale, **extra_kwargs)
+

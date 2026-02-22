@@ -12,6 +12,7 @@ This is the single entry point for all SR inference.  It owns:
 from __future__ import annotations
 
 import gc
+import logging
 import os
 import sys
 import threading
@@ -33,6 +34,8 @@ torch.backends.cudnn.benchmark = False
 
 from arch_wrappers import BaseAdapter, create_adapter  # noqa: E402
 from blender_engine import PredictionBlender, clear_temporal_buffers  # noqa: E402
+
+log = logging.getLogger("videoforge")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -366,7 +369,7 @@ def _register_official_model_stubs() -> None:
     sys.modules["model.rcan"] = rcan_mod
     sys.modules["model.edsr"] = edsr_mod
 
-    print("[ModelManager] Registered official EDSR/RCAN model stubs", flush=True)
+    log.info("Registered official EDSR/RCAN model stubs")
 
 
 def _load_via_spandrel(path: str, model_key: str) -> Tuple[nn.Module, int]:
@@ -384,7 +387,7 @@ def _load_via_spandrel(path: str, model_key: str) -> Tuple[nn.Module, int]:
             "Install: pip install spandrel"
         )
 
-    print(f"[ModelManager] Loading via spandrel: {model_key}", flush=True)
+    log.info(f"Loading via spandrel: {model_key}")
     model_descriptor = spandrel.ModelLoader(device="cpu").load_from_file(path)
     model = model_descriptor.model
     scale = model_descriptor.scale
@@ -397,8 +400,8 @@ def _load_via_spandrel(path: str, model_key: str) -> Tuple[nn.Module, int]:
     # Spandrel models handle their own padding, mean subtraction, and cropping.
     model._vf_spandrel = True  # type: ignore[attr-defined]
 
-    print(f"[ModelManager] Spandrel loaded {model_key}: "
-          f"arch={model_descriptor.architecture.name}, scale={scale}x", flush=True)
+    log.info(f"Spandrel loaded {model_key}: "
+          f"arch={model_descriptor.architecture.name}, scale={scale}x")
     return model, scale
 
 
@@ -503,15 +506,14 @@ def _load_swin2sr_hf(
     hf_model = Swin2SRForImageSuperResolution(config)
     missing, unexpected = hf_model.load_state_dict(state_dict, strict=False)
     if missing:
-        print(f"[ModelManager] Swin2SR HF load: {len(missing)} missing keys", flush=True)
+        log.info(f"Swin2SR HF load: {len(missing)} missing keys")
 
     hf_model.eval()
     for p in hf_model.parameters():
         p.requires_grad_(False)
 
     wrapper = _Swin2SRWrapper(hf_model, window_size=8, scale=scale)
-    print(
-        f"[ModelManager] Loaded Swin2SR via HuggingFace transformers: "
+    log.info(f"Loaded Swin2SR via HuggingFace transformers: "
         f"embed={embed_dim}, depths={depths}, scale={scale}x, upsampler={upsampler}",
         flush=True,
     )
@@ -649,24 +651,23 @@ def _load_onnx_model(path: str) -> Tuple[nn.Module, int]:
     # Try CUDA EP first. Some transformer models (DAT2 deformable/sparse attention)
     # deadlock ORT's CUDA kernels. Probe with a dummy input before committing.
     if "CUDAExecutionProvider" in available:
-        print(f"[ModelManager] Loading ONNX (CUDA EP probe): {os.path.basename(path)}", flush=True)
+        log.info(f"Loading ONNX (CUDA EP probe): {os.path.basename(path)}")
         cuda_session = ort.InferenceSession(
             path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
         )
         inp_info = cuda_session.get_inputs()[0]
         if _probe_onnx_session(cuda_session, inp_info):
-            print(f"[ModelManager] ONNX CUDA EP OK — scale={scale}x tile={preferred_tile_size}px", flush=True)
+            log.info(f"ONNX CUDA EP OK — scale={scale}x tile={preferred_tile_size}px")
             return OnnxModelWrapper(cuda_session, scale, preferred_tile_size), scale
         else:
-            print(
-                f"[ModelManager] CUDA EP probe timed out for {os.path.basename(path)}, "
-                f"falling back to CPU EP (inference will be slower)",
-                flush=True,
+            log.warning(
+                f"CUDA EP probe timed out for {os.path.basename(path)}, "
+                f"falling back to CPU EP (inference will be slower)"
             )
 
-    print(f"[ModelManager] Loading ONNX (CPU EP): {os.path.basename(path)}", flush=True)
+    log.info(f"Loading ONNX (CPU EP): {os.path.basename(path)}")
     cpu_session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
-    print(f"[ModelManager] ONNX CPU EP loaded — scale={scale}x tile={preferred_tile_size}px", flush=True)
+    log.info(f"ONNX CPU EP loaded — scale={scale}x tile={preferred_tile_size}px")
     return OnnxModelWrapper(cpu_session, scale, preferred_tile_size), scale
 
 
@@ -686,7 +687,7 @@ def _load_module(model_key: str) -> Tuple[nn.Module, int]:
     Raises ``RuntimeError`` if loading fails for any reason.
     """
     path = _resolve_weight_path(model_key)
-    print(f"[ModelManager] Loading {model_key} from {path}", flush=True)
+    log.info(f"Loading {model_key} from {path}")
 
     # ── ONNX models bypass the PyTorch loading pipeline entirely ──────
     if path.lower().endswith(".onnx"):
@@ -701,7 +702,7 @@ def _load_module(model_key: str) -> Tuple[nn.Module, int]:
                 "safetensors package required for .safetensors files. "
                 "Install: pip install safetensors"
             )
-        print(f"[ModelManager] Loading safetensors: {path}", flush=True)
+        log.info(f"Loading safetensors: {path}")
         loaded = load_file(path, device="cpu")
     else:
         # Try loading — if it fails with an import error the file is likely a full
@@ -709,7 +710,7 @@ def _load_module(model_key: str) -> Tuple[nn.Module, int]:
         try:
             loaded = torch.load(path, map_location="cpu", weights_only=False)
         except (ImportError, ModuleNotFoundError) as e:
-            print(f"[ModelManager] Pickle import failed ({e}), registering model stubs and retrying", flush=True)
+            log.info(f"Pickle import failed ({e}), registering model stubs and retrying")
             _register_official_model_stubs()
             loaded = torch.load(path, map_location="cpu", weights_only=False)
 
@@ -718,11 +719,11 @@ def _load_module(model_key: str) -> Tuple[nn.Module, int]:
     # and pipeline can work correctly (official models include MeanShift
     # layers that we handle in the adapter instead).
     if isinstance(loaded, nn.Module):
-        print(f"[ModelManager] Loaded full model object ({type(loaded).__name__}), extracting state dict", flush=True)
+        log.info(f"Loaded full model object ({type(loaded).__name__}), extracting state dict")
         loaded.eval()
         state_dict = loaded.state_dict()
         family = _detect_family(model_key, state_dict)
-        print(f"[ModelManager] Full model family='{family}', rebuilding with our architecture", flush=True)
+        log.info(f"Full model family='{family}', rebuilding with our architecture")
 
         # Strip MeanShift keys (sub_mean / add_mean) — handled by adapter
         state_dict = {k: v for k, v in state_dict.items()
@@ -733,12 +734,12 @@ def _load_module(model_key: str) -> Tuple[nn.Module, int]:
             try:
                 model = _build_rcan(state_dict, model_key)
             except Exception as e:
-                print(f"[ModelManager] RCAN rebuild failed: {e}", flush=True)
+                log.info(f"RCAN rebuild failed: {e}")
         elif family == "edsr":
             try:
                 model = _build_edsr(state_dict, model_key)
             except Exception as e:
-                print(f"[ModelManager] EDSR rebuild failed: {e}", flush=True)
+                log.info(f"EDSR rebuild failed: {e}")
 
         if model is not None:
             model.eval()
@@ -748,7 +749,7 @@ def _load_module(model_key: str) -> Tuple[nn.Module, int]:
             scale = BaseAdapter.infer_scale(model_on_device, DEVICE)
             model_on_device.cpu()
             torch.cuda.empty_cache()
-            print(f"[ModelManager] Rebuilt from full model, scale={scale}x", flush=True)
+            log.info(f"Rebuilt from full model, scale={scale}x")
             return model, scale
 
         # Fallback: use the loaded model as-is (includes MeanShift).
@@ -761,21 +762,21 @@ def _load_module(model_key: str) -> Tuple[nn.Module, int]:
             loaded._vf_has_mean_shift = True  # type: ignore[attr-defined]
         scale = BaseAdapter.infer_scale(loaded.to(DEVICE), DEVICE)
         loaded.cpu()
-        print(f"[ModelManager] Using full model as-is (has_mean_shift={has_sub_mean}), "
-              f"detected scale={scale}x", flush=True)
+        log.info(f"Using full model as-is (has_mean_shift={has_sub_mean}), "
+              f"detected scale={scale}x")
         return loaded, scale
 
     # ── State-dict checkpoint ─────────────────────────────────────────
     state_dict = _extract_state_dict(loaded)
     family = _detect_family(model_key, state_dict)
-    print(f"[ModelManager] Detected family='{family}' for {model_key}", flush=True)
+    log.info(f"Detected family='{family}' for {model_key}")
 
     # Strip MeanShift keys for RCAN/EDSR — we handle range/mean in adapter
     if family in ("rcan", "edsr"):
         stripped = {k: v for k, v in state_dict.items()
                     if not k.startswith("sub_mean.") and not k.startswith("add_mean.")}
         if len(stripped) < len(state_dict):
-            print(f"[ModelManager] Stripped {len(state_dict) - len(stripped)} MeanShift keys", flush=True)
+            log.info(f"Stripped {len(state_dict) - len(stripped)} MeanShift keys")
             state_dict = stripped
 
     model: Optional[nn.Module] = None
@@ -785,12 +786,12 @@ def _load_module(model_key: str) -> Tuple[nn.Module, int]:
         try:
             model = _build_rcan(state_dict, model_key)
         except Exception as e:
-            print(f"[ModelManager] RCAN builder failed: {e}, trying spandrel", flush=True)
+            log.info(f"RCAN builder failed: {e}, trying spandrel")
     elif family == "edsr":
         try:
             model = _build_edsr(state_dict, model_key)
         except Exception as e:
-            print(f"[ModelManager] EDSR builder failed: {e}, trying spandrel", flush=True)
+            log.info(f"EDSR builder failed: {e}, trying spandrel")
 
     # For everything else (including realesrgan), use spandrel — it handles
     # RRDBNet, SwinIR, HAT, DAT, OmniSR, MOSR, SPAN, ESRGAN, and 20+ more
@@ -798,7 +799,7 @@ def _load_module(model_key: str) -> Tuple[nn.Module, int]:
         try:
             return _load_via_spandrel(path, model_key)
         except Exception as spandrel_err:
-            print(f"[ModelManager] Spandrel failed: {spandrel_err}", flush=True)
+            log.info(f"Spandrel failed: {spandrel_err}")
 
             # Try HuggingFace Swin2SR loader for HF-format state dicts
             is_hf_swin2sr = any(
@@ -838,7 +839,7 @@ def _load_module(model_key: str) -> Tuple[nn.Module, int]:
     scale = BaseAdapter.infer_scale(model_on_device, DEVICE)
     model_on_device.cpu()
     torch.cuda.empty_cache()
-    print(f"[ModelManager] Built {model_key}, detected scale={scale}x", flush=True)
+    log.info(f"Built {model_key}, detected scale={scale}x")
     return model, scale
 
 
@@ -1090,7 +1091,7 @@ def remap_edsr_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tens
             new_key = key
         new_dict[new_key] = value
 
-    print(f"[ModelManager] Remapped {len(new_dict)} EDSR keys from BasicSR -> official format", flush=True)
+    log.info(f"Remapped {len(new_dict)} EDSR keys from BasicSR -> official format")
     return new_dict
 
 
@@ -1186,27 +1187,27 @@ def _build_rcan(
             # Last index in the group Sequential is a plain conv, not RCAB
             num_rcab = max(rcab_indices)  # 0..num_rcab-1 are RCABs, num_rcab is conv
 
-    print(f"[ModelManager] RCAN params: num_feat={num_feat}, num_group={num_group}, "
-          f"num_rcab={num_rcab}, scale={scale}", flush=True)
+    log.info(f"RCAN params: num_feat={num_feat}, num_group={num_group}, "
+          f"num_rcab={num_rcab}, scale={scale}")
 
     model = RCAN(num_feat=num_feat, num_group=num_group,
                  num_rcab=num_rcab, scale=scale)
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as e:
-        print(f"[ModelManager] RCAN strict load failed: {e}", flush=True)
+        log.info(f"RCAN strict load failed: {e}")
         # Log key differences for debugging
         model_keys = set(model.state_dict().keys())
         weight_keys = set(state_dict.keys())
         missing = model_keys - weight_keys
         unexpected = weight_keys - model_keys
         if missing:
-            print(f"[ModelManager] Missing keys ({len(missing)}): {sorted(missing)[:5]}...", flush=True)
+            log.info(f"Missing keys ({len(missing)}): {sorted(missing)[:5]}...")
         if unexpected:
-            print(f"[ModelManager] Unexpected keys ({len(unexpected)}): {sorted(unexpected)[:5]}...", flush=True)
+            log.info(f"Unexpected keys ({len(unexpected)}): {sorted(unexpected)[:5]}...")
         # Try non-strict as last resort
         model.load_state_dict(state_dict, strict=False)
-        print("[ModelManager] RCAN loaded with strict=False", flush=True)
+        log.info("RCAN loaded with strict=False")
     return model
 
 
@@ -1227,7 +1228,7 @@ def _build_edsr(
     # ── Remap BasicSR format if needed ───────────────────────────────
     is_basicsr = any(k.startswith("conv_first.") for k in state_dict)
     if is_basicsr:
-        print("[ModelManager] Detected BasicSR EDSR format, remapping to official format", flush=True)
+        log.info("Detected BasicSR EDSR format, remapping to official format")
         state_dict = remap_edsr_keys(state_dict)
 
     # ── Detect scale from model key ──────────────────────────────────
@@ -1255,26 +1256,26 @@ def _build_edsr(
     # ── res_scale: large=0.1, baseline=1.0 ───────────────────────────
     res_scale = 0.1 if num_feat >= 128 else 1.0
 
-    print(f"[ModelManager] EDSR params: num_feat={num_feat}, num_block={num_block}, "
-          f"res_scale={res_scale}, scale={scale}", flush=True)
+    log.info(f"EDSR params: num_feat={num_feat}, num_block={num_block}, "
+          f"res_scale={res_scale}, scale={scale}")
 
     model = EDSR(num_feat=num_feat, num_block=num_block,
                  res_scale=res_scale, scale=scale)
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as e:
-        print(f"[ModelManager] EDSR strict load failed: {e}", flush=True)
+        log.info(f"EDSR strict load failed: {e}")
         model_keys = set(model.state_dict().keys())
         weight_keys = set(state_dict.keys())
         missing = model_keys - weight_keys
         unexpected = weight_keys - model_keys
         if missing:
-            print(f"[ModelManager] Missing keys ({len(missing)}): {sorted(missing)[:5]}...", flush=True)
+            log.info(f"Missing keys ({len(missing)}): {sorted(missing)[:5]}...")
         if unexpected:
-            print(f"[ModelManager] Unexpected keys ({len(unexpected)}): {sorted(unexpected)[:5]}...", flush=True)
+            log.info(f"Unexpected keys ({len(unexpected)}): {sorted(unexpected)[:5]}...")
         # Try non-strict as last resort
         model.load_state_dict(state_dict, strict=False)
-        print("[ModelManager] EDSR loaded with strict=False", flush=True)
+        log.info("EDSR loaded with strict=False")
     return model
 
 
@@ -1322,7 +1323,7 @@ def unload_heavy_models() -> None:
         entry = _registry.pop(_current_heavy)
         del entry.adapter
         del entry.model
-        print(f"[ModelManager] Evicted heavy model '{_current_heavy}'", flush=True)
+        log.info(f"Evicted heavy model '{_current_heavy}'")
     _current_heavy = None
     gc.collect()
     if torch.cuda.is_available():
@@ -1358,10 +1359,9 @@ def _ensure_loaded(model_key: str) -> _SlotEntry:
     if _is_heavy(model_key):
         _current_heavy = model_key
 
-    print(
-        f"[ModelManager] Registered '{model_key}' "
-        f"(family={family}, scale={scale}x, heavy={_is_heavy(model_key)})",
-        flush=True,
+    log.info(
+        f"Registered '{model_key}' "
+        f"(family={family}, scale={scale}x, heavy={_is_heavy(model_key)})"
     )
     return entry
 
@@ -1583,7 +1583,7 @@ def process_frame(
 def reset_temporal() -> None:
     """Clear all temporal EMA buffers (call on seek, new video, etc.)."""
     clear_temporal_buffers()
-    print("[ModelManager] Temporal buffers cleared", flush=True)
+    log.info("Temporal buffers cleared")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1613,7 +1613,7 @@ class ModelLoader:
 
         # Log precision mode
         if precision == "fp16":
-            print("[Python WARNING] FP16 mode enabled - determinism not guaranteed across hardware", flush=True)
+            log.warning("FP16 mode enabled - determinism not guaranteed across hardware")
 
     def load(self, model_identifier: str) -> Tuple[torch.nn.Module, int]:
         """
@@ -1627,7 +1627,7 @@ class ModelLoader:
         Also creates an architecture adapter for proper pre/post processing
         (window padding for transformers, output clamping, etc.)
         """
-        print(f"[Python] Loading model: '{model_identifier}'", flush=True)
+        log.info(f"Loading model: '{model_identifier}'")
 
         # Use the internal loader
         model, scale = _load_module(model_identifier)
@@ -1667,3 +1667,5 @@ class ModelLoader:
             param.requires_grad = False
 
         return model
+
+

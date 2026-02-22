@@ -15,6 +15,7 @@ Device Discipline:
 """
 
 import json
+import logging
 import math
 import mmap
 import os
@@ -30,6 +31,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+log = logging.getLogger("videoforge")
 
 
 # =============================================================================
@@ -721,7 +724,7 @@ class ZenohControlListener:
             f"{self.prefix}/**", self._on_message
         )
         self.pub = self.session.declare_publisher(f"{self.prefix}/status")
-        print(f"[ResearchLayer] Zenoh control listener active on {self.prefix}/**", flush=True)
+        log.info(f"Zenoh control listener active on {self.prefix}/**")
 
     def _on_message(self, sample) -> None:
         try:
@@ -775,8 +778,10 @@ class ZenohControlListener:
 
                 # Warn if both models are diffusion (12GB VRAM risk)
                 if primary == "diffusion" and secondary == "diffusion":
-                    print("[ResearchLayer] WARNING: Both slots are diffusion models. "
-                          "Estimated VRAM >12GB. Risk of OOM.", flush=True)
+                    log.warning(
+                        "Both slots are diffusion models. "
+                        "Estimated VRAM >12GB. Risk of OOM."
+                    )
                     self._ack("vram_warning", {"message": "Both models are diffusion. >12GB VRAM risk."})
 
                 if updates:
@@ -785,8 +790,8 @@ class ZenohControlListener:
                 self._ack("blend_control_applied", payload)
 
         except Exception as e:
-            print(f"[ResearchLayer] Control error: {e}", flush=True)
-            traceback.print_exc()
+            log.info(f"Control error: {e}")
+            log.exception("Control channel exception")
 
     def _ack(self, status: str, data: Any) -> None:
         if self.pub:
@@ -845,7 +850,7 @@ class VideoForgeResearchLayer:
         slot = ModelSlot(role, model, scale)
         self.models[role] = slot
         self.scale = scale
-        print(f"[ResearchLayer] Registered {role.value} model (scale={scale})", flush=True)
+        log.info(f"Registered {role.value} model (scale={scale})")
 
     def enable_model(self, role: ModelRole) -> None:
         if role in self.models:
@@ -889,7 +894,7 @@ class VideoForgeResearchLayer:
             if hasattr(self.params, key):
                 setattr(self.params, key, value)
             else:
-                print(f"[ResearchLayer] Warning: unknown parameter '{key}'", flush=True)
+                log.info(f"Warning: unknown parameter '{key}'")
 
     def get_params(self) -> Dict[str, Any]:
         return self.params.to_dict()
@@ -1243,7 +1248,7 @@ def create_research_layer(
         for name, model in models.items():
             role = role_map.get(name)
             if role is None:
-                print(f"[ResearchLayer] Warning: unknown role '{name}', skipping", flush=True)
+                log.info(f"Warning: unknown role '{name}', skipping")
                 continue
             layer.register_model(role, model, scale)
             layer.enable_model(role)
@@ -1256,10 +1261,10 @@ def create_research_layer(
 # =============================================================================
 
 if __name__ == "__main__":
-    print("[ResearchLayer] Running self-test...", flush=True)
+    log.info("Running self-test...")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[ResearchLayer] Device: {device}", flush=True)
+    log.info(f"Device: {device}")
 
     class DummySRModel(nn.Module):
         def __init__(self, scale: int = 4):
@@ -1271,61 +1276,61 @@ if __name__ == "__main__":
             return self.conv(x).clamp(0, 1)
 
     # --- HF Analysis ---
-    print("\n--- HF Analysis Methods ---", flush=True)
+    log.info("\n--- HF Analysis Methods ---")
     test_img = torch.rand(1, 3, 64, 64, device=device)
     for method in ["laplacian", "sobel", "highpass", "fft"]:
         energy = HFAnalyzer.compute(test_img, method)
-        print(f"  {method}: shape={energy.shape}, range=[{energy.min():.3f}, {energy.max():.3f}]", flush=True)
+        log.info(f"  {method}: shape={energy.shape}, range=[{energy.min():.3f}, {energy.max():.3f}]")
 
     # --- Frequency Band Splitting ---
-    print("\n--- Frequency Band Splitting ---", flush=True)
+    log.info("\n--- Frequency Band Splitting ---")
     low, mid, high = FrequencyBandSplitter.split(test_img)
     recon = low + mid + high
     recon_error = (recon - test_img).abs().max().item()
-    print(f"  Low: {low.shape}, Mid: {mid.shape}, High: {high.shape}", flush=True)
-    print(f"  Reconstruction error: {recon_error:.6f}", flush=True)
+    log.info(f"  Low: {low.shape}, Mid: {mid.shape}, High: {high.shape}")
+    log.info(f"  Reconstruction error: {recon_error:.6f}")
 
     # --- Spatial Routing ---
-    print("\n--- Spatial Routing ---", flush=True)
+    log.info("\n--- Spatial Routing ---")
     edge_m, tex_m, flat_m = SpatialRouter.compute_routing_masks(test_img)
     coverage = (edge_m + tex_m + flat_m).mean().item()
-    print(f"  Edge: mean={edge_m.mean():.3f}, Texture: mean={tex_m.mean():.3f}, Flat: mean={flat_m.mean():.3f}", flush=True)
-    print(f"  Total coverage: {coverage:.3f} (should be ~1.0)", flush=True)
+    log.info(f"  Edge: mean={edge_m.mean():.3f}, Texture: mean={tex_m.mean():.3f}, Flat: mean={flat_m.mean():.3f}")
+    log.info(f"  Total coverage: {coverage:.3f} (should be ~1.0)")
 
     # --- Hallucination Detection ---
-    print("\n--- Hallucination Detection ---", flush=True)
+    log.info("\n--- Hallucination Detection ---")
     lr = torch.rand(1, 3, 16, 16, device=device)
     sr = torch.rand(1, 3, 64, 64, device=device)
     h_mask = HallucinationDetector.generate_mask(lr, sr, scale=4, hf_method="laplacian", sensitivity=1.0)
-    print(f"  Mask: shape={h_mask.shape}, range=[{h_mask.min():.3f}, {h_mask.max():.3f}]", flush=True)
+    log.info(f"  Mask: shape={h_mask.shape}, range=[{h_mask.min():.3f}, {h_mask.max():.3f}]")
 
     # --- PredictionBlender ---
-    print("\n--- PredictionBlender (GPU) ---", flush=True)
+    log.info("\n--- PredictionBlender (GPU) ---")
     t1 = torch.rand(1, 3, 64, 64, device=device)
     t2 = torch.rand(1, 3, 64, 64, device=device)
     blended_pred = PredictionBlender.weighted_average([t1, t2], [0.6, 0.4])
-    print(f"  Weighted avg: shape={blended_pred.shape}", flush=True)
+    log.info(f"  Weighted avg: shape={blended_pred.shape}")
     masked = PredictionBlender.masked_blend(t1, t2, torch.ones(1, 1, 64, 64, device=device) * 0.5)
-    print(f"  Masked blend: shape={masked.shape}", flush=True)
+    log.info(f"  Masked blend: shape={masked.shape}")
     freq_out, freq_bands = PredictionBlender.frequency_weighted_blend(
         [t1, t2], [0.7, 0.3], (1.0, 1.0, 1.0))
-    print(f"  Freq blend: shape={freq_out.shape}, bands={[b.shape for b in freq_bands]}", flush=True)
+    log.info(f"  Freq blend: shape={freq_out.shape}, bands={[b.shape for b in freq_bands]}")
     suppressed = PredictionBlender.hallucination_suppress(t1, t2, h_mask, 0.5)
-    print(f"  Halluc suppress: shape={suppressed.shape}", flush=True)
+    log.info(f"  Halluc suppress: shape={suppressed.shape}")
     injected = PredictionBlender.detail_inject(t1, t2, 0.3)
-    print(f"  Detail inject: shape={injected.shape}", flush=True)
+    log.info(f"  Detail inject: shape={injected.shape}")
 
     # --- Weight Blending (CPU) ---
-    print("\n--- WeightBlender (CPU) ---", flush=True)
+    log.info("\n--- WeightBlender (CPU) ---")
     sd1 = {"w": torch.randn(3, 3)}
     sd2 = {"w": torch.randn(3, 3)}
     blended_sd = WeightBlender.blend_state_dicts([sd1, sd2], [0.7, 0.3])
     expected = sd1["w"] * 0.7 + sd2["w"] * 0.3
     blend_error = (blended_sd["w"] - expected).abs().max().item()
-    print(f"  Blend error: {blend_error:.8f}", flush=True)
+    log.info(f"  Blend error: {blend_error:.8f}")
 
     # --- Full Pipeline ---
-    print("\n--- Full Pipeline ---", flush=True)
+    log.info("\n--- Full Pipeline ---")
     layer = create_research_layer(
         models={"structure": DummySRModel(4), "texture": DummySRModel(4)},
         scale=4, device=device,
@@ -1334,27 +1339,28 @@ if __name__ == "__main__":
 
     lr_input = torch.rand(1, 3, 32, 32, device=device)
     output = layer.process_frame(lr_input)
-    print(f"  Input: {lr_input.shape} -> Output: {output.shape}", flush=True)
-    print(f"  Output range: [{output.min():.3f}, {output.max():.3f}]", flush=True)
+    log.info(f"  Input: {lr_input.shape} -> Output: {output.shape}")
+    log.info(f"  Output range: [{output.min():.3f}, {output.max():.3f}]")
 
     # --- NumPy Interface ---
-    print("\n--- NumPy Interface ---", flush=True)
+    log.info("\n--- NumPy Interface ---")
     lr_np = np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)
     out_np = layer.process_frame_numpy(lr_np)
-    print(f"  Input: {lr_np.shape} -> Output: {out_np.shape}", flush=True)
+    log.info(f"  Input: {lr_np.shape} -> Output: {out_np.shape}")
 
     # --- Diagnostics ---
-    print("\n--- Diagnostics ---", flush=True)
+    log.info("\n--- Diagnostics ---")
     diag = layer.get_diagnostics()
     for name, arr in diag.items():
         if arr is not None:
-            print(f"  {name}: shape={arr.shape}", flush=True)
+            log.info(f"  {name}: shape={arr.shape}")
         else:
-            print(f"  {name}: None", flush=True)
+            log.info(f"  {name}: None")
 
     # --- Parameter Serialization ---
-    print("\n--- Parameter Serialization ---", flush=True)
+    log.info("\n--- Parameter Serialization ---")
     params_json = json.dumps(layer.get_params(), indent=2)
-    print(f"  {params_json}", flush=True)
+    log.info(f"  {params_json}")
 
-    print("\n[ResearchLayer] Self-test complete.", flush=True)
+    log.info("\n[ResearchLayer] Self-test complete.")
+
