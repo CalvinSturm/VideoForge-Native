@@ -3,8 +3,10 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use serde::Serialize;
 use serde_json::json;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
@@ -51,16 +53,62 @@ pub struct UpscaleJobReport {
     pub frames_encoded: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct StageTimingsMs {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encode: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+}
+
 /// Single progress tick emitted during the job.
+#[derive(Debug, Clone, Serialize)]
 pub struct JobProgress {
     pub pct: u32,
     pub frame: u64,
     pub message: String,
     pub output_path: Option<String>,
     pub eta_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frames_decoded: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frames_processed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frames_encoded: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_ms: Option<StageTimingsMs>,
 }
 
 pub type JobProgressFn = Arc<dyn Fn(JobProgress) + Send + Sync + 'static>;
+
+fn progress_to_event_payload(p: &JobProgress) -> serde_json::Value {
+    let mut j = json!({
+        "jobId": "active",
+        "progress": p.pct,
+        "message": p.message,
+        "eta": p.eta_secs
+    });
+    if let Some(op) = &p.output_path {
+        j["outputPath"] = json!(op);
+    }
+    if let Some(v) = p.frames_decoded {
+        j["frames_decoded"] = json!(v);
+    }
+    if let Some(v) = p.frames_processed {
+        j["frames_processed"] = json!(v);
+    }
+    if let Some(v) = p.frames_encoded {
+        j["frames_encoded"] = json!(v);
+    }
+    if let Some(stage) = &p.stage_ms {
+        j["stage_ms"] = serde_json::to_value(stage).unwrap_or_default();
+    }
+    j
+}
 
 fn extract_handshake_protocol_version(raw: &str) -> Option<u32> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
@@ -233,8 +281,8 @@ pub async fn run_upscale_job(
     })?
     .map_err(|e: zenoh::Error| e.to_string())?;
 
-    let handshake_data =
-        String::from_utf8(handshake_msg.payload().to_bytes().to_vec()).map_err(|e| e.to_string())?;
+    let handshake_data = String::from_utf8(handshake_msg.payload().to_bytes().to_vec())
+        .map_err(|e| e.to_string())?;
     validate_worker_protocol_version(
         extract_handshake_protocol_version(&handshake_data),
         worker_caps.use_typed_ipc,
@@ -330,6 +378,10 @@ pub async fn run_upscale_job(
                     message: format!("Processing Tile {}/{}", current, total),
                     output_path: None,
                     eta_secs: 0,
+                    frames_decoded: None,
+                    frames_processed: Some(current),
+                    frames_encoded: None,
+                    stage_ms: None,
                 });
             } else if resp["status"] == "ok" {
                 tracing::info!(job_id = %job_id, output = %output_path, "Image upscale complete");
@@ -443,6 +495,9 @@ pub async fn run_upscale_job(
     );
 
     let shared_shm = Mutex::new(shm);
+    let frames_decoded_ctr = Arc::new(AtomicU64::new(0));
+    let frames_processed_ctr = Arc::new(AtomicU64::new(0));
+    let frames_encoded_ctr = Arc::new(AtomicU64::new(0));
 
     // Flow-control channels (Rust-only, not cross-process).
     let (free_tx, mut free_rx) = mpsc::channel::<usize>(shm::RING_SIZE);
@@ -484,6 +539,7 @@ pub async fn run_upscale_job(
 
     // ── Decoder task ─────────────────────────────────────────────────────────
     let decoder_task = async {
+        let frames_decoded_ctr = Arc::clone(&frames_decoded_ctr);
         let use_nvdec = video_pipeline::probe_nvdec();
         let mut decoder = video_pipeline::VideoDecoder::new(
             &config.input_path,
@@ -526,6 +582,7 @@ pub async fn run_upscale_job(
 
             if let Some(size) = frame_size {
                 frame_id += 1;
+                frames_decoded_ctr.fetch_add(1, Ordering::Relaxed);
                 shm_guard.set_slot_write_index(slot_idx, frame_id);
                 shm_guard.set_slot_frame_bytes(slot_idx, size);
                 shm_guard.set_slot_state(slot_idx, shm::SLOT_READY_FOR_AI);
@@ -553,6 +610,7 @@ pub async fn run_upscale_job(
 
     // ── Poll task ────────────────────────────────────────────────────────────
     let poll_task = async {
+        let frames_processed_ctr = Arc::clone(&frames_processed_ctr);
         let mut last_params_push = Instant::now();
 
         while let Some(slot_idx) = pending_rx.recv().await {
@@ -580,6 +638,7 @@ pub async fn run_upscale_job(
                 {
                     let shm_guard = shared_shm.lock().await;
                     if shm_guard.slot_state(slot_idx) == shm::SLOT_READY_FOR_ENCODE {
+                        frames_processed_ctr.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
                 }
@@ -612,6 +671,9 @@ pub async fn run_upscale_job(
     // ── Encoder task ─────────────────────────────────────────────────────────
     let target_fps = config.edit_config.fps;
     let encoder_task = async {
+        let frames_decoded_ctr = Arc::clone(&frames_decoded_ctr);
+        let frames_processed_ctr = Arc::clone(&frames_processed_ctr);
+        let frames_encoded_ctr = Arc::clone(&frames_encoded_ctr);
         let mut encoder = video_pipeline::VideoEncoder::new_with_audio(
             &output_path,
             fps as u32,
@@ -652,6 +714,7 @@ pub async fn run_upscale_job(
             let _ = free_tx.send(slot_idx).await;
 
             processed_count += 1;
+            frames_encoded_ctr.store(processed_count, Ordering::Relaxed);
             let is_last_frame = processed_count >= process_frames;
 
             if last_emit.elapsed() > Duration::from_millis(100) || is_last_frame {
@@ -679,6 +742,15 @@ pub async fn run_upscale_job(
                     message: format!("Processing Frame {}/{}", processed_count, process_frames),
                     output_path: None,
                     eta_secs: eta,
+                    frames_decoded: Some(frames_decoded_ctr.load(Ordering::Relaxed)),
+                    frames_processed: Some(frames_processed_ctr.load(Ordering::Relaxed)),
+                    frames_encoded: Some(frames_encoded_ctr.load(Ordering::Relaxed)),
+                    stage_ms: Some(StageTimingsMs {
+                        decode: None,
+                        ai: None,
+                        encode: None,
+                        total: Some(eta_start.elapsed().as_millis() as u64),
+                    }),
                 });
                 last_emit = Instant::now();
             }
@@ -701,6 +773,15 @@ pub async fn run_upscale_job(
             message: "Finalizing...".to_string(),
             output_path: Some(output_path.clone()),
             eta_secs: 0,
+            frames_decoded: Some(frames_decoded_ctr.load(Ordering::Relaxed)),
+            frames_processed: Some(frames_processed_ctr.load(Ordering::Relaxed)),
+            frames_encoded: Some(frames_encoded_ctr.load(Ordering::Relaxed)),
+            stage_ms: Some(StageTimingsMs {
+                decode: None,
+                ai: None,
+                encode: None,
+                total: Some(eta_start.elapsed().as_millis() as u64),
+            }),
         });
         Ok::<u64, String>(processed_count)
     };
@@ -751,11 +832,13 @@ pub async fn run_upscale_job(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_worker_protocol_version;
+    use super::{validate_worker_protocol_version, JobProgress, StageTimingsMs};
 
     #[test]
     fn test_handshake_version_match_ok() {
-        assert!(validate_worker_protocol_version(Some(crate::ipc::PROTOCOL_VERSION), false).is_ok());
+        assert!(
+            validate_worker_protocol_version(Some(crate::ipc::PROTOCOL_VERSION), false).is_ok()
+        );
         assert!(validate_worker_protocol_version(Some(crate::ipc::PROTOCOL_VERSION), true).is_ok());
     }
 
@@ -767,16 +850,66 @@ mod tests {
 
     #[test]
     fn test_handshake_mismatch_warn_only_ok_when_typed_ipc_off() {
-        assert!(validate_worker_protocol_version(Some(crate::ipc::PROTOCOL_VERSION + 1), false).is_ok());
+        assert!(
+            validate_worker_protocol_version(Some(crate::ipc::PROTOCOL_VERSION + 1), false).is_ok()
+        );
     }
 
     #[test]
     fn test_handshake_mismatch_fails_when_typed_ipc_on() {
-        let err =
-            validate_worker_protocol_version(Some(crate::ipc::PROTOCOL_VERSION + 1), true).unwrap_err();
+        let err = validate_worker_protocol_version(Some(crate::ipc::PROTOCOL_VERSION + 1), true)
+            .unwrap_err();
         assert!(err.contains("IPC_PROTOCOL_VERSION_MISMATCH"));
         assert!(err.contains("expected="));
         assert!(err.contains("found="));
+    }
+
+    #[test]
+    fn test_job_progress_serialization_includes_perf_fields_when_present() {
+        let p = JobProgress {
+            pct: 50,
+            frame: 10,
+            message: "x".to_string(),
+            output_path: None,
+            eta_secs: 1,
+            frames_decoded: Some(10),
+            frames_processed: Some(9),
+            frames_encoded: Some(8),
+            stage_ms: Some(StageTimingsMs {
+                decode: Some(1),
+                ai: Some(2),
+                encode: Some(3),
+                total: Some(6),
+            }),
+        };
+        let v = serde_json::to_value(&p).expect("serialize job progress");
+        assert_eq!(v["frames_decoded"], 10);
+        assert_eq!(v["frames_processed"], 9);
+        assert_eq!(v["frames_encoded"], 8);
+        assert_eq!(v["stage_ms"]["decode"], 1);
+        assert_eq!(v["stage_ms"]["ai"], 2);
+        assert_eq!(v["stage_ms"]["encode"], 3);
+        assert_eq!(v["stage_ms"]["total"], 6);
+    }
+
+    #[test]
+    fn test_job_progress_serialization_omits_perf_fields_when_absent() {
+        let p = JobProgress {
+            pct: 50,
+            frame: 10,
+            message: "x".to_string(),
+            output_path: None,
+            eta_secs: 1,
+            frames_decoded: None,
+            frames_processed: None,
+            frames_encoded: None,
+            stage_ms: None,
+        };
+        let v = serde_json::to_value(&p).expect("serialize job progress");
+        assert!(v.get("frames_decoded").is_none());
+        assert!(v.get("frames_processed").is_none());
+        assert!(v.get("frames_encoded").is_none());
+        assert!(v.get("stage_ms").is_none());
     }
 }
 
@@ -802,15 +935,7 @@ pub async fn upscale_request(
 
     let app_clone = app.clone();
     let progress: JobProgressFn = Arc::new(move |p: JobProgress| {
-        let mut j = json!({
-            "jobId": "active",
-            "progress": p.pct,
-            "message": p.message,
-            "eta": p.eta_secs
-        });
-        if let Some(op) = &p.output_path {
-            j["outputPath"] = json!(op);
-        }
+        let j = progress_to_event_payload(&p);
         let _ = app_clone.emit("upscale-progress", j);
     });
 
