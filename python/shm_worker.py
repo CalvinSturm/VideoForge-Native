@@ -14,6 +14,7 @@ Author: VideoForge Team
 """
 
 import argparse
+import importlib
 import json
 import mmap
 import os
@@ -87,10 +88,19 @@ torch.backends.cudnn.deterministic = True
 try:
     import cv2
     import numpy as np
-    import zenoh
 except ImportError as e:
     print(f"[Python Critical] Missing Dependency: {e}", flush=True)
     sys.exit(1)
+
+
+def _require_zenoh():
+    try:
+        return importlib.import_module("zenoh")
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "Missing dependency: zenoh. Install requirements for the Python worker "
+            "(e.g. activate the VideoForge Python environment / install project requirements)."
+        ) from e
 
 # Research layer (optional — graceful fallback if unavailable)
 try:
@@ -457,6 +467,7 @@ class AIWorker:
         print(f"[Python] CUDNN deterministic: {torch.backends.cudnn.deterministic}", flush=True)
         print(f"[Python] CUDNN benchmark: {torch.backends.cudnn.benchmark}", flush=True)
 
+        zenoh = _require_zenoh()
         conf = zenoh.Config()
         conf.insert_json5("connect/endpoints", json.dumps([f"tcp/127.0.0.1:{port}"]))
 
@@ -1614,11 +1625,7 @@ class AIWorker:
         self.send_status("FRAME_LOOP_STOPPED")
 
 
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
-
-if __name__ == "__main__":
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="VideoForge Deterministic AI Worker")
     parser.add_argument("--port", type=str, default="7447", help="Zenoh port")
     parser.add_argument("--parent-pid", type=int, default=0, help="Parent process ID to monitor")
@@ -1639,7 +1646,15 @@ if __name__ == "__main__":
     parser.add_argument("--use-events", action="store_true", help="Parsed only (plumbing)")
     parser.add_argument("--prealloc-tensors", action="store_true", help="Parsed only (plumbing)")
     parser.add_argument("--deterministic", action="store_true", help="Parsed only (plumbing)")
-    args = parser.parse_args()
+    return parser
+
+
+def run_worker(args: argparse.Namespace) -> int:
+    try:
+        _require_zenoh()
+    except RuntimeError as e:
+        print(f"[Python Critical] {e}", flush=True)
+        return 1
 
     # Configure precision BEFORE any model loading or CUDA ops
     configure_precision(args.precision)
@@ -1656,4 +1671,18 @@ if __name__ == "__main__":
         prealloc_tensors=args.prealloc_tensors,
         deterministic=args.deterministic,
     )
-    sys.exit(0)
+    return 0
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return run_worker(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
