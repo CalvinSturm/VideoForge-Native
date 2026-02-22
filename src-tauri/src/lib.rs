@@ -17,13 +17,13 @@ pub mod commands;
 pub mod control;
 pub mod edit_config;
 pub mod ipc;
-mod models;
+pub mod models;
 pub mod python_env;
 pub mod shm;
 pub mod spatial_map;
 pub mod spatial_publisher;
-mod video_pipeline;
 mod utils;
+mod video_pipeline;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;

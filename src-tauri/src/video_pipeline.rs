@@ -31,7 +31,7 @@ pub fn probe_nvdec() -> bool {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let has_cuda = stdout.lines().any(|line| line.trim() == "cuda");
-                println!(
+                eprintln!(
                     "NVDEC probe: {}",
                     if has_cuda {
                         "CUDA available"
@@ -42,7 +42,7 @@ pub fn probe_nvdec() -> bool {
                 has_cuda
             }
             Err(e) => {
-                println!("NVDEC probe failed (ffmpeg not found?): {}", e);
+                eprintln!("NVDEC probe failed (ffmpeg not found?): {}", e);
                 false
             }
         }
@@ -140,7 +140,7 @@ impl VideoDecoder {
     ) -> Result<Self> {
         // Try NVDEC if requested
         if use_hwaccel {
-            println!("FFmpeg Decoder Starting (NVDEC): {}", input);
+            eprintln!("FFmpeg Decoder Starting (NVDEC): {}", input);
             let args = Self::build_args(input, start, duration, filter_str, true);
             match Self::spawn_decoder(&args) {
                 Ok((child, reader)) => {
@@ -152,7 +152,7 @@ impl VideoDecoder {
                     });
                 }
                 Err(e) => {
-                    println!(
+                    eprintln!(
                         "NVDEC decoder spawn failed, falling back to software: {}",
                         e
                     );
@@ -161,7 +161,7 @@ impl VideoDecoder {
         }
 
         // Software fallback
-        println!("FFmpeg Decoder Starting (software): {}", input);
+        eprintln!("FFmpeg Decoder Starting (software): {}", input);
         let args = Self::build_args(input, start, duration, filter_str, false);
         let (child, reader) = Self::spawn_decoder(&args)?;
 
@@ -278,7 +278,7 @@ pub fn probe_nvenc() -> bool {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let has_nvenc = stdout.lines().any(|line| line.contains("h264_nvenc"));
-                println!(
+                eprintln!(
                     "NVENC probe: {}",
                     if has_nvenc {
                         "NVENC available"
@@ -289,7 +289,7 @@ pub fn probe_nvenc() -> bool {
                 has_nvenc
             }
             Err(e) => {
-                println!("NVENC probe failed (ffmpeg not found?): {}", e);
+                eprintln!("NVENC probe failed (ffmpeg not found?): {}", e);
                 false
             }
         }
@@ -522,7 +522,7 @@ impl VideoEncoder {
             } else {
                 "h264_nvenc"
             };
-            println!(
+            eprintln!(
                 "FFmpeg Encoder Starting (NVENC): {}x{} -> {} ({})",
                 width, height, output, codec_label
             );
@@ -547,7 +547,7 @@ impl VideoEncoder {
                     });
                 }
                 Err(e) => {
-                    println!(
+                    eprintln!(
                         "NVENC encoder spawn failed, falling back to software: {}",
                         e
                     );
@@ -561,7 +561,7 @@ impl VideoEncoder {
         } else {
             "libx264"
         };
-        println!(
+        eprintln!(
             "FFmpeg Encoder Starting (software): {}x{} -> {} ({})",
             width, height, output, codec_label
         );
@@ -595,7 +595,7 @@ impl VideoEncoder {
     }
 
     pub async fn finish(&mut self) -> Result<()> {
-        println!("Encoder: Closing Stdin to signal EOF...");
+        eprintln!("Encoder: Closing Stdin to signal EOF...");
         if let Some(mut stdin) = self.stdin.take() {
             use tokio::io::AsyncWriteExt;
             tokio::io::AsyncWriteExt::shutdown(&mut stdin)
@@ -604,7 +604,7 @@ impl VideoEncoder {
             drop(stdin);
         }
 
-        println!("Encoder: Waiting for FFmpeg process to exit...");
+        eprintln!("Encoder: Waiting for FFmpeg process to exit...");
         match timeout(Duration::from_secs(30), self.child.wait()).await {
             Ok(result) => {
                 let status = result.context("Encoder wait failed")?;
@@ -614,10 +614,10 @@ impl VideoEncoder {
                         status.code()
                     ));
                 }
-                println!("Encoder: FFmpeg exited successfully.");
+                eprintln!("Encoder: FFmpeg exited successfully.");
             }
             Err(_) => {
-                println!("Encoder: Timeout waiting for FFmpeg. Force killing...");
+                eprintln!("Encoder: Timeout waiting for FFmpeg. Force killing...");
                 let _ = self.child.start_kill();
                 return Err(anyhow::anyhow!("Encoder timed out and was killed"));
             }
