@@ -19,6 +19,7 @@ pub mod edit_config;
 pub mod ipc;
 pub mod models;
 pub mod python_env;
+pub mod run_manifest;
 pub mod shm;
 pub mod spatial_map;
 pub mod spatial_publisher;

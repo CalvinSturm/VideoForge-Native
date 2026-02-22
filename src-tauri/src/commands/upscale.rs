@@ -18,6 +18,7 @@ use crate::python_env::{
     build_worker_argv, get_free_port, resolve_python_environment, BaseWorkerArgs, ProcessGuard,
     WorkerCaps, PYTHON_PIDS,
 };
+use crate::run_manifest::{maybe_write_run_manifest, RunManifestInputs};
 use crate::video_pipeline;
 use crate::{
     commands::export::{get_smart_output_path, is_image_file},
@@ -41,6 +42,8 @@ pub struct UpscaleJobConfig {
     pub research_config: Arc<Mutex<ResearchConfig>>,
     /// Seconds to wait for Python handshake (default 60).
     pub zenoh_timeout_secs: u64,
+    /// Internal opt-in only. Default false keeps behavior/output unchanged.
+    pub enable_run_artifacts: bool,
 }
 
 pub struct UpscaleJobReport {
@@ -81,6 +84,26 @@ pub async fn run_upscale_job(
     } else {
         config.output_path.clone()
     };
+    let worker_caps = WorkerCaps::default();
+
+    if let Some(manifest_path) = maybe_write_run_manifest(
+        config.enable_run_artifacts,
+        &RunManifestInputs {
+            input_path: &config.input_path,
+            output_path: &output_path,
+            scale: config.scale,
+            precision: &precision,
+            model_key: Some(&config.model),
+            worker_caps: &worker_caps,
+            ipc_protocol_version: Some(crate::ipc::PROTOCOL_VERSION),
+            shm_protocol_version: None,
+            app_version: Some(env!("CARGO_PKG_VERSION")),
+        },
+    )
+    .map_err(|e| format!("Failed to write run manifest: {e}"))?
+    {
+        tracing::info!(path = %manifest_path.display(), "Run manifest written");
+    }
 
     // Generate a session-scoped job ID for IPC correlation.
     let job_id = ipc::protocol::next_request_id();
@@ -133,7 +156,7 @@ pub async fn run_upscale_job(
             parent_pid: std::process::id(),
             precision: &precision,
         },
-        &WorkerCaps::default(),
+        &worker_caps,
     );
     cmd.args(&worker_argv);
     cmd.stdout(Stdio::null());
@@ -156,9 +179,12 @@ pub async fn run_upscale_job(
     let mut python_guard = ProcessGuard::new(python_child);
 
     // Wait for Python startup handshake (first message = ready signal).
-    if timeout(Duration::from_secs(config.zenoh_timeout_secs), subscriber.recv_async())
-        .await
-        .is_err()
+    if timeout(
+        Duration::from_secs(config.zenoh_timeout_secs),
+        subscriber.recv_async(),
+    )
+    .await
+    .is_err()
     {
         return Err(format!(
             "Python worker handshake timeout ({}s)",
@@ -232,8 +258,8 @@ pub async fn run_upscale_job(
                 .map_err(|_| "Image upscale timeout (5 min)")?
                 .map_err(|e: zenoh::Error| e.to_string())?;
 
-            let payload_str = String::from_utf8(msg.payload().to_bytes().to_vec())
-                .map_err(|e| e.to_string())?;
+            let payload_str =
+                String::from_utf8(msg.payload().to_bytes().to_vec()).map_err(|e| e.to_string())?;
             let resp: serde_json::Value =
                 serde_json::from_str(&payload_str).map_err(|e| e.to_string())?;
 
@@ -288,7 +314,10 @@ pub async fn run_upscale_job(
             }
         }
 
-        return Ok(UpscaleJobReport { output_path, frames_encoded: 0 });
+        return Ok(UpscaleJobReport {
+            output_path,
+            frames_encoded: 0,
+        });
     }
 
     // ── Video pipeline ───────────────────────────────────────────────────────
@@ -339,8 +368,7 @@ pub async fn run_upscale_job(
         .map_err(|e: zenoh::Error| e.to_string())?;
     let shm_data =
         String::from_utf8(shm_msg.payload().to_bytes().to_vec()).map_err(|e| e.to_string())?;
-    let shm_resp: serde_json::Value =
-        serde_json::from_str(&shm_data).map_err(|e| e.to_string())?;
+    let shm_resp: serde_json::Value = serde_json::from_str(&shm_data).map_err(|e| e.to_string())?;
 
     if shm_resp["status"] != "SHM_CREATED" {
         let msg = shm_resp["error"]["message"]
@@ -440,7 +468,11 @@ pub async fn run_upscale_job(
                     .read_raw_frame_into(input_slot)
                     .await
                     .unwrap_or(false);
-                if got_frame { Some(size) } else { None }
+                if got_frame {
+                    Some(size)
+                } else {
+                    None
+                }
             };
 
             if let Some(size) = frame_size {
@@ -487,11 +519,7 @@ pub async fn run_upscale_job(
 
                 let _ = ipc::put_request(
                     &publisher,
-                    RequestEnvelope::new(
-                        "update_research_params",
-                        &job_id,
-                        json!({"params": val}),
-                    ),
+                    RequestEnvelope::new("update_research_params", &job_id, json!({"params": val})),
                 )
                 .await;
                 last_params_push = Instant::now();
@@ -628,8 +656,8 @@ pub async fn run_upscale_job(
         Ok::<u64, String>(processed_count)
     };
 
-    let (_, _, frames_encoded) = tokio::try_join!(decoder_task, poll_task, encoder_task)
-        .map_err(|e| {
+    let (_, _, frames_encoded) =
+        tokio::try_join!(decoder_task, poll_task, encoder_task).map_err(|e| {
             tracing::error!(job_id = %job_id, error = %e, "Pipeline task failed");
             e
         })?;
@@ -666,7 +694,10 @@ pub async fn run_upscale_job(
     }
 
     tracing::info!(job_id = %job_id, output = %output_path, "Upscale request complete");
-    Ok(UpscaleJobReport { output_path, frames_encoded })
+    Ok(UpscaleJobReport {
+        output_path,
+        frames_encoded,
+    })
 }
 
 // ─── upscale_request (thin Tauri wrapper) ────────────────────────────────────
@@ -713,6 +744,7 @@ pub async fn upscale_request(
         edit_config,
         research_config: research_state.inner().clone(),
         zenoh_timeout_secs: 60,
+        enable_run_artifacts: false,
     };
 
     let report = run_upscale_job(job_config, progress).await?;

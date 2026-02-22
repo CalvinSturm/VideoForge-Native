@@ -83,11 +83,7 @@ fn check_ffprobe() -> bool {
 fn check_python_env() -> Option<(String, String)> {
     match resolve_python_environment() {
         Ok((bin, script)) => {
-            check(
-                "Python environment",
-                true,
-                "",
-            );
+            check("Python environment", true, "");
             println!("       python = {bin}");
             println!("       script = {script}");
             Some((bin, script))
@@ -105,26 +101,36 @@ fn check_python_env() -> Option<(String, String)> {
 fn ffprobe_dims(path: &str) -> Option<(usize, usize)> {
     let out = std::process::Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
             path,
         ])
         .output()
         .ok()?;
     let s = String::from_utf8(out.stdout).ok()?;
     let mut it = s.lines();
-    Some((it.next()?.trim().parse().ok()?, it.next()?.trim().parse().ok()?))
+    Some((
+        it.next()?.trim().parse().ok()?,
+        it.next()?.trim().parse().ok()?,
+    ))
 }
 
 /// Returns duration in seconds of the file or None on failure.
 fn ffprobe_duration(path: &str) -> Option<f64> {
     let out = std::process::Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
             path,
         ])
         .output()
@@ -256,10 +262,7 @@ async fn check_python_ipc(
     true
 }
 
-async fn shutdown_python(
-    publisher: &zenoh::pubsub::Publisher<'_>,
-    guard: &mut ProcessGuard,
-) {
+async fn shutdown_python(publisher: &zenoh::pubsub::Publisher<'_>, guard: &mut ProcessGuard) {
     let job_id = app_lib::ipc::protocol::next_request_id();
     let _ = ipc::put_request(
         publisher,
@@ -399,8 +402,7 @@ async fn check_shm_roundtrip(
             return false;
         }
         Ok(Ok(msg)) => {
-            let raw =
-                String::from_utf8_lossy(&msg.payload().to_bytes()).to_string();
+            let raw = String::from_utf8_lossy(&msg.payload().to_bytes()).to_string();
             let v: serde_json::Value = match serde_json::from_str(&raw) {
                 Ok(v) => v,
                 Err(e) => {
@@ -424,7 +426,11 @@ async fn check_shm_roundtrip(
             match v["shm_path"].as_str() {
                 Some(p) => p.to_string(),
                 None => {
-                    check("SHM created", false, "SHM_CREATE_FAILED: missing shm_path field");
+                    check(
+                        "SHM created",
+                        false,
+                        "SHM_CREATE_FAILED: missing shm_path field",
+                    );
                     shutdown_python(&publisher, &mut guard).await;
                     return false;
                 }
@@ -434,12 +440,7 @@ async fn check_shm_roundtrip(
     check("SHM created", true, &format!("path: {}", shm_path));
 
     // ── Open SHM ─────────────────────────────────────────────────────────────
-    let mut shm = match VideoShm::open(
-        &shm_path,
-        width as usize,
-        height as usize,
-        scale as usize,
-    ) {
+    let mut shm = match VideoShm::open(&shm_path, width as usize, height as usize, scale as usize) {
         Ok(s) => s,
         Err(e) => {
             check(
@@ -464,7 +465,11 @@ async fn check_shm_roundtrip(
     shm.set_slot_frame_bytes(0, (width * height * 3) as u32);
     shm.set_slot_write_index(0, 1);
     shm.set_slot_state(0, SLOT_READY_FOR_AI);
-    check("Synthetic frame written \u{2192} SLOT_READY_FOR_AI", true, "");
+    check(
+        "Synthetic frame written \u{2192} SLOT_READY_FOR_AI",
+        true,
+        "",
+    );
 
     // ── process_one_frame ─────────────────────────────────────────────────────
     let job_id2 = app_lib::ipc::protocol::next_request_id();
@@ -505,14 +510,17 @@ async fn check_shm_roundtrip(
             return false;
         }
         Ok(Ok(msg)) => {
-            let raw =
-                String::from_utf8_lossy(&msg.payload().to_bytes()).to_string();
+            let raw = String::from_utf8_lossy(&msg.payload().to_bytes()).to_string();
             let v: serde_json::Value =
                 serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
             v["status"].as_str() == Some("FRAME_DONE")
         }
     };
-    if !check("FRAME_DONE received", frame_ok, "unexpected status in response") {
+    if !check(
+        "FRAME_DONE received",
+        frame_ok,
+        "unexpected status in response",
+    ) {
         shutdown_python(&publisher, &mut guard).await;
         return false;
     }
@@ -521,7 +529,11 @@ async fn check_shm_roundtrip(
     let expected_len = (width * scale * height * scale * 3) as usize;
     let output_ok = match shm.output_slot(0) {
         Err(e) => {
-            check("Output validated", false, &format!("SHM_OPEN_FAILED: {}", e));
+            check(
+                "Output validated",
+                false,
+                &format!("SHM_OPEN_FAILED: {}", e),
+            );
             shutdown_python(&publisher, &mut guard).await;
             return false;
         }
@@ -575,21 +587,29 @@ async fn check_e2e_python(
     timeout_ms: u64,
     keep_temp: bool,
 ) -> bool {
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-    use app_lib::commands::upscale::{run_upscale_job, JobProgress, JobProgressFn, UpscaleJobConfig};
+    use app_lib::commands::upscale::{
+        run_upscale_job, JobProgress, JobProgressFn, UpscaleJobConfig,
+    };
     use app_lib::control::ResearchConfig;
     use app_lib::edit_config::EditConfig;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     // A) Input prereq checks
     if !std::path::Path::new(input_path).exists() {
-        return check("Input file exists", false,
-            &format!("E2E_INPUT_NOT_FOUND: {}", input_path));
+        return check(
+            "Input file exists",
+            false,
+            &format!("E2E_INPUT_NOT_FOUND: {}", input_path),
+        );
     }
     check("Input file exists", true, "");
 
     let (in_w, in_h) = match ffprobe_dims(input_path) {
-        Some(d) => { check(&format!("Probe input ({}×{})", d.0, d.1), true, ""); d }
+        Some(d) => {
+            check(&format!("Probe input ({}×{})", d.0, d.1), true, "");
+            d
+        }
         None => return check("Probe input", false, "E2E_FFPROBE_PROBE: ffprobe failed"),
     };
 
@@ -607,6 +627,7 @@ async fn check_e2e_python(
         edit_config: EditConfig::default(),
         research_config,
         zenoh_timeout_secs: (timeout_ms / 1000).max(60),
+        enable_run_artifacts: false,
     };
 
     // C) Progress callback
@@ -626,11 +647,17 @@ async fn check_e2e_python(
     let result = tokio::time::timeout(
         Duration::from_millis(timeout_ms),
         run_upscale_job(config, progress),
-    ).await;
+    )
+    .await;
 
     let report = match result {
-        Err(_) => return check("Job completed", false,
-            &format!("E2E_TIMEOUT: exceeded {}ms", timeout_ms)),
+        Err(_) => {
+            return check(
+                "Job completed",
+                false,
+                &format!("E2E_TIMEOUT: exceeded {}ms", timeout_ms),
+            )
+        }
         Ok(Err(e)) => return check("Job completed", false, &e),
         Ok(Ok(r)) => r,
     };
@@ -638,13 +665,19 @@ async fn check_e2e_python(
     let actual_out = &report.output_path;
 
     // E) Validate output
-    let size = std::fs::metadata(actual_out)
-        .map(|m| m.len()).unwrap_or(0);
+    let size = std::fs::metadata(actual_out).map(|m| m.len()).unwrap_or(0);
     if size < 4096 {
-        return check("Output file size", false,
-            &format!("E2E_OUTPUT_MISSING: {} bytes at {}", size, actual_out));
+        return check(
+            "Output file size",
+            false,
+            &format!("E2E_OUTPUT_MISSING: {} bytes at {}", size, actual_out),
+        );
     }
-    check("Output file size", true, &format!("> 4 KB ({} bytes)", size));
+    check(
+        "Output file size",
+        true,
+        &format!("> 4 KB ({} bytes)", size),
+    );
 
     let (out_w, out_h) = match ffprobe_dims(actual_out) {
         Some(d) => d,
@@ -653,10 +686,20 @@ async fn check_e2e_python(
     let exp_w = in_w * scale as usize;
     let exp_h = in_h * scale as usize;
     if out_w != exp_w || out_h != exp_h {
-        return check("Output dimensions", false,
-            &format!("E2E_DIM_MISMATCH: expected {}×{}, got {}×{}", exp_w, exp_h, out_w, out_h));
+        return check(
+            "Output dimensions",
+            false,
+            &format!(
+                "E2E_DIM_MISMATCH: expected {}×{}, got {}×{}",
+                exp_w, exp_h, out_w, out_h
+            ),
+        );
     }
-    check(&format!("Output dimensions ({}×{})", out_w, out_h), true, "");
+    check(
+        &format!("Output dimensions ({}×{})", out_w, out_h),
+        true,
+        "",
+    );
 
     let dur = ffprobe_duration(actual_out).unwrap_or(0.0);
     if dur <= 0.0 {
@@ -689,24 +732,33 @@ async fn check_e2e_native(
 
     // A) Input prereq checks
     if !std::path::Path::new(input_path).exists() {
-        return check("Input file exists", false,
-            &format!("E2E_INPUT_NOT_FOUND: {}", input_path));
+        return check(
+            "Input file exists",
+            false,
+            &format!("E2E_INPUT_NOT_FOUND: {}", input_path),
+        );
     }
     check("Input file exists", true, "");
 
     let (in_w, in_h) = match ffprobe_dims(input_path) {
-        Some(d) => { check(&format!("Probe input ({}×{})", d.0, d.1), true, ""); d }
+        Some(d) => {
+            check(&format!("Probe input ({}×{})", d.0, d.1), true, "");
+            d
+        }
         None => return check("Probe input", false, "E2E_FFPROBE_PROBE: ffprobe failed"),
     };
 
     if !std::path::Path::new(model_path).exists() {
-        return check("Model file exists", false,
-            &format!("E2E_MODEL_NOT_FOUND: {}", model_path));
+        return check(
+            "Model file exists",
+            false,
+            &format!("E2E_MODEL_NOT_FOUND: {}", model_path),
+        );
     }
     check("Model file exists", true, model_path);
 
     let out = output_path.unwrap_or("").to_string();
-    
+
     // B) Run pipeline
     println!("  Running native pipeline (this may take time)...");
     let result = upscale_request_native(
@@ -716,7 +768,8 @@ async fn check_e2e_native(
         scale,
         Some(precision.to_string()),
         Some(true), // audio
-    ).await;
+    )
+    .await;
 
     let report = match result {
         Ok(r) => r,
@@ -725,18 +778,28 @@ async fn check_e2e_native(
             return check("Native pipeline completed", false, &e);
         }
     };
-    
-    check("Native pipeline completed", true, &format!("frames={}", report.frames_processed));
+
+    check(
+        "Native pipeline completed",
+        true,
+        &format!("frames={}", report.frames_processed),
+    );
     let actual_out = &report.output_path;
 
     // C) Validate output
-    let size = std::fs::metadata(actual_out)
-        .map(|m| m.len()).unwrap_or(0);
+    let size = std::fs::metadata(actual_out).map(|m| m.len()).unwrap_or(0);
     if size < 4096 {
-        return check("Output file size", false,
-            &format!("E2E_OUTPUT_MISSING: {} bytes at {}", size, actual_out));
+        return check(
+            "Output file size",
+            false,
+            &format!("E2E_OUTPUT_MISSING: {} bytes at {}", size, actual_out),
+        );
     }
-    check("Output file size", true, &format!("> 4 KB ({} bytes)", size));
+    check(
+        "Output file size",
+        true,
+        &format!("> 4 KB ({} bytes)", size),
+    );
 
     let (out_w, out_h) = match ffprobe_dims(actual_out) {
         Some(d) => d,
@@ -745,10 +808,20 @@ async fn check_e2e_native(
     let exp_w = in_w * scale as usize;
     let exp_h = in_h * scale as usize;
     if out_w != exp_w || out_h != exp_h {
-        return check("Output dimensions", false,
-            &format!("E2E_DIM_MISMATCH: expected {}×{}, got {}×{}", exp_w, exp_h, out_w, out_h));
+        return check(
+            "Output dimensions",
+            false,
+            &format!(
+                "E2E_DIM_MISMATCH: expected {}×{}, got {}×{}",
+                exp_w, exp_h, out_w, out_h
+            ),
+        );
     }
-    check(&format!("Output dimensions ({}×{})", out_w, out_h), true, "");
+    check(
+        &format!("Output dimensions ({}×{})", out_w, out_h),
+        true,
+        "",
+    );
 
     let dur = ffprobe_duration(actual_out).unwrap_or(0.0);
     if dur <= 0.0 {
@@ -930,7 +1003,7 @@ async fn main() {
     // Only verify Python if we're running Python tests or NOT running native-only
     let run_python_tests = args.model.is_some() || args.shm_roundtrip || args.e2e_python;
     let native_only = args.e2e_native && !run_python_tests;
-    
+
     let mut python_env = None;
     if !native_only {
         println!();
@@ -1013,16 +1086,15 @@ async fn main() {
                     args.e2e_scale,
                     &args.precision,
                     args.keep_temp,
-                ).await;
+                )
+                .await;
                 all_passed &= ok;
             }
         }
     }
     #[cfg(not(feature = "native_engine"))]
     {
-        println!(
-            "[SKIP] native_engine feature: BLOCKED / DISABLED."
-        );
+        println!("[SKIP] native_engine feature: BLOCKED / DISABLED.");
         if args.e2e_native {
             eprintln!("[FAIL] --e2e-native requested but feature is disabled.");
             all_passed = false;
