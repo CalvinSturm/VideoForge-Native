@@ -62,6 +62,48 @@ pub struct JobProgress {
 
 pub type JobProgressFn = Arc<dyn Fn(JobProgress) + Send + Sync + 'static>;
 
+fn extract_handshake_protocol_version(raw: &str) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if let Some(v) = value
+        .get("protocol_version")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+    {
+        return Some(v);
+    }
+    value
+        .get("payload")
+        .and_then(|p| p.get("protocol_version"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+}
+
+fn validate_worker_protocol_version(found: Option<u32>, typed_ipc: bool) -> Result<(), String> {
+    let expected = crate::ipc::PROTOCOL_VERSION;
+    match found {
+        None => {
+            tracing::warn!("Worker protocol_version missing (older worker?)");
+            Ok(())
+        }
+        Some(v) if v == expected => Ok(()),
+        Some(v) => {
+            if typed_ipc {
+                Err(format!(
+                    "IPC_PROTOCOL_VERSION_MISMATCH: expected={}, found={}. Update or reinstall the Python worker to match host protocol.",
+                    expected, v
+                ))
+            } else {
+                tracing::warn!(
+                    expected,
+                    found = v,
+                    "Worker protocol version mismatch; continuing because typed IPC is disabled"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
 // ─── run_upscale_job ─────────────────────────────────────────────────────────
 
 pub async fn run_upscale_job(
@@ -178,18 +220,26 @@ pub async fn run_upscale_job(
     let mut python_guard = ProcessGuard::new(python_child);
 
     // Wait for Python startup handshake (first message = ready signal).
-    if timeout(
+    let handshake_msg = timeout(
         Duration::from_secs(config.zenoh_timeout_secs),
         subscriber.recv_async(),
     )
     .await
-    .is_err()
-    {
-        return Err(format!(
+    .map_err(|_| {
+        format!(
             "Python worker handshake timeout ({}s)",
             config.zenoh_timeout_secs
-        ));
-    }
+        )
+    })?
+    .map_err(|e: zenoh::Error| e.to_string())?;
+
+    let handshake_data =
+        String::from_utf8(handshake_msg.payload().to_bytes().to_vec()).map_err(|e| e.to_string())?;
+    validate_worker_protocol_version(
+        extract_handshake_protocol_version(&handshake_data),
+        worker_caps.use_typed_ipc,
+    )?;
+
     tracing::info!(job_id = %job_id, "Python worker handshake received");
 
     // ── Load model ───────────────────────────────────────────────────────────
@@ -697,6 +747,37 @@ pub async fn run_upscale_job(
         output_path,
         frames_encoded,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_worker_protocol_version;
+
+    #[test]
+    fn test_handshake_version_match_ok() {
+        assert!(validate_worker_protocol_version(Some(crate::ipc::PROTOCOL_VERSION), false).is_ok());
+        assert!(validate_worker_protocol_version(Some(crate::ipc::PROTOCOL_VERSION), true).is_ok());
+    }
+
+    #[test]
+    fn test_handshake_missing_version_warn_only_ok() {
+        assert!(validate_worker_protocol_version(None, false).is_ok());
+        assert!(validate_worker_protocol_version(None, true).is_ok());
+    }
+
+    #[test]
+    fn test_handshake_mismatch_warn_only_ok_when_typed_ipc_off() {
+        assert!(validate_worker_protocol_version(Some(crate::ipc::PROTOCOL_VERSION + 1), false).is_ok());
+    }
+
+    #[test]
+    fn test_handshake_mismatch_fails_when_typed_ipc_on() {
+        let err =
+            validate_worker_protocol_version(Some(crate::ipc::PROTOCOL_VERSION + 1), true).unwrap_err();
+        assert!(err.contains("IPC_PROTOCOL_VERSION_MISMATCH"));
+        assert!(err.contains("expected="));
+        assert!(err.contains("found="));
+    }
 }
 
 // ─── upscale_request (thin Tauri wrapper) ────────────────────────────────────

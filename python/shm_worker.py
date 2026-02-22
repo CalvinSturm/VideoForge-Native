@@ -547,7 +547,7 @@ class AIWorker:
         # Load default model
         default_model = "rcan_4x"
         log.info(f"Attempting initial load: {default_model}")
-        self.load_model(default_model)
+        self.load_model(default_model, startup_handshake=True)
         self.loop()
 
     def loop(self) -> None:
@@ -578,9 +578,11 @@ class AIWorker:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def load_model(self, model_identifier: str) -> None:
+    def load_model(self, model_identifier: str, startup_handshake: bool = False) -> None:
         """Load model using the deterministic model loader"""
         try:
+            from ipc_protocol import PROTOCOL_VERSION
+
             model, scale = self.model_loader.load(model_identifier)
             self.model = model
             self.model_scale = scale
@@ -605,9 +607,10 @@ class AIWorker:
                     log.warning(f"Research layer init failed: {e}")
                     self.research_layer = None
 
-            self.send_status(
-                "MODEL_LOADED", {"model": self.model_name, "scale": self.model_scale}
-            )
+            extra = {"model": self.model_name, "scale": self.model_scale}
+            if startup_handshake:
+                extra["protocol_version"] = PROTOCOL_VERSION
+            self.send_status("MODEL_LOADED", extra)
 
         except Exception as e:
             log.error(f"Load Error: {e}")
