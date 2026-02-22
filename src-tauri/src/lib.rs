@@ -25,6 +25,7 @@ pub mod spatial_map;
 pub mod spatial_publisher;
 mod utils;
 mod video_pipeline;
+pub mod win_events;
 
 // --- SYSTEM MONITOR (background thread) ---
 

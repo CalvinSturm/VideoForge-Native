@@ -279,6 +279,11 @@ def suppress_stdout():
 import threading
 import ctypes
 
+WAIT_OBJECT_0 = 0x00000000
+WAIT_TIMEOUT = 0x00000102
+SYNCHRONIZE = 0x00100000
+EVENT_MODIFY_STATE = 0x0002
+
 
 def is_pid_alive(pid: int) -> bool:
     """Check if PID is alive on Windows using ctypes kernel32"""
@@ -621,6 +626,13 @@ class AIWorker:
         self.use_events = use_events
         self.prealloc_tensors = prealloc_tensors
         self.deterministic_flag = deterministic
+        self.events_enabled = False
+        self.event_in_name: Optional[str] = None
+        self.event_out_name: Optional[str] = None
+        self._event_in_handle = None
+        self._event_out_handle = None
+        self._event_wait_timeout_ms = 50
+        self._event_warned = False
         self.tensor_pool: Optional[PreallocBuffers] = (
             PreallocBuffers(log) if self.prealloc_tensors else None
         )
@@ -664,6 +676,7 @@ class AIWorker:
 
     def cleanup(self) -> None:
         log.info("Cleanup...")
+        self._disable_event_sync(None)
         if self.tensor_pool is not None:
             self.tensor_pool.clear()
         if self.mmap:
@@ -685,6 +698,99 @@ class AIWorker:
                 log.warning(f"Zenoh session close failed: {e}")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _close_event_handle(self, handle) -> None:
+        if handle is None:
+            return
+        try:
+            ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception as e:
+            log.warning(f"CloseHandle failed: {e}")
+
+    def _disable_event_sync(self, reason: Optional[str]) -> None:
+        if reason:
+            log.warning(f"{reason}; falling back to polling")
+        self.events_enabled = False
+        self.event_in_name = None
+        self.event_out_name = None
+        if self._event_in_handle is not None:
+            self._close_event_handle(self._event_in_handle)
+            self._event_in_handle = None
+        if self._event_out_handle is not None:
+            self._close_event_handle(self._event_out_handle)
+            self._event_out_handle = None
+
+    def _setup_event_sync(self, payload: Dict) -> None:
+        self._disable_event_sync(None)
+
+        if not self.use_events:
+            return
+        if os.name != "nt":
+            if not self._event_warned:
+                log.warning("--use-events is Windows-only; falling back to polling")
+                self._event_warned = True
+            return
+
+        in_name = payload.get("event_in_name")
+        out_name = payload.get("event_out_name")
+        if not in_name or not out_name:
+            self._disable_event_sync("Event names missing from create_shm payload")
+            return
+
+        try:
+            open_event = ctypes.windll.kernel32.OpenEventW
+            open_event.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]
+            open_event.restype = ctypes.c_void_p
+
+            in_handle = open_event(SYNCHRONIZE, 0, in_name)
+            out_handle = open_event(EVENT_MODIFY_STATE, 0, out_name)
+            if not in_handle or not out_handle:
+                self._close_event_handle(in_handle)
+                self._close_event_handle(out_handle)
+                self._disable_event_sync(
+                    f"OpenEventW failed for in={in_name!r} out={out_name!r}"
+                )
+                return
+
+            self._event_in_handle = in_handle
+            self._event_out_handle = out_handle
+            self.event_in_name = in_name
+            self.event_out_name = out_name
+            self.events_enabled = True
+            log.info(
+                f"Win32 event sync enabled: in={self.event_in_name} out={self.event_out_name} "
+                f"timeout_ms={self._event_wait_timeout_ms}"
+            )
+        except Exception as e:
+            self._disable_event_sync(f"Win32 event setup failed: {e}")
+
+    def _wait_for_input_event(self) -> None:
+        if not self.events_enabled or self._event_in_handle is None:
+            return
+
+        try:
+            wait_result = ctypes.windll.kernel32.WaitForSingleObject(
+                self._event_in_handle, self._event_wait_timeout_ms
+            )
+            if wait_result in (WAIT_OBJECT_0, WAIT_TIMEOUT):
+                return
+            self._disable_event_sync(
+                f"WaitForSingleObject returned unexpected code {wait_result}"
+            )
+        except Exception as e:
+            self._disable_event_sync(f"WaitForSingleObject failed: {e}")
+
+    def _signal_output_event(self) -> None:
+        if not self.events_enabled or self._event_out_handle is None:
+            return
+        try:
+            set_event = ctypes.windll.kernel32.SetEvent
+            set_event.argtypes = [ctypes.c_void_p]
+            set_event.restype = ctypes.c_int
+            if not set_event(self._event_out_handle):
+                self._disable_event_sync("SetEvent(out_ready) failed")
+        except Exception as e:
+            self._disable_event_sync(f"SetEvent(out_ready) failed: {e}")
 
     def load_model(self, model_identifier: str, startup_handshake: bool = False) -> None:
         """Load model using the deterministic model loader"""
@@ -1254,6 +1360,7 @@ class AIWorker:
                 self._pinned_input = None
 
             self.is_configured = True
+            self._setup_event_sync(payload)
             log.info(
                 f"SHM created: {total_size} bytes "
                 f"(global_header={Config.GLOBAL_HEADER_SIZE}, "
@@ -1568,6 +1675,7 @@ class AIWorker:
             self.send_status("error", {"message": str(e)})
             return
         self._write_slot_state(slot_idx, Config.SLOT_READY_FOR_ENCODE)
+        self._signal_output_event()
         self.send_status("FRAME_DONE", {"slot": slot_idx})
 
     # -------------------------------------------------------------------------
@@ -1789,17 +1897,21 @@ class AIWorker:
                 # Transition all batch slots: AI_PROCESSING → READY_FOR_ENCODE
                 for idx in batch:
                     self._write_slot_state(idx, Config.SLOT_READY_FOR_ENCODE)
+                self._signal_output_event()
 
                 next_slot = (batch[-1] + 1) % self.ring_size
             else:
-                # No work available — adaptive backoff
-                idle_spins += 1
-                if idle_spins < 100:
-                    time.sleep(0.0001)  # 100µs tight spin
-                elif idle_spins < 1000:
-                    time.sleep(0.001)   # 1ms
+                # No work available. Event path waits with timeout; polling path keeps adaptive backoff.
+                if self.events_enabled and self._event_in_handle is not None:
+                    self._wait_for_input_event()
                 else:
-                    time.sleep(0.005)   # 5ms deep idle
+                    idle_spins += 1
+                    if idle_spins < 100:
+                        time.sleep(0.0001)  # 100µs tight spin
+                    elif idle_spins < 1000:
+                        time.sleep(0.001)   # 1ms
+                    else:
+                        time.sleep(0.005)   # 5ms deep idle
 
         log.info("Frame loop stopped")
 
@@ -1847,7 +1959,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Logger verbosity for stderr output (default: info)"
     )
     parser.add_argument("--use-typed-ipc", action="store_true", help="Parsed only (plumbing)")
-    parser.add_argument("--use-events", action="store_true", help="Parsed only (plumbing)")
+    parser.add_argument("--use-events", action="store_true", help="Use Win32 named-event SHM sync hints (Windows only)")
     parser.add_argument("--prealloc-tensors", action="store_true", help="Parsed only (plumbing)")
     parser.add_argument("--deterministic", action="store_true", help="Parsed only (plumbing)")
     return parser

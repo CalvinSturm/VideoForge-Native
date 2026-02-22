@@ -22,6 +22,8 @@ use crate::python_env::{
 };
 use crate::run_manifest::{maybe_write_run_manifest, RunManifestInputs};
 use crate::video_pipeline;
+#[cfg(windows)]
+use crate::win_events::{create_named_event, format_event_name, NamedEvent};
 use crate::{
     commands::export::{get_smart_output_path, is_image_file},
     shm,
@@ -152,6 +154,29 @@ fn validate_worker_protocol_version(found: Option<u32>, typed_ipc: bool) -> Resu
     }
 }
 
+fn build_create_shm_payload(
+    width: usize,
+    height: usize,
+    scale: usize,
+    ring_size: usize,
+    event_in_name: Option<&str>,
+    event_out_name: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = json!({
+        "width": width,
+        "height": height,
+        "scale": scale,
+        "ring_size": ring_size
+    });
+    if let Some(name) = event_in_name {
+        payload["event_in_name"] = json!(name);
+    }
+    if let Some(name) = event_out_name {
+        payload["event_out_name"] = json!(name);
+    }
+    payload
+}
+
 // ─── run_upscale_job ─────────────────────────────────────────────────────────
 
 pub async fn run_upscale_job(
@@ -175,6 +200,10 @@ pub async fn run_upscale_job(
         config.output_path.clone()
     };
     let worker_caps = WorkerCaps::default();
+    #[cfg(not(windows))]
+    if worker_caps.use_events {
+        tracing::warn!("--use-events is Windows-only; falling back to polling");
+    }
 
     if let Some(manifest_path) = maybe_write_run_manifest(
         config.enable_run_artifacts,
@@ -446,19 +475,58 @@ pub async fn run_upscale_job(
         "Video pipeline starting"
     );
 
+    let mut event_in_name: Option<String> = None;
+    let mut event_out_name: Option<String> = None;
+    #[cfg(windows)]
+    let mut in_ready_event: Option<Arc<NamedEvent>> = None;
+    #[cfg(windows)]
+    let mut out_ready_event: Option<Arc<NamedEvent>> = None;
+
+    #[cfg(windows)]
+    if worker_caps.use_events {
+        let in_name = format_event_name(&job_id, "in_ready");
+        let out_name = format_event_name(&job_id, "out_ready");
+        match (create_named_event(&in_name), create_named_event(&out_name)) {
+            (Ok(in_evt), Ok(out_evt)) => {
+                tracing::info!(
+                    job_id = %job_id,
+                    in_event = %in_evt.name(),
+                    out_event = %out_evt.name(),
+                    "Win32 named SHM events enabled"
+                );
+                event_in_name = Some(in_name);
+                event_out_name = Some(out_name);
+                in_ready_event = Some(Arc::new(in_evt));
+                out_ready_event = Some(Arc::new(out_evt));
+            }
+            (in_res, out_res) => {
+                let in_err = in_res.err().unwrap_or_default();
+                let out_err = out_res.err().unwrap_or_default();
+                tracing::warn!(
+                    job_id = %job_id,
+                    in_error = %in_err,
+                    out_error = %out_err,
+                    "Failed to create Win32 events; falling back to polling"
+                );
+            }
+        }
+    }
+    #[cfg(windows)]
+    let _out_ready_event_lifetime_guard = out_ready_event;
+
     // Request Python to create the SHM ring buffer.
+    let create_shm_payload = build_create_shm_payload(
+        process_w,
+        process_h,
+        scale_factor,
+        shm::RING_SIZE,
+        event_in_name.as_deref(),
+        event_out_name.as_deref(),
+    );
+
     ipc::put_request(
         &publisher,
-        RequestEnvelope::new(
-            "create_shm",
-            &job_id,
-            json!({
-                "width": process_w,
-                "height": process_h,
-                "scale": scale_factor,
-                "ring_size": shm::RING_SIZE
-            }),
-        ),
+        RequestEnvelope::new("create_shm", &job_id, create_shm_payload),
     )
     .await
     .map_err(|e: zenoh::Error| e.to_string())?;
@@ -540,6 +608,8 @@ pub async fn run_upscale_job(
     // ── Decoder task ─────────────────────────────────────────────────────────
     let decoder_task = async {
         let frames_decoded_ctr = Arc::clone(&frames_decoded_ctr);
+        #[cfg(windows)]
+        let in_ready_event = in_ready_event.clone();
         let use_nvdec = video_pipeline::probe_nvdec();
         let mut decoder = video_pipeline::VideoDecoder::new(
             &config.input_path,
@@ -587,6 +657,17 @@ pub async fn run_upscale_job(
                 shm_guard.set_slot_frame_bytes(slot_idx, size);
                 shm_guard.set_slot_state(slot_idx, shm::SLOT_READY_FOR_AI);
                 drop(shm_guard);
+                #[cfg(windows)]
+                if let Some(evt) = &in_ready_event {
+                    if let Err(e) = evt.signal() {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            slot_index = slot_idx,
+                            error = %e,
+                            "Failed to signal in_ready event; polling path will recover"
+                        );
+                    }
+                }
 
                 tracing::debug!(
                     job_id = %job_id,
@@ -832,7 +913,9 @@ pub async fn run_upscale_job(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_worker_protocol_version, JobProgress, StageTimingsMs};
+    use super::{
+        build_create_shm_payload, validate_worker_protocol_version, JobProgress, StageTimingsMs,
+    };
 
     #[test]
     fn test_handshake_version_match_ok() {
@@ -910,6 +993,31 @@ mod tests {
         assert!(v.get("frames_processed").is_none());
         assert!(v.get("frames_encoded").is_none());
         assert!(v.get("stage_ms").is_none());
+    }
+
+    #[test]
+    fn test_create_shm_payload_omits_event_names_when_absent() {
+        let v = build_create_shm_payload(1920, 1080, 2, 6, None, None);
+        assert_eq!(v["width"], 1920);
+        assert_eq!(v["height"], 1080);
+        assert_eq!(v["scale"], 2);
+        assert_eq!(v["ring_size"], 6);
+        assert!(v.get("event_in_name").is_none());
+        assert!(v.get("event_out_name").is_none());
+    }
+
+    #[test]
+    fn test_create_shm_payload_includes_event_names_when_present() {
+        let v = build_create_shm_payload(
+            1920,
+            1080,
+            2,
+            6,
+            Some("vf_shm_abc_in_ready"),
+            Some("vf_shm_abc_out_ready"),
+        );
+        assert_eq!(v["event_in_name"], "vf_shm_abc_in_ready");
+        assert_eq!(v["event_out_name"], "vf_shm_abc_out_ready");
     }
 }
 
