@@ -13,7 +13,14 @@
       "Bash(cargo --version:*)",
       "Bash(cargo build:*)",
       "Bash(cargo search:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(\"C:\\\\Users\\\\Calvin\\\\VideoForge\\\\venv310\\\\Scripts\\\\python.exe\" -c:*)",
+      "Bash(\"C:\\\\Users\\\\Calvin\\\\VideoForge\\\\venv310\\\\Scripts\\\\python.exe\" -c \":*)",
+      "Bash(npx tsc:*)",
+      "Bash(cat:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)"
     ]
   }
 }

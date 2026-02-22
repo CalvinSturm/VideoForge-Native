@@ -25,7 +25,7 @@ import { TitleBar } from "./components/TitleBar";
 import { PanelHeader } from "./components/PanelHeader";
 import { EmptyState } from "./components/EmptyState";
 
-import type { Toast, UpscaleMode, Job, VideoState, EditState } from './types';
+import type { Toast, UpscaleMode, Job, VideoState, EditState, RavePolicy } from './types';
 
 interface ModelInfo {
   id: string;
@@ -33,6 +33,14 @@ interface ModelInfo {
   filename: string;
   format: string;  // "onnx" | "pytorch"
   path: string;
+}
+
+interface RaveCommandJson {
+  output?: string;
+  policy?: RavePolicy;
+  host_copy_audit_enabled?: boolean;
+  host_copy_audit_disable_reason?: string | null;
+  [key: string]: unknown;
 }
 
 // Fallback model list when engine discovery fails
@@ -180,7 +188,7 @@ const App: React.FC = () => {
   const getScaleFromModel = (modelId?: string): number => {
     if (!modelId) return 4;
     const match = modelId.match(/x(\d)/);
-    return match ? parseInt(match[1], 10) : 4;
+    return match?.[1] ? parseInt(match[1], 10) : 4;
   };
 
   // --- Keybinds ---
@@ -357,6 +365,40 @@ const App: React.FC = () => {
     color: editState.color
   });
 
+  const defaultRaveOutputPath = (input: string) => {
+    const ext = input.split('.').pop()?.toLowerCase();
+    if (ext) return input.replace(new RegExp(`\\.${ext}$`), `_rave_upscaled.mp4`);
+    return `${input}_rave_upscaled.mp4`;
+  };
+
+  const buildRaveUpscaleArgs = (params: {
+    input: string;
+    output: string;
+    modelPath: string;
+  }): string[] => {
+    const args = [
+      "-i", params.input,
+      "-m", params.modelPath,
+      "-o", params.output,
+      "--precision", "fp16",
+      "--progress", "jsonl"
+    ];
+    return args;
+  };
+
+  const buildRaveBenchmarkArgs = (params: {
+    input: string;
+    modelPath: string;
+  }): string[] => {
+    return [
+      "-i", params.input,
+      "-m", params.modelPath,
+      "--skip-encode",
+      "--dry-run",
+      "--progress", "jsonl"
+    ];
+  };
+
   const startUpscale = async () => {
     if (!inputPath) return addToast("Select an input file first!", "error");
 
@@ -366,7 +408,7 @@ const App: React.FC = () => {
     }
 
     const jobId = Date.now().toString();
-    const newJob: Job = { id: jobId, command: `Upscale: ${inputPath.split(/[\\/]/).pop()}`, status: "running", progress: 0, statusMessage: "Initializing...", paused: false, eta: 0 };
+    const newJob: Job = { id: jobId, command: `Upscale: ${inputPath.split(/[\\/]/).pop()}`, status: "running", progress: 0, statusMessage: "Initializing...", paused: false, eta: 0, startedAt: Date.now() };
     setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
     if (!panels.QUEUE) openPanel('QUEUE');
 
@@ -398,17 +440,49 @@ const App: React.FC = () => {
       const info = modelInfoMap.get(selectedModel);
 
       let resultPath: string;
-      if (upscaleConfig.useNativeEngine) {
+      let policy: RavePolicy | undefined;
+      let hostCopyAuditEnabled: boolean | undefined;
+      let hostCopyAuditDisableReason: string | null | undefined;
+      const canUseNative = upscaleConfig.useNativeEngine && mode === 'video';
+      if (canUseNative) {
         if (info?.format === "onnx") {
-          // GPU-native pipeline: NVDEC → TensorRT → NVENC (zero host copies).
-          resultPath = await invoke<string>("upscale_request_native", {
-            inputPath,
-            outputPath,
-            modelPath: info.path,
-            scale: info.scale,
-            precision: "fp32",
-            audio: true,
+          // Route native-video path through rave-cli JSON contract.
+          const resolvedOutputPath = outputPath?.trim() ? outputPath : defaultRaveOutputPath(inputPath);
+          if (showTechSpecs) {
+            try {
+              const benchmark = await invoke<RaveCommandJson>("rave_benchmark", {
+                args: buildRaveBenchmarkArgs({
+                  input: inputPath,
+                  modelPath: info.path
+                }),
+                strictAudit: true,
+                mockRun: false
+              });
+              setLogs(prev => [
+                ...prev,
+                `[RAVE] benchmark dry-run fps=${String(benchmark.fps ?? "n/a")} policy=${JSON.stringify(benchmark.policy ?? {})}`
+              ]);
+            } catch (benchErr) {
+              setLogs(prev => [...prev, `[RAVE] benchmark dry-run failed: ${benchErr}`]);
+            }
+          }
+
+          const raveResult = await invoke<RaveCommandJson>("rave_upscale", {
+            args: buildRaveUpscaleArgs({
+              input: inputPath,
+              output: resolvedOutputPath,
+              modelPath: info.path
+            }),
+            strictAudit: true,
+            mockRun: false
           });
+          if (!raveResult.output || typeof raveResult.output !== "string") {
+            throw new Error("rave_upscale did not return a valid output path");
+          }
+          resultPath = raveResult.output;
+          policy = raveResult.policy;
+          hostCopyAuditEnabled = raveResult.host_copy_audit_enabled;
+          hostCopyAuditDisableReason = raveResult.host_copy_audit_disable_reason;
         } else {
           // Native engine selected but current model is not ONNX — fall back.
           addToast(
@@ -421,21 +495,31 @@ const App: React.FC = () => {
         resultPath = await invoke<string>("upscale_request", upscalePayload);
       }
       setLogs(prev => [...prev, `[SYSTEM] Job ${jobId} finished.`]);
-      const finishedJob: Job = { ...newJob, status: 'done', progress: 100, outputPath: resultPath, eta: 0 };
+      const finishedJob: Job = {
+        ...newJob,
+        status: 'done',
+        progress: 100,
+        outputPath: resultPath,
+        eta: 0,
+        completedAt: Date.now(),
+        ...(policy ? { policy } : {}),
+        ...(typeof hostCopyAuditEnabled === "boolean" ? { hostCopyAuditEnabled } : {}),
+        ...(hostCopyAuditDisableReason !== undefined ? { hostCopyAuditDisableReason } : {})
+      };
       setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
       setActiveJob(finishedJob);
       setLastOutputPath(resultPath);
     } catch (err) {
       addToast(`Error: ${err}`, "error");
       setLogs(prev => [...prev, `[ERROR] Job ${jobId} failed: ${err}`]);
-      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'error', statusMessage: String(err) } : j));
+      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'error', statusMessage: String(err), completedAt: Date.now() } : j));
     } finally { setIsProcessing(false); }
   };
 
   const onExportEdited = async () => {
     if (!inputPath) return addToast("Select input first!", "error");
     const jobId = Date.now().toString();
-    const newJob: Job = { id: jobId, command: `Transcode: ${inputPath.split(/[\\/]/).pop()}`, status: "running", progress: 0, statusMessage: "Encoding...", paused: false, eta: 0 };
+    const newJob: Job = { id: jobId, command: `Transcode: ${inputPath.split(/[\\/]/).pop()}`, status: "running", progress: 0, statusMessage: "Encoding...", paused: false, eta: 0, startedAt: Date.now() };
     setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
     if (!panels.QUEUE) openPanel('QUEUE');
 
@@ -443,15 +527,80 @@ const App: React.FC = () => {
       const resultPath = await invoke<string>("export_request", { inputPath, outputPath, editConfig: getRustEditConfig(), scale: 1 });
       setLogs(prev => [...prev, `[SYSTEM] Export ${jobId} complete.`]);
       addToast("Export Completed", "success");
-      const finishedJob: Job = { ...newJob, status: 'done', progress: 100, outputPath: resultPath, eta: 0 };
+      const finishedJob: Job = { ...newJob, status: 'done', progress: 100, outputPath: resultPath, eta: 0, completedAt: Date.now() };
       setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
       setActiveJob(finishedJob);
       setLastOutputPath(resultPath);
     } catch (err) {
       addToast(`Error: ${err}`, "error");
       setLogs(prev => [...prev, `[ERROR] Export ${jobId} failed: ${err}`]);
-      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'error', statusMessage: String(err) } : j));
+      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'error', statusMessage: String(err), completedAt: Date.now() } : j));
     } finally { setIsProcessing(false); }
+  };
+
+  const startRaveValidate = async () => {
+    if (!inputPath) return addToast("Select an input file first!", "error");
+
+    const jobId = `validate_${Date.now().toString()}`;
+    const newJob: Job = {
+      id: jobId,
+      command: "Validate: production_strict (mock)",
+      status: "running",
+      progress: 0,
+      statusMessage: "Validating strict policy...",
+      paused: false,
+      eta: 0,
+      startedAt: Date.now()
+    };
+    setJobs(prev => [...prev, newJob]);
+    setActiveJob(newJob);
+    setIsProcessing(true);
+    if (!panels.QUEUE) openPanel('QUEUE');
+
+    try {
+      const result = await invoke<RaveCommandJson>("rave_validate", {
+        fixture: null,
+        profile: "production_strict",
+        bestEffort: true,
+        strictAudit: true,
+        mockRun: true
+      });
+
+      const policy = result.policy;
+      const hostCopyAuditEnabled = result.host_copy_audit_enabled;
+      const hostCopyAuditDisableReason = result.host_copy_audit_disable_reason;
+      const skipped = result.skipped === true;
+
+      const finishedJob: Job = {
+        ...newJob,
+        status: "done",
+        progress: 100,
+        statusMessage: skipped ? "Validation skipped" : "Validation passed",
+        completedAt: Date.now(),
+        ...(policy ? { policy } : {}),
+        ...(typeof hostCopyAuditEnabled === "boolean" ? { hostCopyAuditEnabled } : {}),
+        ...(hostCopyAuditDisableReason !== undefined ? { hostCopyAuditDisableReason } : {})
+      };
+      setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
+      setActiveJob(finishedJob);
+      setLogs(prev => [
+        ...prev,
+        `[RAVE] validate ok=${String(result.ok ?? "unknown")} skipped=${String(result.skipped ?? false)} policy=${JSON.stringify(policy ?? {})}`
+      ]);
+      addToast(skipped ? "Validate completed (skipped)" : "Validate passed", skipped ? "warning" : "success");
+    } catch (err) {
+      setJobs(prev => prev.map(j => j.id === jobId ? {
+        ...j,
+        status: "error",
+        statusMessage: String(err),
+        errorMessage: String(err),
+        completedAt: Date.now()
+      } : j));
+      setLogs(prev => [...prev, `[RAVE] validate failed: ${err}`]);
+      addToast(`Validate failed: ${err}`, "error");
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
   const renderPreviewSample = async () => {
@@ -461,7 +610,7 @@ const App: React.FC = () => {
     const previewConfig = { ...getRustEditConfig(), trim_start: start, trim_end: end };
     let activeScale = upscaleConfig.scaleFactor || getScaleFromModel(model);
     const jobId = "preview_" + Date.now().toString().slice(-6);
-    const newJob: Job = { id: jobId, command: `PREVIEW SAMPLE`, status: "running", progress: 0, statusMessage: "Rendering...", paused: false, eta: 0 };
+    const newJob: Job = { id: jobId, command: `PREVIEW SAMPLE`, status: "running", progress: 0, statusMessage: "Rendering...", paused: false, eta: 0, startedAt: Date.now() };
     setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
 
     // Build comprehensive preview payload with all new fields
@@ -484,13 +633,13 @@ const App: React.FC = () => {
 
     try {
       const resultPath = await invoke<string>("upscale_request", previewPayload);
-      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'done', progress: 100, outputPath: resultPath } : j));
+      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'done', progress: 100, outputPath: resultPath, completedAt: Date.now() } : j));
       setActiveJob(prev => prev?.id === jobId ? { ...prev, status: 'done', outputPath: resultPath, progress: 100 } : prev);
       setPreviewFile(resultPath); addToast("Preview Ready", "success");
       setRenderedRange({ start, end }); // Set specific sample range
     } catch (e) {
       addToast("Preview Failed: " + e, "error");
-      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'error', errorMessage: String(e) } : j));
+      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'error', errorMessage: String(e), completedAt: Date.now() } : j));
     } finally { setIsProcessing(false); }
   };
 
@@ -509,7 +658,7 @@ const App: React.FC = () => {
         // Assume backend has a cancellation command, or just mark as cancelled in UI if backend is fire-and-forget
         // For now, we'll mark as cancelled. If backend support exists, invoke it here.
         // await invoke('cancel_job', { jobId: id }); 
-        setJobs(prev => prev.map(j => j.id === id ? { ...j, status: 'cancelled', progress: 0, eta: 0 } : j));
+        setJobs(prev => prev.map(j => j.id === id ? { ...j, status: 'cancelled', progress: 0, eta: 0, completedAt: Date.now() } : j));
         setLogs(prev => [...prev, `[SYSTEM] Job ${id} cancelled by user.`]);
         if (activeJob?.id === id) setActiveJob(null);
         setIsProcessing(false);
@@ -528,13 +677,13 @@ const App: React.FC = () => {
   const tileComponents = useMemo(() => {
     const completeVideoState = { ...videoState, renderSample: renderPreviewSample };
     return {
-      SETTINGS: <InputOutputPanel mode={mode} setMode={setMode} pickInput={pickInput} inputPath={inputPath} pickOutput={pickOutput} outputPath={outputPath} model={model} setModel={setModel} availableModels={availableModels} loadingModel={loadingModel} loadModel={() => { }} startUpscale={startUpscale} isValidPaths={isValidPaths} showTech={showTechSpecs} showResearchParams={showResearchParams} videoState={completeVideoState} editState={editState} setEditState={setEditState} onExportEdited={onExportEdited} viewMode={viewMode} setViewMode={setViewMode} />,
+      SETTINGS: <InputOutputPanel mode={mode} setMode={setMode} pickInput={pickInput} inputPath={inputPath} pickOutput={pickOutput} outputPath={outputPath} model={model} setModel={setModel} availableModels={availableModels} loadingModel={loadingModel} loadModel={() => { }} startUpscale={startUpscale} onRunValidate={startRaveValidate} isValidPaths={isValidPaths} showTech={showTechSpecs} showResearchParams={showResearchParams} videoState={completeVideoState} editState={editState} setEditState={setEditState} onExportEdited={onExportEdited} viewMode={viewMode} setViewMode={setViewMode} />,
       PREVIEW: <PreviewPanel inputPreview={inputPath} activeJob={activeJob} videoState={completeVideoState} onFileDrop={handleNewInput} mode={mode} editState={editState} setEditState={setEditState} viewMode={viewMode} setViewMode={setViewMode} showTech={showTechSpecs} />,
       // Updated to pass clearCompleted
       QUEUE: <JobsPanel jobs={jobs} pauseJob={() => { }} cancelJob={handleCancelJob} resumeJob={() => { }} clearCompleted={clearCompletedJobs} showTech={showTechSpecs} />,
       ACTIVITY: <LogsPanel logs={logs} setLogs={setLogs} darkMode={darkMode} logsEndRef={logsEndRef} />
     };
-  }, [mode, inputPath, outputPath, model, availableModels, loadingModel, isValidPaths, showTechSpecs, showResearchParams, videoState, editState, viewMode, jobs, activeJob, logs]);
+  }, [mode, inputPath, outputPath, model, availableModels, loadingModel, isValidPaths, showTechSpecs, showResearchParams, videoState, editState, viewMode, jobs, activeJob, logs, upscaleConfig, modelInfoMap]);
 
   const renderTile = useCallback((id: PanelId, path: any[]) => {
     return (

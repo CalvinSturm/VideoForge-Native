@@ -27,9 +27,7 @@ static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Return a per-process-lifetime monotonically increasing request ID string.
 pub fn next_request_id() -> String {
-    REQUEST_SEQ
-        .fetch_add(1, Ordering::Relaxed)
-        .to_string()
+    REQUEST_SEQ.fetch_add(1, Ordering::Relaxed).to_string()
 }
 
 // ─── Request (Rust → Python) ─────────────────────────────────────────────────
@@ -129,11 +127,7 @@ mod tests {
 
     #[test]
     fn request_roundtrip() {
-        let req = RequestEnvelope::new(
-            "load_model",
-            "job-1",
-            json!({"model_name": "RCAN_x4"}),
-        );
+        let req = RequestEnvelope::new("load_model", "job-1", json!({"model_name": "RCAN_x4"}));
         let json_str = req.to_json();
         let parsed: RequestEnvelope = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed.version, PROTOCOL_VERSION);
@@ -200,9 +194,9 @@ mod tests {
         // Must deserialize cleanly using serde defaults.
         let json_str = r#"{"status": "MODEL_LOADED", "model": "RCAN_x4", "scale": 4}"#;
         let resp: ResponseEnvelope = serde_json::from_str(json_str).unwrap();
-        assert_eq!(resp.version, 0);       // default
-        assert_eq!(resp.request_id, "");   // default
-        assert_eq!(resp.job_id, "");       // default
+        assert_eq!(resp.version, 0); // default
+        assert_eq!(resp.request_id, ""); // default
+        assert_eq!(resp.job_id, ""); // default
         assert_eq!(resp.status.as_deref(), Some("MODEL_LOADED"));
         assert!(resp.error.is_none());
     }

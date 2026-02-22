@@ -658,7 +658,7 @@ async fn check_e2e_python(
                 "Job completed",
                 false,
                 &format!("E2E_TIMEOUT: exceeded {}ms", timeout_ms),
-            )
+            );
         }
         Ok(Err(e)) => return check("Job completed", false, &e),
         Ok(Ok(r)) => r,

@@ -1,0 +1,17 @@
+[package]
+name = "rave-nvcodec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "RAVE NVDEC/NVENC hardware codec wrappers."
+readme = "README.md"
+build = "build.rs"
+
+[dependencies]
+rave-core = { workspace = true }
+cudarc = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]

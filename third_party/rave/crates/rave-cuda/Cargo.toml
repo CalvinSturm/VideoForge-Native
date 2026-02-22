@@ -1,0 +1,14 @@
+[package]
+name = "rave-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "RAVE CUDA kernels, timers, and stream helpers."
+readme = "README.md"
+
+[dependencies]
+rave-core = { workspace = true }
+cudarc = { workspace = true }
+tracing = { workspace = true }

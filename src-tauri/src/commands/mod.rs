@@ -6,4 +6,5 @@
 pub mod engine;
 pub mod export;
 pub mod native_engine;
+pub mod rave;
 pub mod upscale;

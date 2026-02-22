@@ -19,6 +19,13 @@
 
 ---
 
+## RAVE Integration Docs
+
+- `docs/VIDEOFORGE_2_WEEK_EXECUTION_PLAN.md` — execution plan for `rave-*` integration.
+- `docs/WINDOWS_RAVE_RUNTIME.md` — Windows runtime setup, commands, and troubleshooting for RAVE.
+
+---
+
 ## Overview
 
 VideoForge is a high-performance desktop application for AI-powered image and video upscaling. It runs entirely on your local machine — no cloud, no uploads, no data leaves your GPU. The app combines a Rust orchestration layer, a Python AI inference engine, and a professional React-based UI into a zero-copy pipeline that decodes, upscales, and encodes video frames with minimal overhead.

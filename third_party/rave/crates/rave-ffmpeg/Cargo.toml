@@ -1,0 +1,14 @@
+[package]
+name = "rave-ffmpeg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "RAVE FFmpeg container I/O (demux, mux, probe)."
+readme = "README.md"
+
+[dependencies]
+rave-core = { workspace = true }
+ffmpeg-sys-next = { workspace = true }
+tracing = { workspace = true }

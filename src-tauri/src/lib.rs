@@ -19,6 +19,7 @@ pub mod edit_config;
 pub mod ipc;
 pub mod models;
 pub mod python_env;
+pub mod rave_cli;
 pub mod run_manifest;
 pub mod shm;
 pub mod spatial_map;
@@ -82,6 +83,10 @@ pub fn run() {
             commands::upscale::upscale_request,
             // Native engine (always registered; returns FEATURE_DISABLED if not compiled in)
             commands::native_engine::upscale_request_native,
+            // RAVE pipeline integration
+            commands::rave::rave_validate,
+            commands::rave::rave_upscale,
+            commands::rave::rave_benchmark,
             // Transcode-only export
             commands::export::export_request,
             // Engine management

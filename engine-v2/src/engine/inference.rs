@@ -20,7 +20,7 @@ use crate::backends::tensorrt::TensorRtBackend;
 use crate::core::backend::UpscaleBackend;
 use crate::core::context::GpuContext;
 use crate::core::kernels::{ModelPrecision, PreprocessKernels, PreprocessPipeline, StageMetrics};
-use crate::core::types::{GpuTexture, FrameEnvelope, PixelFormat};
+use crate::core::types::{FrameEnvelope, GpuTexture, PixelFormat};
 use crate::error::{EngineError, Result};
 
 /// End-to-end GPU-resident inference pipeline.
@@ -126,12 +126,9 @@ impl InferencePipeline {
             (inference_output.width as usize + 255) & !255, // 256-byte aligned
         );
 
-        let nv12_output = self.preprocess.postprocess(
-            inference_output,
-            nv12_pitch,
-            &self.ctx,
-            stream,
-        )?;
+        let nv12_output =
+            self.preprocess
+                .postprocess(inference_output, nv12_pitch, &self.ctx, stream)?;
 
         debug!(
             frame = envelope.frame_index,

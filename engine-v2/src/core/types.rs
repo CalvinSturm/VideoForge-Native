@@ -22,8 +22,8 @@
 //!    the `GpuTexture` is dropped.  This is guaranteed structurally because
 //!    `CudaSlice` holds an `Arc<CudaDevice>`.
 
-use std::sync::Arc;
 use cudarc::driver::{CudaSlice, DevicePtr};
+use std::sync::Arc;
 
 // ─── Pixel format ────────────────────────────────────────────────────────────
 
@@ -167,7 +167,11 @@ impl GpuTexture {
     /// Panics if `self.format != PixelFormat::Nv12`.
     #[inline]
     pub fn nv12_uv_offset(&self) -> usize {
-        assert_eq!(self.format, PixelFormat::Nv12, "nv12_uv_offset called on non-NV12 texture");
+        assert_eq!(
+            self.format,
+            PixelFormat::Nv12,
+            "nv12_uv_offset called on non-NV12 texture"
+        );
         self.pitch * (self.height as usize)
     }
 

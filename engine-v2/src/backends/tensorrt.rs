@@ -40,11 +40,11 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use ort::execution_providers::TensorRTExecutionProvider as TrtEP;
+use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::Session;
-use ort::memory::{Allocator, AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::tensor::TensorElementType;
 use ort::value::DynTensor;
-use ort::execution_providers::TensorRTExecutionProvider as TrtEP;
 
 use cudarc::driver::DevicePtr;
 
@@ -118,8 +118,10 @@ impl InferenceMetrics {
 
     pub fn record(&self, elapsed_us: u64) {
         self.frames_inferred.fetch_add(1, Ordering::Relaxed);
-        self.total_inference_us.fetch_add(elapsed_us, Ordering::Relaxed);
-        self.peak_inference_us.fetch_max(elapsed_us, Ordering::Relaxed);
+        self.total_inference_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
+        self.peak_inference_us
+            .fetch_max(elapsed_us, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> InferenceMetricsSnapshot {
@@ -242,7 +244,9 @@ impl OutputRing {
         let sc = Arc::strong_count(slot);
 
         if sc != 1 {
-            self.metrics.slot_contention_events.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .slot_contention_events
+                .fetch_add(1, Ordering::Relaxed);
             return Err(EngineError::BufferTooSmall {
                 need: self.slot_bytes,
                 have: 0,
@@ -251,16 +255,22 @@ impl OutputRing {
 
         // Debug assertion — belt-and-suspenders check.
         debug_assert_eq!(
-            Arc::strong_count(slot), 1,
+            Arc::strong_count(slot),
+            1,
             "OutputRing: slot {} strong_count must be 1 before reuse, got {}",
-            self.cursor, sc
+            self.cursor,
+            sc
         );
 
         if self.used[self.cursor] {
-            self.metrics.slot_reuse_count.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .slot_reuse_count
+                .fetch_add(1, Ordering::Relaxed);
         } else {
             self.used[self.cursor] = true;
-            self.metrics.slot_first_use_count.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .slot_first_use_count
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         let cloned = Arc::clone(slot);
@@ -273,13 +283,7 @@ impl OutputRing {
     }
 
     /// Reallocate all slots.  All must have `strong_count == 1`.
-    pub fn reallocate(
-        &mut self,
-        ctx: &GpuContext,
-        in_w: u32,
-        in_h: u32,
-        scale: u32,
-    ) -> Result<()> {
+    pub fn reallocate(&mut self, ctx: &GpuContext, in_w: u32, in_h: u32, scale: u32) -> Result<()> {
         for (i, slot) in self.slots.iter().enumerate() {
             let sc = Arc::strong_count(slot);
             if sc != 1 {
@@ -368,8 +372,12 @@ impl TensorRtBackend {
         downstream_capacity: usize,
     ) -> Self {
         Self::with_precision(
-            model_path, ctx, device_id, ring_size,
-            downstream_capacity, PrecisionPolicy::default(),
+            model_path,
+            ctx,
+            device_id,
+            ring_size,
+            downstream_capacity,
+            PrecisionPolicy::default(),
             BatchConfig::default(),
         )
     }
@@ -414,7 +422,8 @@ impl TensorRtBackend {
             0,
             AllocatorType::Device,
             MemoryType::Default,
-        ).map_err(|e| EngineError::ModelMetadata(format!("MemoryInfo: {e}")))?;
+        )
+        .map_err(|e| EngineError::ModelMetadata(format!("MemoryInfo: {e}")))?;
         // Ignore race — if another thread already set it, discard ours and use theirs.
         let _ = self.cached_mem_info.set(info);
         Ok(self.cached_mem_info.get().unwrap())
@@ -423,7 +432,8 @@ impl TensorRtBackend {
     /// Access ring metrics (if initialized).
     pub async fn ring_metrics(&self) -> Option<(u64, u64, u64)> {
         let guard = self.state.lock().await;
-        guard.as_ref()
+        guard
+            .as_ref()
             .and_then(|s| s.ring.as_ref())
             .map(|r| r.metrics.snapshot())
     }
@@ -446,25 +456,36 @@ impl TensorRtBackend {
         // In ORT 2.0-rc.11, ValueType::Tensor uses `shape: Shape` (SmallVec<[i64;4]>)
         // where -1 means dynamic. We convert to Vec<Option<i64>> for downstream use.
         let input_dims: Vec<Option<i64>> = match input_info.dtype() {
-            ort::value::ValueType::Tensor { ty: _, shape, .. } =>
-                shape.iter().map(|&d| if d < 0 { None } else { Some(d) }).collect(),
-            other => return Err(EngineError::ModelMetadata(format!(
-                "Expected tensor input, got {:?}", other
-            ))),
+            ort::value::ValueType::Tensor { ty: _, shape, .. } => shape
+                .iter()
+                .map(|&d| if d < 0 { None } else { Some(d) })
+                .collect(),
+            other => {
+                return Err(EngineError::ModelMetadata(format!(
+                    "Expected tensor input, got {:?}",
+                    other
+                )));
+            }
         };
 
         let output_dims: Vec<Option<i64>> = match output_info.dtype() {
-            ort::value::ValueType::Tensor { ty: _, shape, .. } =>
-                shape.iter().map(|&d| if d < 0 { None } else { Some(d) }).collect(),
-            other => return Err(EngineError::ModelMetadata(format!(
-                "Expected tensor output, got {:?}", other
-            ))),
+            ort::value::ValueType::Tensor { ty: _, shape, .. } => shape
+                .iter()
+                .map(|&d| if d < 0 { None } else { Some(d) })
+                .collect(),
+            other => {
+                return Err(EngineError::ModelMetadata(format!(
+                    "Expected tensor output, got {:?}",
+                    other
+                )));
+            }
         };
 
         if input_dims.len() != 4 || output_dims.len() != 4 {
             return Err(EngineError::ModelMetadata(format!(
                 "Expected 4D tensors (NCHW), got input={}D output={}D",
-                input_dims.len(), output_dims.len()
+                input_dims.len(),
+                output_dims.len()
             )));
         }
 
@@ -494,8 +515,13 @@ impl TensorRtBackend {
             .unwrap_or_else(|| "unknown".to_string());
 
         Ok(ModelMetadata {
-            name, scale, input_name, output_name, input_channels,
-            min_input_hw, max_input_hw,
+            name,
+            scale,
+            input_name,
+            output_name,
+            input_channels,
+            min_input_hw,
+            max_input_hw,
         })
     }
 
@@ -614,17 +640,21 @@ impl TensorRtBackend {
         // (Not a strict identity check since we now use ORT-managed intermediate buffers.)
         Self::verify_pointer_identity(ort_in_ptr, ort_out_ptr, input, output_ptr);
 
-        let mut binding = session.create_binding()
+        let mut binding = session
+            .create_binding()
             .map_err(|e| EngineError::ModelMetadata(format!("IO binding: {e}")))?;
-        binding.bind_input(&meta.input_name, &input_tensor)
+        binding
+            .bind_input(&meta.input_name, &input_tensor)
             .map_err(|e| EngineError::ModelMetadata(format!("bind_input: {e}")))?;
-        binding.bind_output(&meta.output_name, output_tensor)
+        binding
+            .bind_output(&meta.output_name, output_tensor)
             .map_err(|e| EngineError::ModelMetadata(format!("bind_output: {e}")))?;
 
         // run_binding is synchronous: ORT blocks until all GPU kernels
         // on its internal stream complete.  Output buffer is fully written
         // when this call returns.  No additional stream sync needed.
-        session.run_binding(&binding)
+        session
+            .run_binding(&binding)
             .map_err(|e| EngineError::ModelMetadata(format!("run_binding: {e}")))?;
 
         // D2D copy: ORT output tensor → our ring slot.
@@ -746,11 +776,19 @@ impl UpscaleBackend for TensorRtBackend {
                 ring.reallocate(&self.ctx, input.width, input.height, meta.scale)?;
             }
             None => {
-                debug!(w = input.width, h = input.height, slots = self.ring_size,
-                       "Lazily creating output ring");
+                debug!(
+                    w = input.width,
+                    h = input.height,
+                    slots = self.ring_size,
+                    "Lazily creating output ring"
+                );
                 state.ring = Some(OutputRing::new(
-                    &self.ctx, input.width, input.height, meta.scale,
-                    self.ring_size, self.min_ring_slots,
+                    &self.ctx,
+                    input.width,
+                    input.height,
+                    meta.scale,
+                    self.ring_size,
+                    self.min_ring_slots,
                 )?);
             }
             Some(_) => {}
@@ -774,7 +812,13 @@ impl UpscaleBackend for TensorRtBackend {
 
         let mem_info = self.mem_info()?;
         Self::run_io_bound(
-            &mut state.session, meta, &input, output_ptr, output_bytes, &self.ctx, mem_info,
+            &mut state.session,
+            meta,
+            &input,
+            output_ptr,
+            output_bytes,
+            &self.ctx,
+            mem_info,
         )?;
 
         let elapsed_us = t_start.elapsed().as_micros() as u64;
@@ -827,9 +871,11 @@ impl UpscaleBackend for TensorRtBackend {
 
             // Report VRAM.
             let (current, peak) = self.ctx.vram_usage();
-            info!(current_mb = current / (1024 * 1024),
-                  peak_mb = peak / (1024 * 1024),
-                  "Final VRAM usage");
+            info!(
+                current_mb = current / (1024 * 1024),
+                peak_mb = peak / (1024 * 1024),
+                "Final VRAM usage"
+            );
 
             drop(state.ring);
             drop(state.session);

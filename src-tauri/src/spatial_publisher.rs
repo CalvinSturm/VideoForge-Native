@@ -40,9 +40,7 @@ pub struct SpatialMapPublisher {
 impl SpatialMapPublisher {
     /// Create a publisher bound to [`SPATIAL_MAP_TOPIC`].
     pub async fn new(session: &zenoh::Session) -> Result<Self, zenoh::Error> {
-        let publisher = session
-            .declare_publisher(SPATIAL_MAP_TOPIC)
-            .await?;
+        let publisher = session.declare_publisher(SPATIAL_MAP_TOPIC).await?;
         Ok(Self {
             publisher,
             // Pre-allocate for 1080p — grows if needed, never shrinks

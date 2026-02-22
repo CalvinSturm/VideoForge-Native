@@ -1,0 +1,23 @@
+[package]
+name = "rave-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "RAVE core types, traits, context, and error hierarchy."
+readme = "README.md"
+
+[features]
+default = []
+debug-alloc = []
+audit-no-host-copies = []
+
+[dependencies]
+cudarc = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+half = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+ort = { workspace = true }

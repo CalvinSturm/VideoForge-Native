@@ -36,11 +36,11 @@ fn extract_scale(name: &str) -> u32 {
     // Check for explicit scale markers — order: most specific first
     for scale in [2u32, 3, 4, 8] {
         let patterns = [
-            format!("_x{}", scale),     // RCAN_x4, EDSR_x3
-            format!("x{}plus", scale),   // RealESRGAN_x4plus
-            format!("_{}x", scale),      // model_4x
-            format!("{}x_", scale),      // 4x_model
-            format!("{}x-", scale),      // 4x-SwinIR
+            format!("_x{}", scale),    // RCAN_x4, EDSR_x3
+            format!("x{}plus", scale), // RealESRGAN_x4plus
+            format!("_{}x", scale),    // model_4x
+            format!("{}x_", scale),    // 4x_model
+            format!("{}x-", scale),    // 4x-SwinIR
         ];
         for pattern in &patterns {
             if lower.contains(pattern) {
@@ -139,7 +139,9 @@ pub fn list_models() -> Vec<ModelInfo> {
                             let sub_path = sub_entry.path();
                             let sub_name = sub_entry.file_name().to_string_lossy().to_string();
                             if is_weight_file(&sub_name) {
-                                if let Some(model) = process_weight_file(&sub_path, &sub_name, &seen_ids) {
+                                if let Some(model) =
+                                    process_weight_file(&sub_path, &sub_name, &seen_ids)
+                                {
                                     seen_ids.insert(model.id.clone());
                                     models.push(model);
                                 }

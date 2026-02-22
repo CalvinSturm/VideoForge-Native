@@ -1,0 +1,35 @@
+Sat Feb 21 10:23:45 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 591.86                 Driver Version: 591.86         CUDA Version: 13.1     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                  Driver-Model | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3080 Ti   WDDM  |   00000000:08:00.0  On |                  N/A |
+| 39%   59C    P0             97W /  436W |    1575MiB /  12288MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A            5080    C+G   ...yb3d8bbwe\WindowsTerminal.exe      N/A      |
+|    0   N/A  N/A            6664    C+G   ...ntrolPanel\SystemSettings.exe      N/A      |
+|    0   N/A  N/A            7516    C+G   C:\Windows\explorer.exe               N/A      |
+|    0   N/A  N/A            7680    C+G   ..._cw5n1h2txyewy\SearchHost.exe      N/A      |
+|    0   N/A  N/A            8204    C+G   ...y\StartMenuExperienceHost.exe      N/A      |
+|    0   N/A  N/A           10960    C+G   ...em_tray\lghub_system_tray.exe      N/A      |
+|    0   N/A  N/A           13076    C+G   ...s\Mozilla Firefox\firefox.exe      N/A      |
+|    0   N/A  N/A           13904    C+G   ...5n1h2txyewy\TextInputHost.exe      N/A      |
+|    0   N/A  N/A           14844    C+G   C:\Program Files\Tetrd\Tetrd.exe      N/A      |
+|    0   N/A  N/A           15356    C+G   ...xyewy\ShellExperienceHost.exe      N/A      |
+|    0   N/A  N/A           17004    C+G   C:\Windows\explorer.exe               N/A      |
+|    0   N/A  N/A           27628    C+G   C:\Windows\explorer.exe               N/A      |
+|    0   N/A  N/A           38920    C+G   ...s\Antigravity\Antigravity.exe      N/A      |
+|    0   N/A  N/A           55048    C+G   ...s\Antigravity\Antigravity.exe      N/A      |
+|    0   N/A  N/A           69164    C+G   ...me SxS\Application\chrome.exe      N/A      |
+|    0   N/A  N/A           71168    C+G   ...s\Mozilla Firefox\firefox.exe      N/A      |
++-----------------------------------------------------------------------------------------+

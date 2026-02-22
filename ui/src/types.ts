@@ -1,6 +1,15 @@
 export type UpscaleMode = "image" | "batch" | "video";
 export type JobStatus = "queued" | "running" | "paused" | "done" | "cancelled" | "error";
 
+export interface RavePolicy {
+  profile?: string;
+  strict_invariants?: boolean;
+  strict_vram_limit?: boolean;
+  strict_no_host_copies?: boolean;
+  determinism_policy?: string;
+  ort_reexec_gate?: boolean;
+}
+
 export interface ColorSettings {
   brightness: number;  // -1.0 to 1.0 (0 = no change)
   contrast: number;    // -1.0 to 1.0 (0 = no change)
@@ -25,13 +34,18 @@ export interface Job {
   command: string;
   status: JobStatus;
   progress: number; // Percentage 0-100
-  framesProcessed?: number; // NEW
-  totalFrames?: number;     // NEW
+  framesProcessed?: number;
+  totalFrames?: number;
   statusMessage: string;
   paused: boolean;
   errorMessage?: string;
   outputPath?: string;
   eta?: number;
+  startedAt?: number;   // ms timestamp when job entered running state
+  completedAt?: number; // ms timestamp when job reached done/error/cancelled
+  policy?: RavePolicy;
+  hostCopyAuditEnabled?: boolean;
+  hostCopyAuditDisableReason?: string | null;
 }
 
 export interface Toast {

@@ -224,7 +224,7 @@ pub async fn run_upscale_job(
             return Err(format!(
                 "Invalid precision mode '{}'. Use fp32, fp16, or deterministic.",
                 config.precision
-            ))
+            ));
         }
     };
 

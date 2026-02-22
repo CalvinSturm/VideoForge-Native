@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Job } from "../types";
 
@@ -16,6 +16,26 @@ const formatEta = (seconds?: number) => {
   if (seconds < 60) return `${Math.round(seconds)}s`;
   const mins = Math.floor(seconds / 60);
   return `${mins}m ${Math.round(seconds % 60)}s`;
+};
+
+const formatElapsed = (ms: number) => {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+};
+
+const formatPolicySummary = (job: Job): string | null => {
+  if (!job.policy) return null;
+  const parts: string[] = [];
+  if (job.policy.profile) parts.push(`profile=${job.policy.profile}`);
+  if (typeof job.policy.strict_invariants === 'boolean') parts.push(`strict_invariants=${job.policy.strict_invariants}`);
+  if (typeof job.policy.strict_vram_limit === 'boolean') parts.push(`strict_vram_limit=${job.policy.strict_vram_limit}`);
+  if (typeof job.policy.strict_no_host_copies === 'boolean') parts.push(`strict_no_host_copies=${job.policy.strict_no_host_copies}`);
+  if (job.policy.determinism_policy) parts.push(`determinism=${job.policy.determinism_policy}`);
+  if (typeof job.policy.ort_reexec_gate === 'boolean') parts.push(`ort_reexec_gate=${job.policy.ort_reexec_gate}`);
+  return parts.length > 0 ? parts.join(" | ") : null;
 };
 
 // --- ICONS ---
@@ -87,7 +107,7 @@ const StatusBadge: React.FC<{ status: string }> = ({ status }) => {
     queued: { bg: 'rgba(59,130,246,0.1)', color: '#3b82f6', border: 'rgba(59,130,246,0.3)', label: 'QUEUED' }
   };
 
-  const config = configs[status] || configs.queued;
+  const config = configs[status] ?? configs.queued!;
 
   return (
     <span style={{
@@ -154,6 +174,15 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
 }) => {
   const isVideo = (path: string) => /\.(mp4|mkv|mov|avi|webm)$/i.test(path);
   const hasCompletedJobs = jobs.some(j => j.status === 'done' || j.status === 'error' || j.status === 'cancelled');
+
+  // Tick every second while any job is running so elapsed time stays live
+  const [, setTick] = useState(0);
+  const hasRunning = jobs.some(j => j.status === 'running');
+  useEffect(() => {
+    if (!hasRunning) return;
+    const id = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [hasRunning]);
 
   return (
     <div style={{
@@ -275,6 +304,12 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
             const isCancelled = job.status === "cancelled";
             const etaText = isRunning ? formatEta(job.eta) : null;
             const filename = job.command.replace(/^(Upscale|Transcode|Export Edited|PREVIEW SAMPLE):\s*/i, "");
+            const policySummary = formatPolicySummary(job);
+
+            const elapsedMs = job.startedAt
+              ? (job.completedAt ?? Date.now()) - job.startedAt
+              : null;
+            const elapsedText = elapsedMs !== null && elapsedMs >= 0 ? formatElapsed(elapsedMs) : null;
 
             // Determine accent color based on status
             const accentColor = isComplete ? '#10b981' : isError ? '#ef4444' : isCancelled ? '#eab308' : 'var(--brand-primary)';
@@ -371,7 +406,25 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
                             ETA: {etaText}
                           </span>
                         )}
+                        {elapsedText && (
+                          <span style={{
+                            fontSize: '9px',
+                            color: 'var(--text-muted)',
+                            fontFamily: 'var(--font-mono)'
+                          }}>
+                            {elapsedText}
+                          </span>
+                        )}
                       </>
+                    )}
+                    {(isComplete || isError || isCancelled) && elapsedText && (
+                      <span style={{
+                        fontSize: '9px',
+                        color: 'var(--text-muted)',
+                        fontFamily: 'var(--font-mono)'
+                      }}>
+                        {elapsedText}
+                      </span>
                     )}
                   </div>
 
@@ -411,6 +464,28 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
                     )}
                   </div>
                 </div>
+
+                {/* Error message */}
+                {isComplete && (job.policy || typeof job.hostCopyAuditEnabled === 'boolean') && (
+                  <div style={{
+                    fontSize: '9px',
+                    color: 'var(--text-muted)',
+                    fontFamily: 'var(--font-mono)',
+                    padding: '6px 8px',
+                    background: 'rgba(255,255,255,0.03)',
+                    borderRadius: '4px',
+                    wordBreak: 'break-word',
+                    lineHeight: 1.45
+                  }}>
+                    {policySummary && <div>{policySummary}</div>}
+                    {typeof job.hostCopyAuditEnabled === 'boolean' && (
+                      <div>
+                        host_copy_audit={String(job.hostCopyAuditEnabled)}
+                        {job.hostCopyAuditDisableReason ? ` (${job.hostCopyAuditDisableReason})` : ""}
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {/* Error message */}
                 {job.errorMessage && (

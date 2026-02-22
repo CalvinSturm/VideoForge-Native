@@ -896,6 +896,7 @@ interface InputOutputPanelProps {
   model: string; setModel: (model: string) => void;
   availableModels: string[]; loadingModel: boolean; loadModel: (model: string) => void;
   startUpscale: () => void; isValidPaths: boolean;
+  onRunValidate: () => void;
   videoState: VideoState; editState: EditState; setEditState: (state: EditState) => void;
   onExportEdited: () => void; showTech: boolean;
   showResearchParams?: boolean;
@@ -905,7 +906,7 @@ interface InputOutputPanelProps {
 export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
   mode, setMode, pickInput, inputPath, pickOutput, outputPath,
   model, setModel, loadModel, availableModels, loadingModel,
-  startUpscale, isValidPaths, videoState, editState, setEditState, onExportEdited,
+  startUpscale, isValidPaths, onRunValidate, videoState, editState, setEditState, onExportEdited,
   showTech, showResearchParams = true,
 }) => {
 
@@ -1042,6 +1043,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
   const buttonStyle = isHighIntensity
     ? { height: '44px', fontSize: '12px' }
     : { height: '44px', fontSize: '12px', background: '#ededed', color: '#000', border: 'none', boxShadow: '0 0 10px rgba(255,255,255,0.2)' };
+  const canRunValidate = mode === "video" && isAIActive;
 
   // Model display name for SignalSummary
   const modelDisplayLabel = isAIActive ? `${modelFamily} ${activeScale}×` : undefined;
@@ -2402,6 +2404,21 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             >
               <IconPlay />
               PREVIEW 2s
+            </button>
+            <button
+              className="action-secondary"
+              onClick={onRunValidate}
+              disabled={!isValidPaths || !canRunValidate}
+              title={canRunValidate ? "Run strict policy validation in mock mode" : "Enable AI Upscale on video input to validate"}
+              style={{
+                borderColor: "rgba(59,130,246,0.4)", color: "#bfdbfe",
+                background: "rgba(59,130,246,0.08)", fontWeight: 700,
+                display: 'flex', gap: '8px', alignItems: 'center', justifyContent: 'center',
+                boxShadow: "0 2px 4px rgba(0,0,0,0.2)"
+              }}
+            >
+              <IconShield />
+              VALIDATE STRICT (MOCK)
             </button>
           </div>
         )}

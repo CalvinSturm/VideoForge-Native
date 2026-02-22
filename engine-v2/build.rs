@@ -46,7 +46,10 @@ fn main() {
     if cfg!(target_os = "windows") {
         let nvcuvid_lib = lib_dir.join("nvcuvid.lib");
         if !nvcuvid_lib.exists() {
-            panic!("MISSING SDK: nvcuvid.lib not found in {}. Did you copy it from the Video Codec SDK?", lib_dir.display());
+            panic!(
+                "MISSING SDK: nvcuvid.lib not found in {}. Did you copy it from the Video Codec SDK?",
+                lib_dir.display()
+            );
         }
     }
     println!("cargo:rustc-link-lib=dylib=nvcuvid");
@@ -55,7 +58,10 @@ fn main() {
     if cfg!(target_os = "windows") {
         let nvenc_lib = lib_dir.join("nvencodeapi.lib");
         if !nvenc_lib.exists() {
-            panic!("MISSING SDK: nvencodeapi.lib not found in {}. Did you copy it from the Video Codec SDK?", lib_dir.display());
+            panic!(
+                "MISSING SDK: nvencodeapi.lib not found in {}. Did you copy it from the Video Codec SDK?",
+                lib_dir.display()
+            );
         }
         println!("cargo:rustc-link-lib=dylib=nvencodeapi");
     } else {

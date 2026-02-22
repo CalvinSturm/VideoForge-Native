@@ -42,3 +42,68 @@ jobs:
         run: cargo test
         env:
           RUST_LOG: "error"
+
+      - name: RAVE strict mock validate contract
+        working-directory: .
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\artifacts" | Out-Null
+          $env:RAVE_MOCK_RUN = "1"
+          cargo run --manifest-path third_party/rave/Cargo.toml -p rave-cli --features audit-no-host-copies --bin rave -- validate --profile production_strict --json --best-effort 1> "$env:GITHUB_WORKSPACE\artifacts\rave_validate_mock.stdout.json" 2> "$env:GITHUB_WORKSPACE\artifacts\rave_validate_mock.stderr.log"
+        env:
+          RAVE_MOCK_RUN: "1"
+
+      - name: Upload RAVE mock artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rave-mock-artifacts
+          path: artifacts
+          if-no-files-found: warn
+
+  gpu-rave:
+    name: GPU RAVE checks
+    if: ${{ vars.ENABLE_GPU_CI == '1' }}
+    runs-on: [self-hosted, windows, gpu]
+    defaults:
+      run:
+        working-directory: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify GPU fixture configuration
+        shell: pwsh
+        run: |
+          if (-not $env:RAVE_GPU_INPUT) { throw "Missing RAVE_GPU_INPUT (absolute video path on GPU runner)." }
+          if (-not $env:RAVE_GPU_MODEL) { throw "Missing RAVE_GPU_MODEL (absolute ONNX model path on GPU runner)." }
+          if (-not (Test-Path $env:RAVE_GPU_INPUT)) { throw "RAVE_GPU_INPUT does not exist: $env:RAVE_GPU_INPUT" }
+          if (-not (Test-Path $env:RAVE_GPU_MODEL)) { throw "RAVE_GPU_MODEL does not exist: $env:RAVE_GPU_MODEL" }
+
+      - name: Run GPU validate
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\artifacts" | Out-Null
+          cargo run --manifest-path third_party/rave/Cargo.toml -p rave-cli --features audit-no-host-copies --bin rave -- validate --json --profile production_strict --best-effort 1> "$env:GITHUB_WORKSPACE\artifacts\rave_validate_gpu.stdout.json" 2> "$env:GITHUB_WORKSPACE\artifacts\rave_validate_gpu.stderr.log"
+
+      - name: Run GPU benchmark
+        shell: pwsh
+        run: |
+          cargo run --manifest-path third_party/rave/Cargo.toml -p rave-cli --bin rave -- benchmark --json -i "$env:RAVE_GPU_INPUT" -m "$env:RAVE_GPU_MODEL" --profile production_strict 1> "$env:GITHUB_WORKSPACE\artifacts\rave_benchmark_gpu.stdout.json" 2> "$env:GITHUB_WORKSPACE\artifacts\rave_benchmark_gpu.stderr.log"
+
+      - name: Run GPU upscale
+        shell: pwsh
+        run: |
+          $out = Join-Path "$env:GITHUB_WORKSPACE\artifacts" "rave_gpu_upscaled.mp4"
+          cargo run --manifest-path third_party/rave/Cargo.toml -p rave-cli --bin rave -- upscale --json -i "$env:RAVE_GPU_INPUT" -m "$env:RAVE_GPU_MODEL" -o "$out" --profile production_strict 1> "$env:GITHUB_WORKSPACE\artifacts\rave_upscale_gpu.stdout.json" 2> "$env:GITHUB_WORKSPACE\artifacts\rave_upscale_gpu.stderr.log"
+
+      - name: Upload GPU RAVE artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rave-gpu-artifacts
+          path: artifacts
+          if-no-files-found: warn
