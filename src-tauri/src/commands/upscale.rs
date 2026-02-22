@@ -15,10 +15,14 @@ use crate::control::ResearchConfig;
 use crate::edit_config::{build_ffmpeg_filters, calculate_output_dimensions, EditConfig};
 use crate::ipc::{self, protocol::RequestEnvelope};
 use crate::python_env::{
-    get_free_port, resolve_python_environment, ProcessGuard, PYTHON_PIDS,
+    build_worker_argv, get_free_port, resolve_python_environment, BaseWorkerArgs, ProcessGuard,
+    WorkerCaps, PYTHON_PIDS,
 };
 use crate::video_pipeline;
-use crate::{shm, commands::export::{get_smart_output_path, is_image_file}};
+use crate::{
+    commands::export::{get_smart_output_path, is_image_file},
+    shm,
+};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -122,10 +126,16 @@ pub async fn run_upscale_job(
     );
 
     let mut cmd = tokio::process::Command::new(&config.python_bin);
-    cmd.arg(&config.script_path);
-    cmd.arg("--port").arg(port.to_string());
-    cmd.arg("--parent-pid").arg(std::process::id().to_string());
-    cmd.arg("--precision").arg(&precision);
+    let worker_argv = build_worker_argv(
+        &BaseWorkerArgs {
+            script_path: &config.script_path,
+            port,
+            parent_pid: std::process::id(),
+            precision: &precision,
+        },
+        &WorkerCaps::default(),
+    );
+    cmd.args(&worker_argv);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
     #[cfg(target_os = "windows")]

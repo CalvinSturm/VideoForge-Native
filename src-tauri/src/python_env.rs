@@ -19,6 +19,59 @@ lazy_static::lazy_static! {
         Arc::new(std::sync::Mutex::new(HashSet::new()));
 }
 
+/// Canonical base arguments for spawning `python/shm_worker.py`.
+pub struct BaseWorkerArgs<'a> {
+    pub script_path: &'a str,
+    pub port: u16,
+    pub parent_pid: u32,
+    pub precision: &'a str,
+}
+
+/// Optional worker capability flags.
+///
+/// Parsed/plumbed only; not active yet.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerCaps {
+    pub log_level: Option<String>,
+    pub use_typed_ipc: bool,
+    pub use_events: bool,
+    pub prealloc_tensors: bool,
+    pub deterministic: bool,
+}
+
+/// Build the canonical argv passed to the Python SHM worker.
+pub fn build_worker_argv(base: &BaseWorkerArgs<'_>, caps: &WorkerCaps) -> Vec<String> {
+    let mut argv = vec![
+        base.script_path.to_string(),
+        "--port".to_string(),
+        base.port.to_string(),
+        "--parent-pid".to_string(),
+        base.parent_pid.to_string(),
+        "--precision".to_string(),
+        base.precision.to_string(),
+    ];
+
+    // Parsed/plumbed only; not active yet.
+    if let Some(level) = &caps.log_level {
+        argv.push("--log-level".to_string());
+        argv.push(level.clone());
+    }
+    if caps.use_typed_ipc {
+        argv.push("--use-typed-ipc".to_string());
+    }
+    if caps.use_events {
+        argv.push("--use-events".to_string());
+    }
+    if caps.prealloc_tensors {
+        argv.push("--prealloc-tensors".to_string());
+    }
+    if caps.deterministic {
+        argv.push("--deterministic".to_string());
+    }
+
+    argv
+}
+
 // ─── Path resolution ──────────────────────────────────────────────────────────
 
 pub fn get_python_install_dir() -> PathBuf {
@@ -138,5 +191,34 @@ impl Drop for ProcessGuard {
             tracing::warn!("ProcessGuard: killing Python process on drop (cleanup path)");
             let _ = child.start_kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_worker_argv, BaseWorkerArgs, WorkerCaps};
+
+    #[test]
+    fn default_worker_argv_matches_previous_spawn_order() {
+        let base = BaseWorkerArgs {
+            script_path: "python/shm_worker.py",
+            port: 7447,
+            parent_pid: 12345,
+            precision: "fp16",
+        };
+
+        let argv = build_worker_argv(&base, &WorkerCaps::default());
+
+        let expected = vec![
+            "python/shm_worker.py".to_string(),
+            "--port".to_string(),
+            "7447".to_string(),
+            "--parent-pid".to_string(),
+            "12345".to_string(),
+            "--precision".to_string(),
+            "fp16".to_string(),
+        ];
+
+        assert_eq!(argv, expected);
     }
 }

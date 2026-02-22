@@ -437,7 +437,16 @@ def inference_batch(
 # =============================================================================
 
 class AIWorker:
-    def __init__(self, port: str, precision: str = "fp32"):
+    def __init__(
+        self,
+        port: str,
+        precision: str = "fp32",
+        log_level: Optional[str] = None,
+        use_typed_ipc: bool = False,
+        use_events: bool = False,
+        prealloc_tensors: bool = False,
+        deterministic: bool = False,
+    ):
         # Deterministic mode forces batch_size=1 for bit-exact output
         if precision == "deterministic":
             Config.MAX_BATCH_SIZE = 1
@@ -487,6 +496,12 @@ class AIWorker:
 
         # Model state
         self.precision = precision
+        # Parsed/plumbed only; not active yet.
+        self.log_level = log_level
+        self.use_typed_ipc = use_typed_ipc
+        self.use_events = use_events
+        self.prealloc_tensors = prealloc_tensors
+        self.deterministic_flag = deterministic
         self.model_loader = ModelLoader(precision=precision)
         self.model: Optional[torch.nn.Module] = None
         self.model_scale: int = 4
@@ -1614,6 +1629,16 @@ if __name__ == "__main__":
         choices=["fp32", "fp16", "deterministic"],
         help="Inference precision: fp32 (TF32 on), fp16 (autocast), deterministic (strict)"
     )
+    parser.add_argument(
+        "--log-level",
+        choices=["debug", "info", "warning", "error", "critical"],
+        default=None,
+        help="Parsed only (plumbing); runtime behavior unchanged"
+    )
+    parser.add_argument("--use-typed-ipc", action="store_true", help="Parsed only (plumbing)")
+    parser.add_argument("--use-events", action="store_true", help="Parsed only (plumbing)")
+    parser.add_argument("--prealloc-tensors", action="store_true", help="Parsed only (plumbing)")
+    parser.add_argument("--deterministic", action="store_true", help="Parsed only (plumbing)")
     args = parser.parse_args()
 
     # Configure precision BEFORE any model loading or CUDA ops
@@ -1622,5 +1647,13 @@ if __name__ == "__main__":
     if args.parent_pid > 0:
         start_watchdog(args.parent_pid)
 
-    AIWorker(args.port, precision=args.precision)
+    AIWorker(
+        args.port,
+        precision=args.precision,
+        log_level=args.log_level,
+        use_typed_ipc=args.use_typed_ipc,
+        use_events=args.use_events,
+        prealloc_tensors=args.prealloc_tensors,
+        deterministic=args.deterministic,
+    )
     sys.exit(0)
