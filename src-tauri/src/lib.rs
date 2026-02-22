@@ -26,9 +26,6 @@ pub mod spatial_publisher;
 mod utils;
 mod video_pipeline;
 
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
-
 // --- SYSTEM MONITOR (background thread) ---
 
 fn spawn_system_monitor(app: AppHandle) {

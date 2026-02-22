@@ -183,7 +183,7 @@ impl ControlChannel {
     pub async fn start(
         &self,
         session: &zenoh::Session,
-        python_publisher: &zenoh::pubsub::Publisher<'_>,
+        _python_publisher: &zenoh::pubsub::Publisher<'_>,
         app: Option<AppHandle>,
     ) -> anyhow::Result<()> {
         let sub_key = format!("{}/**", self.zenoh_prefix);
@@ -210,11 +210,10 @@ impl ControlChannel {
                 match subscriber.recv_async().await {
                     Ok(sample) => {
                         let topic = sample.key_expr().as_str().to_string();
-                        let payload = match sample.payload().to_bytes().to_vec().as_slice() {
-                            bytes => match String::from_utf8(bytes.to_vec()) {
-                                Ok(s) => s,
-                                Err(_) => continue,
-                            },
+                        let bytes = sample.payload().to_bytes().to_vec();
+                        let payload = match String::from_utf8(bytes) {
+                            Ok(s) => s,
+                            Err(_) => continue,
                         };
 
                         // Route by topic suffix
@@ -223,8 +222,10 @@ impl ControlChannel {
                             // Emit to UI for reactivity
                             if let Some(ref app) = app {
                                 let guard = config.lock().await;
-                                let _ = app.emit("research-config-updated",
-                                    serde_json::to_value(&*guard).unwrap_or_default());
+                                let _ = app.emit(
+                                    "research-config-updated",
+                                    serde_json::to_value(&*guard).unwrap_or_default(),
+                                );
                             }
                         } else if topic.ends_with("/blend_control") {
                             Self::handle_blend_control(&config, &payload, &status_pub).await;
@@ -288,7 +289,10 @@ impl ControlChannel {
                 if let Some(v) = updates.get("texture_model_bias").and_then(|v| v.as_f64()) {
                     guard.texture_model_bias = v;
                 }
-                if let Some(v) = updates.get("flat_region_suppression").and_then(|v| v.as_f64()) {
+                if let Some(v) = updates
+                    .get("flat_region_suppression")
+                    .and_then(|v| v.as_f64())
+                {
                     guard.flat_region_suppression = v;
                 }
                 if let Some(v) = updates.get("hf_method").and_then(|v| v.as_str()) {
@@ -411,10 +415,7 @@ impl ControlChannel {
         }
     }
 
-    async fn handle_model_toggle(
-        payload: &str,
-        status_pub: &zenoh::pubsub::Publisher<'_>,
-    ) {
+    async fn handle_model_toggle(payload: &str, status_pub: &zenoh::pubsub::Publisher<'_>) {
         match serde_json::from_str::<ModelToggleMessage>(payload) {
             Ok(msg) => {
                 let valid_roles = ["structure", "texture", "perceptual", "diffusion"];
@@ -507,7 +508,9 @@ pub async fn update_research_param(
         "h_blend_reduction" => guard.h_blend_reduction = value.as_f64().ok_or("Invalid f64")?,
         "edge_model_bias" => guard.edge_model_bias = value.as_f64().ok_or("Invalid f64")?,
         "texture_model_bias" => guard.texture_model_bias = value.as_f64().ok_or("Invalid f64")?,
-        "flat_region_suppression" => guard.flat_region_suppression = value.as_f64().ok_or("Invalid f64")?,
+        "flat_region_suppression" => {
+            guard.flat_region_suppression = value.as_f64().ok_or("Invalid f64")?
+        }
         "hf_method" => guard.hf_method = value.as_str().ok_or("Invalid string")?.to_string(),
         "preset" => guard.preset = value.as_str().ok_or("Invalid string")?.to_string(),
         "freq_low_sigma" => guard.freq_low_sigma = value.as_f64().ok_or("Invalid f64")?,
@@ -523,7 +526,9 @@ pub async fn update_research_param(
         "sharpen_strength" => guard.sharpen_strength = value.as_f64().ok_or("Invalid f64")?,
         "temporal_enabled" => guard.temporal_enabled = value.as_bool().ok_or("Invalid bool")?,
         "temporal_alpha" => guard.temporal_alpha = value.as_f64().ok_or("Invalid f64")?,
-        "secondary_model" => guard.secondary_model = value.as_str().ok_or("Invalid string")?.to_string(),
+        "secondary_model" => {
+            guard.secondary_model = value.as_str().ok_or("Invalid string")?.to_string()
+        }
         "return_gpu_tensor" => guard.return_gpu_tensor = value.as_bool().ok_or("Invalid bool")?,
         _ => return Err(format!("Unknown parameter: {}", key)),
     }

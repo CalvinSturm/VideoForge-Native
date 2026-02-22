@@ -135,7 +135,7 @@ impl FilterChainBuilder {
     }
 
     /// Add trim filter (always first if present)
-    pub fn add_trim(&mut self, start: f64, end: f64) -> &mut Self {
+    pub fn add_trim(&mut self, _start: f64, _end: f64) -> &mut Self {
         // Trim is currently handled via -ss/-t input args in the pipeline for efficiency,
         // but we keep this stub if we need complex filter-based trimming later.
         self
@@ -201,8 +201,8 @@ impl FilterChainBuilder {
         // saturation: eq expects 0.0-3.0 range, so we map -1.0,1.0 -> 0.0,2.0
         // gamma: 0.1 to 10.0 (maps directly)
         let eq_brightness = color.brightness;
-        let eq_contrast = 1.0 + color.contrast;  // -1 to 1 becomes 0 to 2
-        let eq_saturation = 1.0 + color.saturation;  // -1 to 1 becomes 0 to 2
+        let eq_contrast = 1.0 + color.contrast; // -1 to 1 becomes 0 to 2
+        let eq_saturation = 1.0 + color.saturation; // -1 to 1 becomes 0 to 2
         let eq_gamma = color.gamma.clamp(0.1, 10.0);
 
         let filter = format!(
@@ -219,6 +219,12 @@ impl FilterChainBuilder {
             return String::new();
         }
         self.filters.join(",")
+    }
+}
+
+impl Default for FilterChainBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

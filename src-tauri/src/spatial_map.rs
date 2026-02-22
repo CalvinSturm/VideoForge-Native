@@ -42,6 +42,12 @@ impl SpatialMapState {
     }
 }
 
+impl Default for SpatialMapState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ===========================================================================
 // ZENOH SUBSCRIBER
 // ===========================================================================
@@ -91,7 +97,10 @@ pub async fn init_spatial_subscriber(
                     if raw.len() != expected_len {
                         eprintln!(
                             "[SpatialMap] Bad payload: expected {} bytes for {}×{}, got {}",
-                            expected_len, width, height, raw.len()
+                            expected_len,
+                            width,
+                            height,
+                            raw.len()
                         );
                         continue;
                     }
@@ -139,9 +148,7 @@ pub async fn init_spatial_subscriber(
 /// [8..)   u8[] mask    (width × height)
 /// ```
 #[tauri::command]
-pub fn fetch_spatial_frame(
-    state: tauri::State<'_, Arc<SpatialMapState>>,
-) -> tauri::ipc::Response {
+pub fn fetch_spatial_frame(state: tauri::State<'_, Arc<SpatialMapState>>) -> tauri::ipc::Response {
     let frame = state.pending_frame.lock().unwrap().take();
     match frame {
         Some(data) => tauri::ipc::Response::new(data),

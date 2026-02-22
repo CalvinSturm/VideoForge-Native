@@ -2,7 +2,7 @@
 //! and OS-level file/folder helpers.
 
 use std::fs::{self, File};
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::path::Path;
 
 use futures_util::StreamExt;
@@ -11,8 +11,7 @@ use tauri::{AppHandle, Emitter};
 use crate::models::ModelInfo;
 use crate::python_env::{get_python_install_dir, resolve_python_environment, PYTHON_PIDS};
 
-const ENGINE_URL: &str =
-    "https://github.com/YourRepo/releases/download/v1.0/engine.zip";
+const ENGINE_URL: &str = "https://github.com/YourRepo/releases/download/v1.0/engine.zip";
 
 // ─── check_engine_status ─────────────────────────────────────────────────────
 

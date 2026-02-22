@@ -163,7 +163,6 @@ pub async fn run_upscale_job(
     cmd.stderr(Stdio::null());
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000);
     }
 
@@ -703,6 +702,7 @@ pub async fn run_upscale_job(
 // ─── upscale_request (thin Tauri wrapper) ────────────────────────────────────
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // TODO(clippy): Tauri IPC command signature is intentionally flat.
 pub async fn upscale_request(
     app: AppHandle,
     research_state: tauri::State<'_, Arc<Mutex<ResearchConfig>>>,

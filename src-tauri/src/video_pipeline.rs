@@ -53,6 +53,7 @@ pub fn probe_nvdec() -> bool {
 // Video Decoder (FFmpeg -> Raw RGB24 Frames)
 // -----------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub struct VideoDecoder {
     child: Child,
     stdout: BufReader<tokio::process::ChildStdout>,
@@ -191,7 +192,7 @@ impl VideoDecoder {
 /// Uses a single ffprobe call with JSON output for efficiency.
 pub fn probe_video(path: &str) -> Result<(usize, usize, f64, f64, u64)> {
     let output = std::process::Command::new("ffprobe")
-        .args(&[
+        .args([
             "-v",
             "error",
             "-select_streams",
@@ -300,6 +301,7 @@ pub fn probe_nvenc() -> bool {
 // Video Encoder (Raw RGB24 Frames -> High Quality MP4 with Interpolation)
 // -----------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub struct VideoEncoder {
     child: Child,
     stdin: Option<tokio::process::ChildStdin>,
@@ -307,6 +309,7 @@ pub struct VideoEncoder {
 }
 
 impl VideoEncoder {
+    #[allow(dead_code)]
     pub async fn new(
         output: &str,
         source_fps: u32,
@@ -334,6 +337,7 @@ impl VideoEncoder {
     /// `use_nvenc`: when true, uses h264_nvenc/hevc_nvenc with NVENC-specific
     /// preset/tune flags. When false, uses libx264/libx265 software encoding
     /// with equivalent quality settings.
+    #[allow(clippy::too_many_arguments)] // TODO(clippy): keep flat args to avoid broad pipeline refactor in hygiene pass.
     fn build_encoder_args(
         output: &str,
         source_fps: u32,
@@ -502,6 +506,7 @@ impl VideoEncoder {
 
     /// Create encoder with optional audio source from the original input file.
     /// Tries NVENC first (if available), falls back to libx264/libx265 software.
+    #[allow(clippy::too_many_arguments)] // TODO(clippy): constructor mirrors encode pipeline inputs; refactor can be done separately.
     pub async fn new_with_audio(
         output: &str,
         source_fps: u32,
@@ -597,7 +602,6 @@ impl VideoEncoder {
     pub async fn finish(&mut self) -> Result<()> {
         eprintln!("Encoder: Closing Stdin to signal EOF...");
         if let Some(mut stdin) = self.stdin.take() {
-            use tokio::io::AsyncWriteExt;
             tokio::io::AsyncWriteExt::shutdown(&mut stdin)
                 .await
                 .context("Failed to close encoder stdin")?;

@@ -87,7 +87,7 @@ impl NativeUpscaleError {
 #[tauri::command]
 pub async fn upscale_request_native(
     input_path: String,
-    mut output_path: String,
+    output_path: String,
     model_path: String,
     scale: u32,
     precision: Option<String>,
@@ -242,7 +242,7 @@ async fn run_native_pipeline(
             .await
             .ok();
 
-        if hevc_status.map_or(false, |s| s.success()) {
+        if hevc_status.is_some_and(|s| s.success()) {
             tracing::info!("Falling back to HEVC elementary stream");
             return run_engine_pipeline(
                 hevc_path,
@@ -280,6 +280,7 @@ async fn run_native_pipeline(
 }
 
 #[cfg(feature = "native_engine")]
+#[allow(clippy::too_many_arguments)] // TODO(clippy): this pipeline entry mirrors explicit stage inputs; keep stable for now.
 async fn run_engine_pipeline(
     input_stream: PathBuf,
     engine_output: PathBuf,
@@ -314,7 +315,7 @@ async fn run_engine_pipeline(
     let output_w = input_w.saturating_mul(scale as usize);
     let output_h = input_h.saturating_mul(scale as usize);
     // NV12 row stride must be 256-byte aligned (NVENC hardware requirement).
-    let encoder_nv12_pitch = (output_w + 255) / 256 * 256;
+    let encoder_nv12_pitch = output_w.div_ceil(256) * 256;
     // Express fps as a rational with 1000 as denominator — handles 23.976, 29.97, etc.
     let fps_num = (fps * 1000.0).round() as u32;
     let fps_den = 1000u32;
@@ -394,9 +395,12 @@ async fn run_engine_pipeline(
     // Bind the primary context to this thread, then retrieve whatever is
     // current via cuCtxGetCurrent — the NVENC-canonical approach (matches
     // NVIDIA SDK samples).
-    ctx.device()
-        .bind_to_thread()
-        .map_err(|e| make_err("ENCODER_INIT", &format!("Failed to bind CUDA context: {:?}", e)))?;
+    ctx.device().bind_to_thread().map_err(|e| {
+        make_err(
+            "ENCODER_INIT",
+            &format!("Failed to bind CUDA context: {:?}", e),
+        )
+    })?;
     let cuda_ctx = ctx
         .current_context_ptr()
         .map_err(|e| make_err("ENCODER_INIT", &format!("cuCtxGetCurrent failed: {}", e)))?;

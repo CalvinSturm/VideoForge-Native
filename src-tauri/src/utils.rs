@@ -2,14 +2,13 @@ use anyhow::{Context, Result};
 use base64::engine::general_purpose;
 use base64::Engine;
 use serde_json::Value;
+use std::path::Path;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::ChildStdout;
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
-use std::path::{Path, PathBuf};
 
 /// Reads a full PNG image from the given async buffered reader.
 /// Returns None if EOF is reached.
+#[allow(dead_code)]
 pub async fn read_png_frame(reader: &mut BufReader<ChildStdout>) -> Result<Option<Vec<u8>>> {
     let mut png = Vec::new();
 
@@ -35,17 +34,26 @@ pub async fn read_png_frame(reader: &mut BufReader<ChildStdout>) -> Result<Optio
 
         // Read chunk type (4 bytes)
         let mut chunk_type = [0u8; 4];
-        reader.read_exact(&mut chunk_type).await.context("Failed to read PNG chunk type")?;
+        reader
+            .read_exact(&mut chunk_type)
+            .await
+            .context("Failed to read PNG chunk type")?;
         png.extend_from_slice(&chunk_type);
 
         // Read chunk data
         let mut chunk_data = vec![0u8; length];
-        reader.read_exact(&mut chunk_data).await.context("Failed to read PNG chunk data")?;
+        reader
+            .read_exact(&mut chunk_data)
+            .await
+            .context("Failed to read PNG chunk data")?;
         png.extend_from_slice(&chunk_data);
 
         // Read chunk CRC (4 bytes)
         let mut crc = [0u8; 4];
-        reader.read_exact(&mut crc).await.context("Failed to read PNG chunk CRC")?;
+        reader
+            .read_exact(&mut crc)
+            .await
+            .context("Failed to read PNG chunk CRC")?;
         png.extend_from_slice(&crc);
 
         if &chunk_type == b"IEND" {
@@ -58,11 +66,11 @@ pub async fn read_png_frame(reader: &mut BufReader<ChildStdout>) -> Result<Optio
 /// NOTE:
 /// This is used only for image/batch IPC.
 /// Video paths must NEVER use base64 due to overhead.
-
 /// Decodes a base64 string array from a JSON value by key,
 /// returning a vector of decoded byte buffers (`Vec<u8>`).
 ///
 /// This is the sequential version.
+#[allow(dead_code)]
 pub fn decode_base64_list(value: &Value, key: &str) -> Result<Vec<Vec<u8>>> {
     let arr = value
         .get(key)
@@ -79,28 +87,7 @@ pub fn decode_base64_list(value: &Value, key: &str) -> Result<Vec<Vec<u8>>> {
         .collect()
 }
 
-/// Decodes a base64 string array from a JSON value by key,
-/// returning a vector of decoded byte buffers (`Vec<u8>`).
-///
-/// This is the parallel version using Rayon.
-/// Enabled only when `parallel` feature is enabled.
-#[cfg(feature = "parallel")]
-pub fn decode_base64_list_parallel(value: &Value, key: &str) -> Result<Vec<Vec<u8>>> {
-    let arr = value
-        .get(key)
-        .and_then(|v| v.as_array())
-        .context(format!("Missing or invalid '{}' array", key))?;
-
-    arr.par_iter()
-        .map(|v| {
-            let s = v.as_str().context("Invalid base64 string in array")?;
-            general_purpose::STANDARD
-                .decode(s)
-                .context("Failed to decode base64 string")
-        })
-        .collect()
-}
-
+#[allow(dead_code)]
 pub fn generate_unique_path(input: &str) -> String {
     let input_path = Path::new(input);
     let parent = input_path.parent().unwrap_or_else(|| Path::new(""));
@@ -161,18 +148,5 @@ mod tests {
 
         let result = decode_base64_list(&value, "data");
         assert!(result.is_err());
-    }
-
-    #[cfg(feature = "parallel")]
-    #[test]
-    fn test_decode_base64_list_parallel_success() {
-        let value = json!({
-            "data": [EXAMPLE_BASE64_1, EXAMPLE_BASE64_2]
-        });
-
-        let decoded = decode_base64_list_parallel(&value, "data").expect("Parallel decoding failed");
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0], b"hello");
-        assert_eq!(decoded[1], b"world");
     }
 }

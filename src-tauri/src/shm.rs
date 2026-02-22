@@ -114,11 +114,7 @@ impl VideoShm {
             ));
         }
 
-        tracing::info!(
-            shm_version = version,
-            header_size,
-            "SHM header validated"
-        );
+        tracing::info!(shm_version = version, header_size, "SHM header validated");
 
         Ok(Self {
             mmap,
@@ -238,6 +234,7 @@ mod tests {
     use std::io::Write;
 
     /// Build a minimal valid SHM file in `data` with the given parameters.
+    #[allow(clippy::too_many_arguments)] // TODO(clippy): test helper keeps explicit header fields for readability.
     fn make_shm_bytes(
         magic: &[u8; 8],
         version: u32,
@@ -277,8 +274,14 @@ mod tests {
     #[test]
     fn open_valid_header_succeeds() {
         let data = make_shm_bytes(
-            b"VFSHM001", SHM_VERSION, HEADER_REGION_SIZE as u32,
-            RING_SIZE as u32, 64, 64, 2, PIXEL_FORMAT_RGB24,
+            b"VFSHM001",
+            SHM_VERSION,
+            HEADER_REGION_SIZE as u32,
+            RING_SIZE as u32,
+            64,
+            64,
+            2,
+            PIXEL_FORMAT_RGB24,
         );
         let path = write_temp_shm("vf_test_valid.bin", &data);
         let result = VideoShm::open(&path, 64, 64, 2);
@@ -289,25 +292,34 @@ mod tests {
     #[test]
     fn open_bad_magic_is_rejected() {
         let data = make_shm_bytes(
-            b"INVALID!", SHM_VERSION, HEADER_REGION_SIZE as u32,
-            RING_SIZE as u32, 64, 64, 2, PIXEL_FORMAT_RGB24,
+            b"INVALID!",
+            SHM_VERSION,
+            HEADER_REGION_SIZE as u32,
+            RING_SIZE as u32,
+            64,
+            64,
+            2,
+            PIXEL_FORMAT_RGB24,
         );
         let path = write_temp_shm("vf_test_magic.bin", &data);
         let result = VideoShm::open(&path, 64, 64, 2);
         let _ = std::fs::remove_file(&path);
         assert!(result.is_err(), "Bad magic must be rejected");
         let msg = result.err().unwrap().to_string();
-        assert!(
-            msg.contains("magic"),
-            "Error must mention 'magic': {}", msg
-        );
+        assert!(msg.contains("magic"), "Error must mention 'magic': {}", msg);
     }
 
     #[test]
     fn open_wrong_version_is_rejected() {
         let data = make_shm_bytes(
-            b"VFSHM001", 99, HEADER_REGION_SIZE as u32,
-            RING_SIZE as u32, 64, 64, 2, PIXEL_FORMAT_RGB24,
+            b"VFSHM001",
+            99,
+            HEADER_REGION_SIZE as u32,
+            RING_SIZE as u32,
+            64,
+            64,
+            2,
+            PIXEL_FORMAT_RGB24,
         );
         let path = write_temp_shm("vf_test_ver.bin", &data);
         let result = VideoShm::open(&path, 64, 64, 2);
@@ -316,15 +328,22 @@ mod tests {
         let msg = result.err().unwrap().to_string();
         assert!(
             msg.contains("version"),
-            "Error must mention 'version': {}", msg
+            "Error must mention 'version': {}",
+            msg
         );
     }
 
     #[test]
     fn open_wrong_header_size_is_rejected() {
         let data = make_shm_bytes(
-            b"VFSHM001", SHM_VERSION, 48, // old header size — now invalid
-            RING_SIZE as u32, 64, 64, 2, PIXEL_FORMAT_RGB24,
+            b"VFSHM001",
+            SHM_VERSION,
+            48, // old header size — now invalid
+            RING_SIZE as u32,
+            64,
+            64,
+            2,
+            PIXEL_FORMAT_RGB24,
         );
         let path = write_temp_shm("vf_test_hdrsize.bin", &data);
         let result = VideoShm::open(&path, 64, 64, 2);
@@ -333,7 +352,8 @@ mod tests {
         let msg = result.err().unwrap().to_string();
         assert!(
             msg.contains("header_size"),
-            "Error must mention 'header_size': {}", msg
+            "Error must mention 'header_size': {}",
+            msg
         );
     }
 
@@ -348,8 +368,14 @@ mod tests {
     #[test]
     fn slot_state_roundtrip() {
         let data = make_shm_bytes(
-            b"VFSHM001", SHM_VERSION, HEADER_REGION_SIZE as u32,
-            RING_SIZE as u32, 16, 16, 2, PIXEL_FORMAT_RGB24,
+            b"VFSHM001",
+            SHM_VERSION,
+            HEADER_REGION_SIZE as u32,
+            RING_SIZE as u32,
+            16,
+            16,
+            2,
+            PIXEL_FORMAT_RGB24,
         );
         let path = write_temp_shm("vf_test_state.bin", &data);
         let shm = VideoShm::open(&path, 16, 16, 2).unwrap();

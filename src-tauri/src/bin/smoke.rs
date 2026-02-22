@@ -189,7 +189,6 @@ async fn check_python_ipc(
     cmd.stderr(Stdio::null());
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
 
@@ -279,6 +278,7 @@ async fn shutdown_python(publisher: &zenoh::pubsub::Publisher<'_>, guard: &mut P
 
 // ─── SHM Roundtrip ───────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)] // TODO(clippy): keep explicit smoke-test knobs; refactor after hygiene pass if needed.
 async fn check_shm_roundtrip(
     python_bin: &str,
     script_path: &str,
@@ -333,7 +333,6 @@ async fn check_shm_roundtrip(
     cmd.stderr(Stdio::inherit());
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
 
@@ -462,7 +461,7 @@ async fn check_shm_roundtrip(
             *b = (i % 256) as u8;
         }
     }
-    shm.set_slot_frame_bytes(0, (width * height * 3) as u32);
+    shm.set_slot_frame_bytes(0, width * height * 3);
     shm.set_slot_write_index(0, 1);
     shm.set_slot_state(0, SLOT_READY_FOR_AI);
     check(
@@ -576,6 +575,7 @@ async fn check_shm_roundtrip(
 
 // ─── Python E2E (FFmpeg path) ─────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)] // TODO(clippy): CLI smoke entry mirrors user flags directly.
 async fn check_e2e_python(
     python_bin: &str,
     script_path: &str,
