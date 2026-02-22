@@ -13,8 +13,10 @@ pub const SHM_VERSION_V2: u32 = SHM_VERSION + 1;
 /// Numeric protocol identity used only by extended SHM headers.
 pub const SHM_PROTOCOL_VERSION: u32 = 1;
 const SHM_PROTOCOL_VERSION_OFFSET: usize = GLOBAL_HEADER_SIZE;
+#[cfg(test)]
 const HEADER_REGION_SIZE_V2: usize = HEADER_REGION_SIZE + 4;
 const SHM_PROTOCOL_MISMATCH_CODE: &str = "SHM_PROTOCOL_VERSION_MISMATCH";
+const SHM_RING_SIZE_MISMATCH_CODE: &str = "SHM_RING_SIZE_MISMATCH";
 
 // =============================================================================
 // SHM ERROR
@@ -35,6 +37,9 @@ pub struct VideoShm {
     pub width: usize,
     pub height: usize,
     pub scale: usize,
+    ring_size: usize,
+    global_header_size: usize,
+    header_region_size: usize,
 
     slot_input_size: usize,
     slot_output_size: usize,
@@ -57,15 +62,22 @@ impl VideoShm {
     /// [ Slot 2: input | output ]
     /// ```
     pub fn open(file_path: &str, width: usize, height: usize, scale: usize) -> Result<Self> {
+        Self::open_with_expected_ring_size(file_path, width, height, scale, None)
+    }
+
+    pub fn open_with_expected_ring_size(
+        file_path: &str,
+        width: usize,
+        height: usize,
+        scale: usize,
+        expected_ring_size: Option<usize>,
+    ) -> Result<Self> {
         let slot_input_size = width * height * 3;
         let slot_output_size = (width * scale) * (height * scale) * 3;
         let slot_total_size = slot_input_size + slot_output_size;
-        let total_size = HEADER_REGION_SIZE + slot_total_size * RING_SIZE;
 
         tracing::info!(
             path = %file_path,
-            expected_bytes = total_size,
-            header_bytes = HEADER_REGION_SIZE,
             width,
             height,
             scale,
@@ -79,10 +91,10 @@ impl VideoShm {
             .map_err(|e| anyhow!("Failed to open SHM file '{}': {}", file_path, e))?;
 
         let meta = file.metadata()?;
-        if meta.len() < total_size as u64 {
+        if meta.len() < GLOBAL_HEADER_SIZE as u64 {
             return Err(anyhow!(
-                "SHM file too small: expected {} bytes, got {}",
-                total_size,
+                "SHM file too small: expected at least {} bytes, got {}",
+                GLOBAL_HEADER_SIZE,
                 meta.len()
             ));
         }
@@ -108,6 +120,10 @@ impl VideoShm {
 
         let version = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
         let header_size = u32::from_le_bytes(mmap[12..16].try_into().unwrap());
+        let slot_count = u32::from_le_bytes(mmap[16..20].try_into().unwrap()) as usize;
+        if slot_count == 0 {
+            return Err(anyhow!("SHM slot_count must be > 0"));
+        }
 
         match version {
             SHM_VERSION => {
@@ -118,12 +134,32 @@ impl VideoShm {
                         header_size
                     ));
                 }
+                if slot_count != RING_SIZE {
+                    return Err(anyhow!(
+                        "{code}: expected={}, found={}. Legacy SHM header requires default ring size.",
+                        RING_SIZE,
+                        slot_count,
+                        code = SHM_RING_SIZE_MISMATCH_CODE
+                    ));
+                }
+                if let Some(expected) = expected_ring_size {
+                    if slot_count != expected {
+                        return Err(anyhow!(
+                            "{code}: expected={expected}, found={found}. Ring override requires SHM v2 mode.",
+                            code = SHM_RING_SIZE_MISMATCH_CODE,
+                            expected = expected,
+                            found = slot_count
+                        ));
+                    }
+                }
             }
             SHM_VERSION_V2 => {
-                if header_size != HEADER_REGION_SIZE_V2 as u32 {
+                let expected_header_size_v2 =
+                    (GLOBAL_HEADER_SIZE + 4 + SLOT_HEADER_SIZE * slot_count) as u32;
+                if header_size != expected_header_size_v2 {
                     return Err(anyhow!(
                         "SHM v2 header_size mismatch: expected {}, got {}",
-                        HEADER_REGION_SIZE_V2,
+                        expected_header_size_v2,
                         header_size
                     ));
                 }
@@ -145,6 +181,16 @@ impl VideoShm {
                         found = found_protocol
                     ));
                 }
+                if let Some(expected) = expected_ring_size {
+                    if slot_count != expected {
+                        return Err(anyhow!(
+                            "{code}: expected={expected}, found={found}. Disable ring override or update worker/engine.",
+                            code = SHM_RING_SIZE_MISMATCH_CODE,
+                            expected = expected,
+                            found = slot_count
+                        ));
+                    }
+                }
             }
             found => {
                 return Err(anyhow!(
@@ -156,17 +202,48 @@ impl VideoShm {
             }
         }
 
-        tracing::info!(shm_version = version, header_size, "SHM header validated");
+        let header_region_size = header_size as usize;
+        let slot_header_region = slot_count * SLOT_HEADER_SIZE;
+        if header_region_size < slot_header_region {
+            return Err(anyhow!(
+                "SHM header_size too small for slot headers: header_size={}, slot_headers={}",
+                header_region_size,
+                slot_header_region
+            ));
+        }
+        let total_size = header_region_size + slot_total_size * slot_count;
+        if meta.len() < total_size as u64 {
+            return Err(anyhow!(
+                "SHM file too small: expected {} bytes, got {}",
+                total_size,
+                meta.len()
+            ));
+        }
+        let global_header_size = header_region_size - slot_header_region;
+
+        tracing::info!(
+            shm_version = version,
+            header_size,
+            slot_count,
+            "SHM header validated"
+        );
 
         Ok(Self {
             mmap,
             width,
             height,
             scale,
+            ring_size: slot_count,
+            global_header_size,
+            header_region_size,
             slot_input_size,
             slot_output_size,
             slot_total_size,
         })
+    }
+
+    pub fn ring_size(&self) -> usize {
+        self.ring_size
     }
 
     // -------------------------------------------------------------------------
@@ -177,7 +254,7 @@ impl VideoShm {
     /// Accounts for the global header at the start of the file.
     #[inline]
     fn header_field_ptr(&self, index: usize, field_offset: usize) -> *const AtomicU32 {
-        let byte_offset = GLOBAL_HEADER_SIZE + index * SLOT_HEADER_SIZE + field_offset;
+        let byte_offset = self.global_header_size + index * SLOT_HEADER_SIZE + field_offset;
         // SAFETY: slot header region starts at GLOBAL_HEADER_SIZE, all u32
         // fields are 4-byte aligned within their 16-byte slot header.
         // Both Rust and Python access these via atomic u32 operations.
@@ -186,21 +263,21 @@ impl VideoShm {
 
     /// Read the atomic state of slot `index`.
     pub fn slot_state(&self, index: usize) -> u32 {
-        assert!(index < RING_SIZE, "slot index out of bounds");
+        assert!(index < self.ring_size, "slot index out of bounds");
         let atom = unsafe { &*self.header_field_ptr(index, STATE_OFFSET) };
         atom.load(Ordering::SeqCst)
     }
 
     /// Set the atomic state of slot `index`.
     pub fn set_slot_state(&self, index: usize, state: u32) {
-        assert!(index < RING_SIZE, "slot index out of bounds");
+        assert!(index < self.ring_size, "slot index out of bounds");
         let atom = unsafe { &*self.header_field_ptr(index, STATE_OFFSET) };
         atom.store(state, Ordering::SeqCst);
     }
 
     /// Compare-and-swap the slot state. Returns true if the swap succeeded.
     pub fn cas_slot_state(&self, index: usize, expected: u32, new: u32) -> bool {
-        assert!(index < RING_SIZE, "slot index out of bounds");
+        assert!(index < self.ring_size, "slot index out of bounds");
         let atom = unsafe { &*self.header_field_ptr(index, STATE_OFFSET) };
         atom.compare_exchange(expected, new, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
@@ -208,28 +285,28 @@ impl VideoShm {
 
     /// Read the frame_bytes field for slot `index`.
     pub fn slot_frame_bytes(&self, index: usize) -> u32 {
-        assert!(index < RING_SIZE, "slot index out of bounds");
+        assert!(index < self.ring_size, "slot index out of bounds");
         let atom = unsafe { &*self.header_field_ptr(index, FRAME_BYTES_OFFSET) };
         atom.load(Ordering::SeqCst)
     }
 
     /// Set the frame_bytes field for slot `index`.
     pub fn set_slot_frame_bytes(&self, index: usize, bytes: u32) {
-        assert!(index < RING_SIZE, "slot index out of bounds");
+        assert!(index < self.ring_size, "slot index out of bounds");
         let atom = unsafe { &*self.header_field_ptr(index, FRAME_BYTES_OFFSET) };
         atom.store(bytes, Ordering::SeqCst);
     }
 
     /// Set the write_index (frame counter) for slot `index`.
     pub fn set_slot_write_index(&self, index: usize, frame_id: u32) {
-        assert!(index < RING_SIZE, "slot index out of bounds");
+        assert!(index < self.ring_size, "slot index out of bounds");
         let atom = unsafe { &*self.header_field_ptr(index, WRITE_INDEX_OFFSET) };
         atom.store(frame_id, Ordering::SeqCst);
     }
 
     /// Reset all slot headers to EMPTY state.
     pub fn reset_all_slots(&self) {
-        for i in 0..RING_SIZE {
+        for i in 0..self.ring_size {
             self.set_slot_state(i, SLOT_EMPTY);
             self.set_slot_frame_bytes(i, 0);
             self.set_slot_write_index(i, 0);
@@ -242,25 +319,26 @@ impl VideoShm {
     // -------------------------------------------------------------------------
 
     pub fn input_slot_mut(&mut self, index: usize) -> Result<&mut [u8], ShmError> {
-        if index >= RING_SIZE {
+        if index >= self.ring_size {
             return Err(ShmError::IndexOutOfBounds {
                 index,
-                max: RING_SIZE - 1,
+                max: self.ring_size - 1,
             });
         }
-        let offset = HEADER_REGION_SIZE + index * self.slot_total_size;
+        let offset = self.header_region_size + index * self.slot_total_size;
         let end = offset + self.slot_input_size;
         Ok(&mut self.mmap[offset..end])
     }
 
     pub fn output_slot(&self, index: usize) -> Result<&[u8], ShmError> {
-        if index >= RING_SIZE {
+        if index >= self.ring_size {
             return Err(ShmError::IndexOutOfBounds {
                 index,
-                max: RING_SIZE - 1,
+                max: self.ring_size - 1,
             });
         }
-        let offset = HEADER_REGION_SIZE + (index * self.slot_total_size) + self.slot_input_size;
+        let offset =
+            self.header_region_size + (index * self.slot_total_size) + self.slot_input_size;
         let end = offset + self.slot_output_size;
         Ok(&self.mmap[offset..end])
     }
@@ -382,9 +460,10 @@ mod tests {
         let w = width as usize;
         let h = height as usize;
         let s = scale as usize;
+        let slots = slot_count as usize;
         let slot_in = w * h * 3;
         let slot_out = (w * s) * (h * s) * 3;
-        let total = HEADER_REGION_SIZE + (slot_in + slot_out) * RING_SIZE;
+        let total = (header_size as usize) + (slot_in + slot_out) * slots;
         let mut data = vec![0u8; total];
 
         data[0..8].copy_from_slice(magic);
@@ -413,9 +492,10 @@ mod tests {
         let w = width as usize;
         let h = height as usize;
         let s = scale as usize;
+        let slots = slot_count as usize;
         let slot_in = w * h * 3;
         let slot_out = (w * s) * (h * s) * 3;
-        let total = HEADER_REGION_SIZE_V2 + (slot_in + slot_out) * RING_SIZE;
+        let total = (header_size as usize) + (slot_in + slot_out) * slots;
         let mut data = vec![0u8; total];
 
         data[0..8].copy_from_slice(magic);
@@ -522,6 +602,51 @@ mod tests {
         assert!(msg.contains("SHM_PROTOCOL_VERSION_MISMATCH"));
         assert!(msg.contains("expected="));
         assert!(msg.contains("found="));
+    }
+
+    #[test]
+    fn v2_shm_open_validates_ring_size_match_ok() {
+        let data = make_shm_bytes_v2(
+            b"VFSHM001",
+            SHM_VERSION_V2,
+            (GLOBAL_HEADER_SIZE + SLOT_HEADER_SIZE * 8 + 4) as u32,
+            8,
+            64,
+            64,
+            2,
+            PIXEL_FORMAT_RGB24,
+            SHM_PROTOCOL_VERSION,
+        );
+        let path = write_temp_shm("vf_test_v2_ring8_match.bin", &data);
+        let result = VideoShm::open_with_expected_ring_size(&path, 64, 64, 2, Some(8));
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_ok(),
+            "expected ring size 8 should open when header slot_count=8"
+        );
+    }
+
+    #[test]
+    fn v2_shm_open_ring_size_mismatch_errors() {
+        let data = make_shm_bytes_v2(
+            b"VFSHM001",
+            SHM_VERSION_V2,
+            HEADER_REGION_SIZE_V2 as u32,
+            6,
+            64,
+            64,
+            2,
+            PIXEL_FORMAT_RGB24,
+            SHM_PROTOCOL_VERSION,
+        );
+        let path = write_temp_shm("vf_test_v2_ring_mismatch.bin", &data);
+        let result = VideoShm::open_with_expected_ring_size(&path, 64, 64, 2, Some(8));
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err(), "ring mismatch must fail deterministically");
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("SHM_RING_SIZE_MISMATCH"));
+        assert!(msg.contains("expected=8"));
+        assert!(msg.contains("found=6"));
     }
 
     #[test]

@@ -123,6 +123,7 @@ async fn main() {
         zenoh_timeout_secs: 60,
         enable_run_artifacts: false,
         use_shm_proto_v2: false,
+        shm_ring_size_override: None,
     };
 
     match run_upscale_job(job, progress).await {

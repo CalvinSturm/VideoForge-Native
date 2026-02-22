@@ -50,6 +50,8 @@ pub struct UpscaleJobConfig {
     pub enable_run_artifacts: bool,
     /// Internal opt-in only. Default false keeps legacy SHM header layout.
     pub use_shm_proto_v2: bool,
+    /// Internal opt-in ring override. `None` keeps protocol default ring size.
+    pub shm_ring_size_override: Option<u32>,
 }
 
 pub struct UpscaleJobReport {
@@ -156,12 +158,14 @@ fn validate_worker_protocol_version(found: Option<u32>, typed_ipc: bool) -> Resu
     }
 }
 
+#[allow(clippy::too_many_arguments)] // TODO(clippy): payload builder keeps explicit optional knobs for readability.
 fn build_create_shm_payload(
     width: usize,
     height: usize,
     scale: usize,
     ring_size: usize,
     shm_proto_v2: bool,
+    shm_ring_size: Option<u32>,
     event_in_name: Option<&str>,
     event_out_name: Option<&str>,
 ) -> serde_json::Value {
@@ -180,7 +184,32 @@ fn build_create_shm_payload(
     if shm_proto_v2 {
         payload["shm_proto_v2"] = json!(true);
     }
+    if let Some(ring_size) = shm_ring_size {
+        payload["shm_ring_size"] = json!(ring_size);
+    }
     payload
+}
+
+fn resolve_shm_ring_override(
+    use_shm_proto_v2: bool,
+    shm_ring_size_override: Option<u32>,
+) -> Result<Option<u32>, String> {
+    let Some(override_size) = shm_ring_size_override else {
+        return Ok(None);
+    };
+
+    if override_size != 6 && override_size != 8 {
+        return Err(format!(
+            "SHM_RING_SIZE_INVALID: unsupported ring size {} (allowed: 6 or 8)",
+            override_size
+        ));
+    }
+    if !use_shm_proto_v2 {
+        return Err(
+            "SHM_RING_SIZE_REQUIRES_V2: ring size override requires --shm-proto-v2".to_string(),
+        );
+    }
+    Ok(Some(override_size))
 }
 
 // ─── run_upscale_job ─────────────────────────────────────────────────────────
@@ -207,8 +236,11 @@ pub async fn run_upscale_job(
     };
     let worker_caps = WorkerCaps {
         use_shm_proto_v2: config.use_shm_proto_v2,
+        shm_ring_size: config.shm_ring_size_override,
         ..WorkerCaps::default()
     };
+    let resolved_ring_override =
+        resolve_shm_ring_override(config.use_shm_proto_v2, config.shm_ring_size_override)?;
     #[cfg(not(windows))]
     if worker_caps.use_events {
         tracing::warn!("--use-events is Windows-only; falling back to polling");
@@ -530,6 +562,7 @@ pub async fn run_upscale_job(
         scale_factor,
         shm::RING_SIZE,
         worker_caps.use_shm_proto_v2,
+        resolved_ring_override,
         event_in_name.as_deref(),
         event_out_name.as_deref(),
     );
@@ -562,9 +595,16 @@ pub async fn run_upscale_job(
         .unwrap()
         .to_string();
 
-    let shm = shm::VideoShm::open(&shm_path, process_w, process_h, scale_factor)
-        .map_err(|e| e.to_string())?;
+    let shm = shm::VideoShm::open_with_expected_ring_size(
+        &shm_path,
+        process_w,
+        process_h,
+        scale_factor,
+        resolved_ring_override.map(|v| v as usize),
+    )
+    .map_err(|e| e.to_string())?;
     shm.reset_all_slots();
+    let ring_size = shm.ring_size();
 
     tracing::info!(
         job_id = %job_id,
@@ -578,11 +618,11 @@ pub async fn run_upscale_job(
     let frames_encoded_ctr = Arc::new(AtomicU64::new(0));
 
     // Flow-control channels (Rust-only, not cross-process).
-    let (free_tx, mut free_rx) = mpsc::channel::<usize>(shm::RING_SIZE);
-    let (pending_tx, mut pending_rx) = mpsc::channel::<usize>(shm::RING_SIZE);
-    let (enc_tx, mut enc_rx) = mpsc::channel::<usize>(shm::RING_SIZE);
+    let (free_tx, mut free_rx) = mpsc::channel::<usize>(ring_size);
+    let (pending_tx, mut pending_rx) = mpsc::channel::<usize>(ring_size);
+    let (enc_tx, mut enc_rx) = mpsc::channel::<usize>(ring_size);
 
-    for i in 0..shm::RING_SIZE {
+    for i in 0..ring_size {
         free_tx.send(i).await.map_err(|e| e.to_string())?;
     }
 
@@ -924,7 +964,8 @@ pub async fn run_upscale_job(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_create_shm_payload, validate_worker_protocol_version, JobProgress, StageTimingsMs,
+        build_create_shm_payload, resolve_shm_ring_override, validate_worker_protocol_version,
+        JobProgress, StageTimingsMs,
     };
 
     #[test]
@@ -1007,7 +1048,7 @@ mod tests {
 
     #[test]
     fn test_create_shm_payload_omits_event_names_when_absent() {
-        let v = build_create_shm_payload(1920, 1080, 2, 6, false, None, None);
+        let v = build_create_shm_payload(1920, 1080, 2, 6, false, None, None, None);
         assert_eq!(v["width"], 1920);
         assert_eq!(v["height"], 1080);
         assert_eq!(v["scale"], 2);
@@ -1025,6 +1066,7 @@ mod tests {
             2,
             6,
             false,
+            None,
             Some("vf_shm_abc_in_ready"),
             Some("vf_shm_abc_out_ready"),
         );
@@ -1034,8 +1076,20 @@ mod tests {
 
     #[test]
     fn test_create_shm_payload_includes_shm_proto_v2_when_enabled() {
-        let v = build_create_shm_payload(1920, 1080, 2, 6, true, None, None);
+        let v = build_create_shm_payload(1920, 1080, 2, 6, true, None, None, None);
         assert_eq!(v["shm_proto_v2"], true);
+    }
+
+    #[test]
+    fn test_create_shm_payload_includes_ring_override_when_present() {
+        let v = build_create_shm_payload(1920, 1080, 2, 6, true, Some(8), None, None);
+        assert_eq!(v["shm_ring_size"], 8);
+    }
+
+    #[test]
+    fn ring_override_requires_v2_fails_fast() {
+        let err = resolve_shm_ring_override(false, Some(8)).unwrap_err();
+        assert!(err.contains("SHM_RING_SIZE_REQUIRES_V2"));
     }
 }
 
@@ -1078,6 +1132,7 @@ pub async fn upscale_request(
         zenoh_timeout_secs: 60,
         enable_run_artifacts: false,
         use_shm_proto_v2: false,
+        shm_ring_size_override: None,
     };
 
     let report = run_upscale_job(job_config, progress).await?;

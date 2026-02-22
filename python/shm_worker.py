@@ -160,6 +160,7 @@ class Config:
     TILE_SIZE = 512
     TILE_PAD = 32
     RING_SIZE = 6
+    RING_SIZE_MAX = 8
     PARENT_CHECK_INTERVAL = 2  # seconds
     ZENOH_PREFIX = "videoforge/ipc"
 
@@ -180,6 +181,7 @@ class Config:
     GLOBAL_HEADER_SIZE_V2 = 40
     SLOT_HEADER_SIZE = 16
     SHM_PROTOCOL_VERSION = 1
+    SHM_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB allocation guardrail
 
     # Offsets
     STATE_FIELD_OFFSET = 8
@@ -224,6 +226,7 @@ class Config:
                 )
 
             cls.RING_SIZE = data.get("ring_size", cls.RING_SIZE)
+            cls.RING_SIZE_MAX = data.get("ring_size_max", cls.RING_SIZE_MAX)
             cls.SHM_MAGIC = data.get("magic", cls.SHM_MAGIC.decode("utf-8")).encode("utf-8")
             cls.SHM_VERSION = data.get("version", cls.SHM_VERSION)
             cls.PIXEL_FORMAT_RGB24 = data.get("pixel_format_rgb24", cls.PIXEL_FORMAT_RGB24)
@@ -247,6 +250,32 @@ class Config:
             
         except Exception as e:
             log.warning(f"Failed to load SHM protocol: {e}. Using defaults.")
+
+
+def resolve_effective_ring_size(
+    payload: Dict[str, Any],
+    cli_ring_size: Optional[int],
+    protocol_default: int,
+) -> int:
+    """Resolve ring size override precedence: payload > CLI > protocol default."""
+    if isinstance(payload, dict) and payload.get("shm_ring_size") is not None:
+        return int(payload["shm_ring_size"])
+    if cli_ring_size is not None:
+        return int(cli_ring_size)
+    return int(payload.get("ring_size", protocol_default))
+
+
+def validate_shm_ring_override(effective_ring_size: int, shm_proto_v2: bool) -> None:
+    """Validate ring override guardrails and v2 gating."""
+    allowed = {6, 8}
+    if effective_ring_size not in allowed:
+        raise ValueError(
+            f"SHM_RING_SIZE_INVALID: unsupported ring size {effective_ring_size} (allowed: 6 or 8)"
+        )
+    if effective_ring_size != 6 and not shm_proto_v2:
+        raise ValueError(
+            "SHM_RING_SIZE_REQUIRES_V2: ring size override requires --shm-proto-v2"
+        )
 
 # Load protocol immediately
 Config.load_shm_protocol()
@@ -579,6 +608,7 @@ class AIWorker:
         log_level: Optional[str] = None,
         use_typed_ipc: bool = False,
         use_shm_proto_v2: bool = False,
+        shm_ring_size: Optional[int] = None,
         use_events: bool = False,
         prealloc_tensors: bool = False,
         deterministic: bool = False,
@@ -626,6 +656,7 @@ class AIWorker:
         self._frame_loop_active = False
         self._frame_loop_thread: Optional[threading.Thread] = None
         self._cached_research_params: Optional[Dict] = None
+        self.global_header_size = 0
         self.header_region_size = 0
         self.output_size = 0
 
@@ -638,6 +669,7 @@ class AIWorker:
         self.log_level = log_level
         self.use_typed_ipc = use_typed_ipc
         self.use_shm_proto_v2 = use_shm_proto_v2
+        self.shm_ring_size = shm_ring_size
         self.use_events = use_events
         self.prealloc_tensors = prealloc_tensors
         self.deterministic_flag = deterministic
@@ -1321,19 +1353,31 @@ class AIWorker:
         width = payload["width"]
         height = payload["height"]
         self.active_scale = payload["scale"]
-        self.ring_size = payload.get("ring_size", Config.RING_SIZE)
         shm_proto_v2 = bool(payload.get("shm_proto_v2", self.use_shm_proto_v2))
+        requested_ring_size = resolve_effective_ring_size(
+            payload, self.shm_ring_size, Config.RING_SIZE
+        )
+        validate_shm_ring_override(requested_ring_size, shm_proto_v2)
+        # Default path remains fixed at 6; override is opt-in with proto v2.
+        self.ring_size = requested_ring_size if shm_proto_v2 else Config.RING_SIZE
 
         self.input_size = width * height * 3
         self.output_size = (width * self.active_scale) * (height * self.active_scale) * 3
         self.slot_byte_size = self.input_size + self.output_size
-        global_header_size = (
+        self.global_header_size = (
             Config.GLOBAL_HEADER_SIZE_V2 if shm_proto_v2 else Config.GLOBAL_HEADER_SIZE
         )
         shm_header_version = Config.SHM_VERSION + 1 if shm_proto_v2 else Config.SHM_VERSION
         # header_region_size = global header + per-slot headers
-        self.header_region_size = global_header_size + Config.SLOT_HEADER_SIZE * self.ring_size
+        self.header_region_size = (
+            self.global_header_size + Config.SLOT_HEADER_SIZE * self.ring_size
+        )
         total_size = self.header_region_size + self.slot_byte_size * self.ring_size
+        if total_size > Config.SHM_MAX_BYTES:
+            raise ValueError(
+                f"SHM_SIZE_TOO_LARGE: requested_bytes={total_size} exceeds cap={Config.SHM_MAX_BYTES}. "
+                "Reduce resolution/scale/ring size."
+            )
 
         if self.mmap:
             self.cleanup()
@@ -1374,7 +1418,7 @@ class AIWorker:
                     self.active_scale,         # scale u32
                     Config.PIXEL_FORMAT_RGB24, # pixel_format u32
                 )
-            self.mmap[0:global_header_size] = global_header
+            self.mmap[0:self.global_header_size] = global_header
 
             self.input_shape = (height, width, 3)
             self.output_shape = (
@@ -1396,7 +1440,7 @@ class AIWorker:
             self._setup_event_sync(payload)
             log.info(
                 f"SHM created: {total_size} bytes "
-                f"(global_header={global_header_size}, "
+                f"(global_header={self.global_header_size}, "
                 f"header_region={self.header_region_size}, "
                 f"{self.ring_size} slots x {self.slot_byte_size}), "
                 f"magic=VFSHM001 version={shm_header_version}"
@@ -1412,9 +1456,10 @@ class AIWorker:
         Called after mmap creation. Raises ValueError with a descriptive
         message if the header is malformed.
         """
-        if not self.mmap or len(self.mmap) < Config.GLOBAL_HEADER_SIZE:
+        min_header = self.global_header_size or Config.GLOBAL_HEADER_SIZE
+        if not self.mmap or len(self.mmap) < min_header:
             raise ValueError(
-                f"SHM too small for global header ({Config.GLOBAL_HEADER_SIZE} bytes)"
+                f"SHM too small for global header ({min_header} bytes)"
             )
         magic = bytes(self.mmap[0:8])
         if magic != Config.SHM_MAGIC:
@@ -1422,9 +1467,9 @@ class AIWorker:
                 f"SHM magic mismatch: expected {Config.SHM_MAGIC!r}, got {magic!r}"
             )
         version = struct.unpack_from("<I", self.mmap, 8)[0]
-        if version != Config.SHM_VERSION:
+        if version not in (Config.SHM_VERSION, Config.SHM_VERSION + 1):
             raise ValueError(
-                f"SHM version mismatch: expected {Config.SHM_VERSION}, got {version}"
+                f"SHM version mismatch: expected {Config.SHM_VERSION} or {Config.SHM_VERSION + 1}, got {version}"
             )
 
     # -------------------------------------------------------------------------
@@ -1438,7 +1483,7 @@ class AIWorker:
         Matches Rust: GLOBAL_HEADER_SIZE + slot_idx * SLOT_HEADER_SIZE + STATE_OFFSET
         """
         return (
-            Config.GLOBAL_HEADER_SIZE
+            self.global_header_size
             + slot_idx * Config.SLOT_HEADER_SIZE
             + Config.STATE_FIELD_OFFSET
         )
@@ -1993,6 +2038,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--use-typed-ipc", action="store_true", help="Parsed only (plumbing)")
     parser.add_argument("--shm-proto-v2", action="store_true", help="Use opt-in SHM extended header with protocol_version")
+    parser.add_argument("--shm-ring-size", type=int, default=None, help="Opt-in SHM ring size override (requires --shm-proto-v2)")
     parser.add_argument("--use-events", action="store_true", help="Use Win32 named-event SHM sync hints (Windows only)")
     parser.add_argument("--prealloc-tensors", action="store_true", help="Parsed only (plumbing)")
     parser.add_argument("--deterministic", action="store_true", help="Parsed only (plumbing)")
@@ -2026,6 +2072,7 @@ def run_worker(args: argparse.Namespace) -> int:
         log_level=args.log_level,
         use_typed_ipc=args.use_typed_ipc,
         use_shm_proto_v2=args.shm_proto_v2,
+        shm_ring_size=args.shm_ring_size,
         use_events=args.use_events,
         prealloc_tensors=args.prealloc_tensors,
         deterministic=args.deterministic,

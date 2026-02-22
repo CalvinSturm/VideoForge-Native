@@ -35,6 +35,7 @@ pub struct WorkerCaps {
     pub log_level: Option<String>,
     pub use_typed_ipc: bool,
     pub use_shm_proto_v2: bool,
+    pub shm_ring_size: Option<u32>,
     pub use_events: bool,
     pub prealloc_tensors: bool,
     pub deterministic: bool,
@@ -62,6 +63,10 @@ pub fn build_worker_argv(base: &BaseWorkerArgs<'_>, caps: &WorkerCaps) -> Vec<St
     }
     if caps.use_shm_proto_v2 {
         argv.push("--shm-proto-v2".to_string());
+    }
+    if let Some(ring_size) = caps.shm_ring_size {
+        argv.push("--shm-ring-size".to_string());
+        argv.push(ring_size.to_string());
     }
     if caps.use_events {
         argv.push("--use-events".to_string());
@@ -241,5 +246,26 @@ mod tests {
 
         let argv = build_worker_argv(&base, &caps);
         assert!(argv.iter().any(|a| a == "--shm-proto-v2"));
+    }
+
+    #[test]
+    fn shm_ring_size_flag_is_only_emitted_when_set() {
+        let base = BaseWorkerArgs {
+            script_path: "python/shm_worker.py",
+            port: 7447,
+            parent_pid: 12345,
+            precision: "fp16",
+        };
+
+        let argv_default = build_worker_argv(&base, &WorkerCaps::default());
+        assert!(!argv_default.iter().any(|a| a == "--shm-ring-size"));
+
+        let caps = WorkerCaps {
+            shm_ring_size: Some(8),
+            ..WorkerCaps::default()
+        };
+        let argv = build_worker_argv(&base, &caps);
+        assert!(argv.iter().any(|a| a == "--shm-ring-size"));
+        assert!(argv.iter().any(|a| a == "8"));
     }
 }
