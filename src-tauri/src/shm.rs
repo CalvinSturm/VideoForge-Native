@@ -233,6 +233,98 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SlotState {
+        Empty,
+        RustWriting,
+        ReadyForAi,
+        AiProcessing,
+        ReadyForEncode,
+        Encoding,
+    }
+
+    impl SlotState {
+        fn as_u32(self) -> u32 {
+            match self {
+                Self::Empty => SLOT_EMPTY,
+                Self::RustWriting => SLOT_RUST_WRITING,
+                Self::ReadyForAi => SLOT_READY_FOR_AI,
+                Self::AiProcessing => SLOT_AI_PROCESSING,
+                Self::ReadyForEncode => SLOT_READY_FOR_ENCODE,
+                Self::Encoding => SLOT_ENCODING,
+            }
+        }
+
+        fn from_u32(v: u32) -> Option<Self> {
+            match v {
+                SLOT_EMPTY => Some(Self::Empty),
+                SLOT_RUST_WRITING => Some(Self::RustWriting),
+                SLOT_READY_FOR_AI => Some(Self::ReadyForAi),
+                SLOT_AI_PROCESSING => Some(Self::AiProcessing),
+                SLOT_READY_FOR_ENCODE => Some(Self::ReadyForEncode),
+                SLOT_ENCODING => Some(Self::Encoding),
+                _ => None,
+            }
+        }
+    }
+
+    fn is_valid_transition(from: SlotState, to: SlotState) -> bool {
+        matches!(
+            (from, to),
+            (SlotState::Empty, SlotState::RustWriting)
+                | (SlotState::RustWriting, SlotState::ReadyForAi)
+                | (SlotState::ReadyForAi, SlotState::AiProcessing)
+                | (SlotState::AiProcessing, SlotState::ReadyForEncode)
+                | (SlotState::ReadyForEncode, SlotState::Encoding)
+                | (SlotState::Encoding, SlotState::Empty)
+        )
+    }
+
+    fn apply_transition(slot_state: &mut SlotState, to: SlotState) -> Result<(), &'static str> {
+        if is_valid_transition(*slot_state, to) {
+            *slot_state = to;
+            Ok(())
+        } else {
+            Err("invalid slot transition")
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DecodedGlobalHeader {
+        magic: [u8; 8],
+        version: u32,
+        header_size: u32,
+        slot_count: u32,
+        width: u32,
+        height: u32,
+        scale: u32,
+        pixel_format: u32,
+    }
+
+    fn decode_global_header(bytes: &[u8]) -> Result<DecodedGlobalHeader, String> {
+        if bytes.len() < GLOBAL_HEADER_SIZE {
+            return Err(format!(
+                "header too small: got {}, need {}",
+                bytes.len(),
+                GLOBAL_HEADER_SIZE
+            ));
+        }
+
+        let mut magic = [0u8; 8];
+        magic.copy_from_slice(&bytes[0..8]);
+
+        Ok(DecodedGlobalHeader {
+            magic,
+            version: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            header_size: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            slot_count: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            width: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+            height: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            scale: u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            pixel_format: u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
+        })
+    }
+
     /// Build a minimal valid SHM file in `data` with the given parameters.
     #[allow(clippy::too_many_arguments)] // TODO(clippy): test helper keeps explicit header fields for readability.
     fn make_shm_bytes(
@@ -389,5 +481,200 @@ mod tests {
         assert_eq!(shm.slot_state(0), SLOT_EMPTY);
         assert_eq!(shm.slot_state(2), SLOT_EMPTY);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn global_header_roundtrip_fields_are_correct() {
+        let width = 1920;
+        let height = 1080;
+        let scale = 4;
+        let slot_count = RING_SIZE as u32;
+        let data = make_shm_bytes(
+            MAGIC,
+            SHM_VERSION,
+            HEADER_REGION_SIZE as u32,
+            slot_count,
+            width,
+            height,
+            scale,
+            PIXEL_FORMAT_RGB24,
+        );
+        let header = decode_global_header(&data).expect("decode header");
+
+        assert_eq!(header.magic, *MAGIC);
+        assert_eq!(header.version, SHM_VERSION);
+        assert_eq!(header.header_size, HEADER_REGION_SIZE as u32);
+        assert_eq!(header.slot_count, slot_count);
+        assert_eq!(header.width, width);
+        assert_eq!(header.height, height);
+        assert_eq!(header.scale, scale);
+        assert_eq!(header.pixel_format, PIXEL_FORMAT_RGB24);
+    }
+
+    #[test]
+    fn open_rejects_wrong_magic_version_and_header_size() {
+        let bad_magic = make_shm_bytes(
+            b"BADMAGIC",
+            SHM_VERSION,
+            HEADER_REGION_SIZE as u32,
+            RING_SIZE as u32,
+            64,
+            64,
+            2,
+            PIXEL_FORMAT_RGB24,
+        );
+        let bad_magic_path = write_temp_shm("vf_test_invalid_magic.bin", &bad_magic);
+        let bad_magic_result = VideoShm::open(&bad_magic_path, 64, 64, 2);
+        let _ = std::fs::remove_file(&bad_magic_path);
+        assert!(bad_magic_result.is_err());
+        assert!(
+            bad_magic_result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("magic"),
+            "wrong magic must fail deterministically"
+        );
+
+        let bad_version = make_shm_bytes(
+            MAGIC,
+            SHM_VERSION + 1,
+            HEADER_REGION_SIZE as u32,
+            RING_SIZE as u32,
+            64,
+            64,
+            2,
+            PIXEL_FORMAT_RGB24,
+        );
+        let bad_version_path = write_temp_shm("vf_test_invalid_version.bin", &bad_version);
+        let bad_version_result = VideoShm::open(&bad_version_path, 64, 64, 2);
+        let _ = std::fs::remove_file(&bad_version_path);
+        assert!(bad_version_result.is_err());
+        assert!(
+            bad_version_result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("version"),
+            "wrong version must fail deterministically"
+        );
+
+        let bad_header_size = make_shm_bytes(
+            MAGIC,
+            SHM_VERSION,
+            (HEADER_REGION_SIZE as u32) + 4,
+            RING_SIZE as u32,
+            64,
+            64,
+            2,
+            PIXEL_FORMAT_RGB24,
+        );
+        let bad_header_size_path =
+            write_temp_shm("vf_test_invalid_header_size.bin", &bad_header_size);
+        let bad_header_size_result = VideoShm::open(&bad_header_size_path, 64, 64, 2);
+        let _ = std::fs::remove_file(&bad_header_size_path);
+        assert!(bad_header_size_result.is_err());
+        assert!(
+            bad_header_size_result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("header_size"),
+            "wrong header_size must fail deterministically"
+        );
+    }
+
+    #[test]
+    fn slot_fsm_allows_expected_transitions() {
+        let mut slot = SlotState::Empty;
+        apply_transition(&mut slot, SlotState::RustWriting).expect("EMPTY -> RUST_WRITING");
+        apply_transition(&mut slot, SlotState::ReadyForAi).expect("RUST_WRITING -> READY_FOR_AI");
+        apply_transition(&mut slot, SlotState::AiProcessing)
+            .expect("READY_FOR_AI -> AI_PROCESSING");
+        apply_transition(&mut slot, SlotState::ReadyForEncode)
+            .expect("AI_PROCESSING -> READY_FOR_ENCODE");
+        apply_transition(&mut slot, SlotState::Encoding).expect("READY_FOR_ENCODE -> ENCODING");
+        apply_transition(&mut slot, SlotState::Empty).expect("ENCODING -> EMPTY");
+    }
+
+    #[test]
+    fn slot_fsm_rejects_forbidden_transitions() {
+        let mut slot = SlotState::Empty;
+        assert!(apply_transition(&mut slot, SlotState::ReadyForEncode).is_err());
+        assert!(apply_transition(&mut slot, SlotState::ReadyForAi).is_err());
+        assert_eq!(slot, SlotState::Empty);
+
+        slot = SlotState::ReadyForAi;
+        assert!(apply_transition(&mut slot, SlotState::Empty).is_err());
+        assert_eq!(slot, SlotState::ReadyForAi);
+    }
+
+    #[test]
+    fn simulated_frame_loop_makes_deterministic_forward_progress() {
+        const TOTAL_FRAMES: u32 = 64;
+        const MAX_ITERS: usize = 10_000;
+
+        let mut slot_states = [SlotState::Empty; RING_SIZE];
+        let mut slot_write_index = [0u32; RING_SIZE];
+        let mut next_frame_id = 1u32;
+        let mut completed = 0u32;
+        let mut iterations = 0usize;
+
+        while completed < TOTAL_FRAMES && iterations < MAX_ITERS {
+            iterations += 1;
+
+            if next_frame_id <= TOTAL_FRAMES {
+                if let Some(i) = slot_states.iter().position(|s| *s == SlotState::Empty) {
+                    apply_transition(&mut slot_states[i], SlotState::RustWriting)
+                        .expect("producer EMPTY -> RUST_WRITING");
+                    assert!(
+                        next_frame_id > slot_write_index[i],
+                        "write index must be monotonic per slot"
+                    );
+                    slot_write_index[i] = next_frame_id;
+                    next_frame_id += 1;
+                    apply_transition(&mut slot_states[i], SlotState::ReadyForAi)
+                        .expect("producer RUST_WRITING -> READY_FOR_AI");
+                }
+            }
+
+            if let Some(i) = slot_states.iter().position(|s| *s == SlotState::ReadyForAi) {
+                apply_transition(&mut slot_states[i], SlotState::AiProcessing)
+                    .expect("ai READY_FOR_AI -> AI_PROCESSING");
+                apply_transition(&mut slot_states[i], SlotState::ReadyForEncode)
+                    .expect("ai AI_PROCESSING -> READY_FOR_ENCODE");
+            }
+
+            if let Some(i) = slot_states
+                .iter()
+                .position(|s| *s == SlotState::ReadyForEncode)
+            {
+                apply_transition(&mut slot_states[i], SlotState::Encoding)
+                    .expect("encoder READY_FOR_ENCODE -> ENCODING");
+                apply_transition(&mut slot_states[i], SlotState::Empty)
+                    .expect("encoder ENCODING -> EMPTY");
+                completed += 1;
+            }
+
+            if iterations.is_multiple_of(3) {
+                std::thread::yield_now();
+            }
+        }
+
+        assert_eq!(
+            completed, TOTAL_FRAMES,
+            "all frames should complete without deadlock"
+        );
+        assert!(
+            iterations < MAX_ITERS,
+            "simulation must terminate within bounded iterations"
+        );
+        assert!(
+            next_frame_id > TOTAL_FRAMES,
+            "producer should submit all frames"
+        );
+        assert!(slot_states
+            .iter()
+            .all(|s| SlotState::from_u32(s.as_u32()).is_some()));
     }
 }
