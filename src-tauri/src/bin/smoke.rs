@@ -628,6 +628,7 @@ async fn check_e2e_python(
         research_config,
         zenoh_timeout_secs: (timeout_ms / 1000).max(60),
         enable_run_artifacts: false,
+        use_shm_proto_v2: false,
     };
 
     // C) Progress callback

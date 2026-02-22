@@ -6,6 +6,16 @@ use thiserror::Error;
 
 include!(concat!(env!("OUT_DIR"), "/shm_constants.rs"));
 
+/// Extended SHM header version (opt-in).
+///
+/// Legacy/default writers use `SHM_VERSION` from `shm_protocol.json`.
+pub const SHM_VERSION_V2: u32 = SHM_VERSION + 1;
+/// Numeric protocol identity used only by extended SHM headers.
+pub const SHM_PROTOCOL_VERSION: u32 = 1;
+const SHM_PROTOCOL_VERSION_OFFSET: usize = GLOBAL_HEADER_SIZE;
+const HEADER_REGION_SIZE_V2: usize = HEADER_REGION_SIZE + 4;
+const SHM_PROTOCOL_MISMATCH_CODE: &str = "SHM_PROTOCOL_VERSION_MISMATCH";
+
 // =============================================================================
 // SHM ERROR
 // =============================================================================
@@ -97,21 +107,53 @@ impl VideoShm {
         }
 
         let version = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
-        if version != SHM_VERSION {
-            return Err(anyhow!(
-                "SHM version mismatch: expected {}, got {}",
-                SHM_VERSION,
-                version
-            ));
-        }
-
         let header_size = u32::from_le_bytes(mmap[12..16].try_into().unwrap());
-        if header_size != HEADER_REGION_SIZE as u32 {
-            return Err(anyhow!(
-                "SHM header_size mismatch: expected {}, got {}",
-                HEADER_REGION_SIZE,
-                header_size
-            ));
+
+        match version {
+            SHM_VERSION => {
+                if header_size != HEADER_REGION_SIZE as u32 {
+                    return Err(anyhow!(
+                        "SHM header_size mismatch: expected {}, got {}",
+                        HEADER_REGION_SIZE,
+                        header_size
+                    ));
+                }
+            }
+            SHM_VERSION_V2 => {
+                if header_size != HEADER_REGION_SIZE_V2 as u32 {
+                    return Err(anyhow!(
+                        "SHM v2 header_size mismatch: expected {}, got {}",
+                        HEADER_REGION_SIZE_V2,
+                        header_size
+                    ));
+                }
+                if mmap.len() < GLOBAL_HEADER_SIZE + 4 {
+                    return Err(anyhow!(
+                        "SHM v2 header too small for protocol_version field"
+                    ));
+                }
+                let found_protocol = u32::from_le_bytes(
+                    mmap[SHM_PROTOCOL_VERSION_OFFSET..SHM_PROTOCOL_VERSION_OFFSET + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                if found_protocol != SHM_PROTOCOL_VERSION {
+                    return Err(anyhow!(
+                        "{code}: expected={expected}, found={found}. Update Python worker/engine or disable SHM v2 mode.",
+                        code = SHM_PROTOCOL_MISMATCH_CODE,
+                        expected = SHM_PROTOCOL_VERSION,
+                        found = found_protocol
+                    ));
+                }
+            }
+            found => {
+                return Err(anyhow!(
+                    "SHM version mismatch: expected {} or {}, got {}",
+                    SHM_VERSION,
+                    SHM_VERSION_V2,
+                    found
+                ));
+            }
         }
 
         tracing::info!(shm_version = version, header_size, "SHM header validated");
@@ -356,6 +398,38 @@ mod tests {
         data
     }
 
+    #[allow(clippy::too_many_arguments)] // TODO(clippy): test helper keeps explicit header fields for readability.
+    fn make_shm_bytes_v2(
+        magic: &[u8; 8],
+        version: u32,
+        header_size: u32,
+        slot_count: u32,
+        width: u32,
+        height: u32,
+        scale: u32,
+        pixel_format: u32,
+        protocol_version: u32,
+    ) -> Vec<u8> {
+        let w = width as usize;
+        let h = height as usize;
+        let s = scale as usize;
+        let slot_in = w * h * 3;
+        let slot_out = (w * s) * (h * s) * 3;
+        let total = HEADER_REGION_SIZE_V2 + (slot_in + slot_out) * RING_SIZE;
+        let mut data = vec![0u8; total];
+
+        data[0..8].copy_from_slice(magic);
+        data[8..12].copy_from_slice(&version.to_le_bytes());
+        data[12..16].copy_from_slice(&header_size.to_le_bytes());
+        data[16..20].copy_from_slice(&slot_count.to_le_bytes());
+        data[20..24].copy_from_slice(&width.to_le_bytes());
+        data[24..28].copy_from_slice(&height.to_le_bytes());
+        data[28..32].copy_from_slice(&scale.to_le_bytes());
+        data[32..36].copy_from_slice(&pixel_format.to_le_bytes());
+        data[36..40].copy_from_slice(&protocol_version.to_le_bytes());
+        data
+    }
+
     fn write_temp_shm(name: &str, data: &[u8]) -> String {
         let path = format!("{}/{}", std::env::temp_dir().display(), name);
         let mut f = std::fs::File::create(&path).unwrap();
@@ -379,6 +453,75 @@ mod tests {
         let result = VideoShm::open(&path, 64, 64, 2);
         let _ = std::fs::remove_file(&path);
         assert!(result.is_ok(), "Valid header must open without error");
+    }
+
+    #[test]
+    fn shm_open_v1_header_still_works_without_protocol_version() {
+        let data = make_shm_bytes(
+            b"VFSHM001",
+            SHM_VERSION,
+            HEADER_REGION_SIZE as u32,
+            RING_SIZE as u32,
+            64,
+            64,
+            2,
+            PIXEL_FORMAT_RGB24,
+        );
+        let path = write_temp_shm("vf_test_v1_header.bin", &data);
+        let result = VideoShm::open(&path, 64, 64, 2);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_ok(),
+            "v1 header path must remain backward compatible"
+        );
+    }
+
+    #[test]
+    fn shm_open_v2_header_match_ok() {
+        let data = make_shm_bytes_v2(
+            b"VFSHM001",
+            SHM_VERSION_V2,
+            HEADER_REGION_SIZE_V2 as u32,
+            RING_SIZE as u32,
+            64,
+            64,
+            2,
+            PIXEL_FORMAT_RGB24,
+            SHM_PROTOCOL_VERSION,
+        );
+        let path = write_temp_shm("vf_test_v2_header_match.bin", &data);
+        let result = VideoShm::open(&path, 64, 64, 2);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_ok(),
+            "v2 header with matching protocol_version must open"
+        );
+    }
+
+    #[test]
+    fn shm_open_v2_header_mismatch_returns_clear_error() {
+        let data = make_shm_bytes_v2(
+            b"VFSHM001",
+            SHM_VERSION_V2,
+            HEADER_REGION_SIZE_V2 as u32,
+            RING_SIZE as u32,
+            64,
+            64,
+            2,
+            PIXEL_FORMAT_RGB24,
+            SHM_PROTOCOL_VERSION + 1,
+        );
+        let path = write_temp_shm("vf_test_v2_header_mismatch.bin", &data);
+        let result = VideoShm::open(&path, 64, 64, 2);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_err(),
+            "protocol mismatch must fail deterministically"
+        );
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("SHM_PROTOCOL_VERSION_MISMATCH"));
+        assert!(msg.contains("expected="));
+        assert!(msg.contains("found="));
     }
 
     #[test]
@@ -538,7 +681,7 @@ mod tests {
 
         let bad_version = make_shm_bytes(
             MAGIC,
-            SHM_VERSION + 1,
+            SHM_VERSION_V2 + 1,
             HEADER_REGION_SIZE as u32,
             RING_SIZE as u32,
             64,

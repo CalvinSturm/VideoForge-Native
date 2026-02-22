@@ -48,6 +48,8 @@ pub struct UpscaleJobConfig {
     pub zenoh_timeout_secs: u64,
     /// Internal opt-in only. Default false keeps behavior/output unchanged.
     pub enable_run_artifacts: bool,
+    /// Internal opt-in only. Default false keeps legacy SHM header layout.
+    pub use_shm_proto_v2: bool,
 }
 
 pub struct UpscaleJobReport {
@@ -159,6 +161,7 @@ fn build_create_shm_payload(
     height: usize,
     scale: usize,
     ring_size: usize,
+    shm_proto_v2: bool,
     event_in_name: Option<&str>,
     event_out_name: Option<&str>,
 ) -> serde_json::Value {
@@ -173,6 +176,9 @@ fn build_create_shm_payload(
     }
     if let Some(name) = event_out_name {
         payload["event_out_name"] = json!(name);
+    }
+    if shm_proto_v2 {
+        payload["shm_proto_v2"] = json!(true);
     }
     payload
 }
@@ -199,7 +205,10 @@ pub async fn run_upscale_job(
     } else {
         config.output_path.clone()
     };
-    let worker_caps = WorkerCaps::default();
+    let worker_caps = WorkerCaps {
+        use_shm_proto_v2: config.use_shm_proto_v2,
+        ..WorkerCaps::default()
+    };
     #[cfg(not(windows))]
     if worker_caps.use_events {
         tracing::warn!("--use-events is Windows-only; falling back to polling");
@@ -520,6 +529,7 @@ pub async fn run_upscale_job(
         process_h,
         scale_factor,
         shm::RING_SIZE,
+        worker_caps.use_shm_proto_v2,
         event_in_name.as_deref(),
         event_out_name.as_deref(),
     );
@@ -997,13 +1007,14 @@ mod tests {
 
     #[test]
     fn test_create_shm_payload_omits_event_names_when_absent() {
-        let v = build_create_shm_payload(1920, 1080, 2, 6, None, None);
+        let v = build_create_shm_payload(1920, 1080, 2, 6, false, None, None);
         assert_eq!(v["width"], 1920);
         assert_eq!(v["height"], 1080);
         assert_eq!(v["scale"], 2);
         assert_eq!(v["ring_size"], 6);
         assert!(v.get("event_in_name").is_none());
         assert!(v.get("event_out_name").is_none());
+        assert!(v.get("shm_proto_v2").is_none());
     }
 
     #[test]
@@ -1013,11 +1024,18 @@ mod tests {
             1080,
             2,
             6,
+            false,
             Some("vf_shm_abc_in_ready"),
             Some("vf_shm_abc_out_ready"),
         );
         assert_eq!(v["event_in_name"], "vf_shm_abc_in_ready");
         assert_eq!(v["event_out_name"], "vf_shm_abc_out_ready");
+    }
+
+    #[test]
+    fn test_create_shm_payload_includes_shm_proto_v2_when_enabled() {
+        let v = build_create_shm_payload(1920, 1080, 2, 6, true, None, None);
+        assert_eq!(v["shm_proto_v2"], true);
     }
 }
 
@@ -1059,6 +1077,7 @@ pub async fn upscale_request(
         research_config: research_state.inner().clone(),
         zenoh_timeout_secs: 60,
         enable_run_artifacts: false,
+        use_shm_proto_v2: false,
     };
 
     let report = run_upscale_job(job_config, progress).await?;

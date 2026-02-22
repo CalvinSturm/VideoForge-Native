@@ -177,7 +177,9 @@ class Config:
     SHM_VERSION = 2
     PIXEL_FORMAT_RGB24 = 1
     GLOBAL_HEADER_SIZE = 36
+    GLOBAL_HEADER_SIZE_V2 = 40
     SLOT_HEADER_SIZE = 16
+    SHM_PROTOCOL_VERSION = 1
 
     # Offsets
     STATE_FIELD_OFFSET = 8
@@ -576,6 +578,7 @@ class AIWorker:
         precision: str = "fp32",
         log_level: Optional[str] = None,
         use_typed_ipc: bool = False,
+        use_shm_proto_v2: bool = False,
         use_events: bool = False,
         prealloc_tensors: bool = False,
         deterministic: bool = False,
@@ -634,6 +637,7 @@ class AIWorker:
         # Parsed/plumbed only; not active yet.
         self.log_level = log_level
         self.use_typed_ipc = use_typed_ipc
+        self.use_shm_proto_v2 = use_shm_proto_v2
         self.use_events = use_events
         self.prealloc_tensors = prealloc_tensors
         self.deterministic_flag = deterministic
@@ -1307,7 +1311,7 @@ class AIWorker:
     def create_shm(self, payload: Dict) -> None:
         """Create shared memory ring buffer for video frame processing.
 
-        Layout (SHM_VERSION = 2):
+        Layout (default header = SHM_VERSION, optional extended header = SHM_VERSION+1):
             [ Global Header 36 bytes: magic|version|header_size|slot_count|W|H|S|fmt ]
             [ SlotHeader × ring_size (ring_size × 16 bytes) ]
             [ Slot 0: input (W×H×3) | output (sW×sH×3) ]
@@ -1318,14 +1322,17 @@ class AIWorker:
         height = payload["height"]
         self.active_scale = payload["scale"]
         self.ring_size = payload.get("ring_size", Config.RING_SIZE)
+        shm_proto_v2 = bool(payload.get("shm_proto_v2", self.use_shm_proto_v2))
 
         self.input_size = width * height * 3
         self.output_size = (width * self.active_scale) * (height * self.active_scale) * 3
         self.slot_byte_size = self.input_size + self.output_size
-        # header_region_size = global header + per-slot headers
-        self.header_region_size = (
-            Config.GLOBAL_HEADER_SIZE + Config.SLOT_HEADER_SIZE * self.ring_size
+        global_header_size = (
+            Config.GLOBAL_HEADER_SIZE_V2 if shm_proto_v2 else Config.GLOBAL_HEADER_SIZE
         )
+        shm_header_version = Config.SHM_VERSION + 1 if shm_proto_v2 else Config.SHM_VERSION
+        # header_region_size = global header + per-slot headers
+        self.header_region_size = global_header_size + Config.SLOT_HEADER_SIZE * self.ring_size
         total_size = self.header_region_size + self.slot_byte_size * self.ring_size
 
         if self.mmap:
@@ -1339,20 +1346,35 @@ class AIWorker:
             self.shm_file.seek(0)
             self.mmap = mmap.mmap(self.shm_file.fileno(), total_size)
 
-            # Write global header (36 bytes) at offset 0.
-            # Format: <8sIIIIIII  (little-endian: 8-byte magic + 7 × u32)
-            global_header = struct.pack(
-                "<8sIIIIIII",
-                Config.SHM_MAGIC,          # magic[8]
-                Config.SHM_VERSION,        # version u32
-                self.header_region_size,   # header_size u32
-                self.ring_size,            # slot_count u32
-                width,                     # width u32
-                height,                    # height u32
-                self.active_scale,         # scale u32
-                Config.PIXEL_FORMAT_RGB24, # pixel_format u32
-            )
-            self.mmap[0 : Config.GLOBAL_HEADER_SIZE] = global_header
+            # Write global header at offset 0.
+            # v1 format: <8sIIIIIII  (8-byte magic + 7 × u32)
+            # v2 format: <8sIIIIIIII (v1 + protocol_version u32)
+            if shm_proto_v2:
+                global_header = struct.pack(
+                    "<8sIIIIIIII",
+                    Config.SHM_MAGIC,            # magic[8]
+                    shm_header_version,          # version u32 (v2 opt-in)
+                    self.header_region_size,     # header_size u32
+                    self.ring_size,              # slot_count u32
+                    width,                       # width u32
+                    height,                      # height u32
+                    self.active_scale,           # scale u32
+                    Config.PIXEL_FORMAT_RGB24,   # pixel_format u32
+                    Config.SHM_PROTOCOL_VERSION, # protocol_version u32
+                )
+            else:
+                global_header = struct.pack(
+                    "<8sIIIIIII",
+                    Config.SHM_MAGIC,          # magic[8]
+                    shm_header_version,        # version u32 (legacy/default)
+                    self.header_region_size,   # header_size u32
+                    self.ring_size,            # slot_count u32
+                    width,                     # width u32
+                    height,                    # height u32
+                    self.active_scale,         # scale u32
+                    Config.PIXEL_FORMAT_RGB24, # pixel_format u32
+                )
+            self.mmap[0:global_header_size] = global_header
 
             self.input_shape = (height, width, 3)
             self.output_shape = (
@@ -1374,10 +1396,10 @@ class AIWorker:
             self._setup_event_sync(payload)
             log.info(
                 f"SHM created: {total_size} bytes "
-                f"(global_header={Config.GLOBAL_HEADER_SIZE}, "
+                f"(global_header={global_header_size}, "
                 f"header_region={self.header_region_size}, "
                 f"{self.ring_size} slots x {self.slot_byte_size}), "
-                f"magic=VFSHM001 version={Config.SHM_VERSION}"
+                f"magic=VFSHM001 version={shm_header_version}"
             )
             self.send_status("SHM_CREATED", {"shm_path": self.shm_path})
         except Exception as e:
@@ -1970,6 +1992,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Logger verbosity for stderr output (default: info)"
     )
     parser.add_argument("--use-typed-ipc", action="store_true", help="Parsed only (plumbing)")
+    parser.add_argument("--shm-proto-v2", action="store_true", help="Use opt-in SHM extended header with protocol_version")
     parser.add_argument("--use-events", action="store_true", help="Use Win32 named-event SHM sync hints (Windows only)")
     parser.add_argument("--prealloc-tensors", action="store_true", help="Parsed only (plumbing)")
     parser.add_argument("--deterministic", action="store_true", help="Parsed only (plumbing)")
@@ -2002,6 +2025,7 @@ def run_worker(args: argparse.Namespace) -> int:
         precision=args.precision,
         log_level=args.log_level,
         use_typed_ipc=args.use_typed_ipc,
+        use_shm_proto_v2=args.shm_proto_v2,
         use_events=args.use_events,
         prealloc_tensors=args.prealloc_tensors,
         deterministic=args.deterministic,

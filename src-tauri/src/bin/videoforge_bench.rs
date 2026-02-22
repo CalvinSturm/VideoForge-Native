@@ -122,6 +122,7 @@ async fn main() {
         research_config: Arc::new(TokioMutex::new(ResearchConfig::default())),
         zenoh_timeout_secs: 60,
         enable_run_artifacts: false,
+        use_shm_proto_v2: false,
     };
 
     match run_upscale_job(job, progress).await {

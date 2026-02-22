@@ -17,6 +17,7 @@ pub struct WorkerCapsSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_level: Option<String>,
     pub use_typed_ipc: bool,
+    pub use_shm_proto_v2: bool,
     pub use_events: bool,
     pub prealloc_tensors: bool,
     pub deterministic: bool,
@@ -27,6 +28,7 @@ impl From<&WorkerCaps> for WorkerCapsSnapshot {
         Self {
             log_level: value.log_level.clone(),
             use_typed_ipc: value.use_typed_ipc,
+            use_shm_proto_v2: value.use_shm_proto_v2,
             use_events: value.use_events,
             prealloc_tensors: value.prealloc_tensors,
             deterministic: value.deterministic,

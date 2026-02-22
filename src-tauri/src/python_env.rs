@@ -34,6 +34,7 @@ pub struct BaseWorkerArgs<'a> {
 pub struct WorkerCaps {
     pub log_level: Option<String>,
     pub use_typed_ipc: bool,
+    pub use_shm_proto_v2: bool,
     pub use_events: bool,
     pub prealloc_tensors: bool,
     pub deterministic: bool,
@@ -58,6 +59,9 @@ pub fn build_worker_argv(base: &BaseWorkerArgs<'_>, caps: &WorkerCaps) -> Vec<St
     }
     if caps.use_typed_ipc {
         argv.push("--use-typed-ipc".to_string());
+    }
+    if caps.use_shm_proto_v2 {
+        argv.push("--shm-proto-v2".to_string());
     }
     if caps.use_events {
         argv.push("--use-events".to_string());
@@ -220,5 +224,22 @@ mod tests {
         ];
 
         assert_eq!(argv, expected);
+    }
+
+    #[test]
+    fn shm_proto_v2_flag_is_opt_in() {
+        let base = BaseWorkerArgs {
+            script_path: "python/shm_worker.py",
+            port: 7447,
+            parent_pid: 12345,
+            precision: "fp16",
+        };
+        let caps = WorkerCaps {
+            use_shm_proto_v2: true,
+            ..WorkerCaps::default()
+        };
+
+        let argv = build_worker_argv(&base, &caps);
+        assert!(argv.iter().any(|a| a == "--shm-proto-v2"));
     }
 }
