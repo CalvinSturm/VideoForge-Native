@@ -677,4 +677,278 @@ mod tests {
             .iter()
             .all(|s| SlotState::from_u32(s.as_u32()).is_some()));
     }
+
+    #[derive(Debug, Clone, Copy)]
+    struct SimConfig {
+        total_frames: u32,
+        ring_size: usize,
+        step_cap: usize,
+        drop_per_1000: u16,
+        spurious_per_1000: u16,
+        poll_fallback_ticks: u8,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct XorShift64 {
+        state: u64,
+    }
+
+    impl XorShift64 {
+        fn seeded(seed: u64) -> Self {
+            // xorshift requires non-zero state.
+            let state = if seed == 0 {
+                0x9E37_79B9_7F4A_7C15
+            } else {
+                seed
+            };
+            Self { state }
+        }
+
+        fn next_u32(&mut self) -> u32 {
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.state = x;
+            (x >> 32) as u32
+        }
+
+        fn chance_per_1000(&mut self, per_1000: u16) -> bool {
+            (self.next_u32() % 1000) < per_1000 as u32
+        }
+
+        fn choose_role(&mut self) -> u8 {
+            (self.next_u32() % 3) as u8
+        }
+    }
+
+    #[derive(Debug)]
+    struct EventHintSim {
+        cfg: SimConfig,
+        rng: XorShift64,
+        slots: Vec<SlotState>,
+        slot_frame_index: Vec<u32>,
+        slot_last_assigned: Vec<u32>,
+        completed_seen: Vec<bool>,
+        produced: u32,
+        completed: u32,
+        steps: usize,
+        input_ready_hint: bool,
+        output_ready_hint: bool,
+        ai_hintless_ticks: u8,
+        enc_hintless_ticks: u8,
+    }
+
+    impl EventHintSim {
+        fn new(cfg: SimConfig, seed: u64) -> Self {
+            assert!(cfg.ring_size > 0 && cfg.ring_size <= RING_SIZE);
+            assert!(cfg.total_frames > 0);
+            assert!(cfg.poll_fallback_ticks > 0);
+            Self {
+                cfg,
+                rng: XorShift64::seeded(seed),
+                slots: vec![SlotState::Empty; cfg.ring_size],
+                slot_frame_index: vec![0; cfg.ring_size],
+                slot_last_assigned: vec![0; cfg.ring_size],
+                completed_seen: vec![false; cfg.total_frames as usize + 1],
+                produced: 0,
+                completed: 0,
+                steps: 0,
+                input_ready_hint: false,
+                output_ready_hint: false,
+                ai_hintless_ticks: 0,
+                enc_hintless_ticks: 0,
+            }
+        }
+
+        fn run_to_completion(&mut self) {
+            while self.completed < self.cfg.total_frames && self.steps < self.cfg.step_cap {
+                self.steps += 1;
+
+                if self.rng.chance_per_1000(self.cfg.spurious_per_1000) {
+                    self.input_ready_hint = true;
+                }
+                if self.rng.chance_per_1000(self.cfg.spurious_per_1000) {
+                    self.output_ready_hint = true;
+                }
+
+                match self.rng.choose_role() {
+                    0 => self.producer_step(),
+                    1 => self.ai_step(),
+                    _ => self.encoder_step(),
+                }
+            }
+        }
+
+        fn producer_step(&mut self) {
+            if self.produced >= self.cfg.total_frames {
+                return;
+            }
+            let Some(slot_idx) = self.slots.iter().position(|s| *s == SlotState::Empty) else {
+                return;
+            };
+
+            apply_transition(&mut self.slots[slot_idx], SlotState::RustWriting)
+                .expect("producer EMPTY -> RUST_WRITING must be valid");
+
+            let frame_idx = self.produced + 1;
+            assert!(
+                frame_idx > self.slot_last_assigned[slot_idx],
+                "frame index must be strictly monotonic per slot"
+            );
+            self.slot_last_assigned[slot_idx] = frame_idx;
+            self.slot_frame_index[slot_idx] = frame_idx;
+            self.produced += 1;
+
+            apply_transition(&mut self.slots[slot_idx], SlotState::ReadyForAi)
+                .expect("producer RUST_WRITING -> READY_FOR_AI must be valid");
+
+            // Event hints are unreliable: signals can be dropped.
+            if !self.rng.chance_per_1000(self.cfg.drop_per_1000) {
+                self.input_ready_hint = true;
+            }
+        }
+
+        fn ai_step(&mut self) {
+            let should_scan = if self.input_ready_hint {
+                self.input_ready_hint = false;
+                self.ai_hintless_ticks = 0;
+                true
+            } else {
+                self.ai_hintless_ticks = self.ai_hintless_ticks.saturating_add(1);
+                if self.ai_hintless_ticks >= self.cfg.poll_fallback_ticks {
+                    self.ai_hintless_ticks = 0;
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if !should_scan {
+                return;
+            }
+
+            let Some(slot_idx) = self.slots.iter().position(|s| *s == SlotState::ReadyForAi) else {
+                return;
+            };
+
+            apply_transition(&mut self.slots[slot_idx], SlotState::AiProcessing)
+                .expect("ai READY_FOR_AI -> AI_PROCESSING must be valid");
+            apply_transition(&mut self.slots[slot_idx], SlotState::ReadyForEncode)
+                .expect("ai AI_PROCESSING -> READY_FOR_ENCODE must be valid");
+
+            if !self.rng.chance_per_1000(self.cfg.drop_per_1000) {
+                self.output_ready_hint = true;
+            }
+        }
+
+        fn encoder_step(&mut self) {
+            let should_scan = if self.output_ready_hint {
+                self.output_ready_hint = false;
+                self.enc_hintless_ticks = 0;
+                true
+            } else {
+                self.enc_hintless_ticks = self.enc_hintless_ticks.saturating_add(1);
+                if self.enc_hintless_ticks >= self.cfg.poll_fallback_ticks {
+                    self.enc_hintless_ticks = 0;
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if !should_scan {
+                return;
+            }
+
+            let Some(slot_idx) = self
+                .slots
+                .iter()
+                .position(|s| *s == SlotState::ReadyForEncode)
+            else {
+                return;
+            };
+
+            apply_transition(&mut self.slots[slot_idx], SlotState::Encoding)
+                .expect("encoder READY_FOR_ENCODE -> ENCODING must be valid");
+
+            let frame_idx = self.slot_frame_index[slot_idx];
+            assert!(frame_idx >= 1 && frame_idx <= self.cfg.total_frames);
+            let seen = &mut self.completed_seen[frame_idx as usize];
+            assert!(!*seen, "frame must not be completed more than once");
+            *seen = true;
+            self.completed += 1;
+
+            apply_transition(&mut self.slots[slot_idx], SlotState::Empty)
+                .expect("encoder ENCODING -> EMPTY must be valid");
+            self.slot_frame_index[slot_idx] = 0;
+        }
+
+        fn assert_invariants(&self) {
+            assert_eq!(
+                self.completed, self.cfg.total_frames,
+                "all frames must complete (no deadlock)"
+            );
+            assert!(
+                self.steps < self.cfg.step_cap,
+                "simulation must terminate within bounded step cap"
+            );
+            assert_eq!(
+                self.produced, self.cfg.total_frames,
+                "producer must submit all frames exactly once"
+            );
+            for frame_idx in 1..=self.cfg.total_frames as usize {
+                assert!(
+                    self.completed_seen[frame_idx],
+                    "frame {} was never completed",
+                    frame_idx
+                );
+            }
+            assert!(
+                self.slots.iter().all(|s| *s == SlotState::Empty),
+                "all slots should be EMPTY at completion"
+            );
+            assert!(
+                self.slots
+                    .iter()
+                    .all(|s| SlotState::from_u32(s.as_u32()).is_some()),
+                "all slots must remain in known FSM states"
+            );
+        }
+    }
+
+    fn run_event_hint_sim(drop_per_1000: u16, spurious_per_1000: u16) {
+        let cfg = SimConfig {
+            total_frames: 200,
+            ring_size: RING_SIZE,
+            step_cap: 200_000,
+            drop_per_1000,
+            spurious_per_1000,
+            poll_fallback_ticks: 3,
+        };
+
+        let mut sim = EventHintSim::new(cfg, 0x00C0_FFEE_u64);
+        sim.run_to_completion();
+        sim.assert_invariants();
+    }
+
+    #[test]
+    fn event_hint_sim_completes_with_no_drops() {
+        run_event_hint_sim(0, 0);
+    }
+
+    #[test]
+    fn event_hint_sim_completes_with_drops() {
+        run_event_hint_sim(200, 0);
+    }
+
+    #[test]
+    fn event_hint_sim_completes_with_spurious_signals() {
+        run_event_hint_sim(0, 100);
+    }
+
+    #[test]
+    fn event_hint_sim_completes_with_drops_and_spurious() {
+        run_event_hint_sim(200, 100);
+    }
 }
