@@ -19,6 +19,7 @@ import json
 import logging
 import mmap
 import os
+import random
 import struct
 import sys
 import tempfile
@@ -80,6 +81,31 @@ def configure_precision(mode: str = "fp32") -> None:
         torch.use_deterministic_algorithms(False)
         tag = "FP16 (autocast)" if mode == "fp16" else "FP32"
         log.info(f"Precision: {tag} (TF32=on, cuDNN_deterministic=on)")
+
+
+def enforce_deterministic_mode(log: logging.Logger, enabled: bool) -> None:
+    """Apply deterministic guardrails when explicitly requested."""
+    if not enabled:
+        return
+
+    random.seed(0)
+    np.random.seed(0)
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    if hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = False
+    torch.use_deterministic_algorithms(True)
+
+    log.info(
+        "deterministic mode enabled: seed=0 cudnn_deterministic=True "
+        "cudnn_benchmark=False tf32=False batch_size=1"
+    )
 
 
 # Apply safe defaults immediately (overridden by configure_precision() at startup)
@@ -446,6 +472,83 @@ def inference_batch(
     return results
 
 
+class PreallocBuffers:
+    """Reusable input/output tensors for per-frame inference.
+
+    Keeps one input tensor [1,3,H,W] and one output tensor [1,3,H*s,W*s].
+    Reallocates only when shape/dtype/device changes.
+    """
+
+    def __init__(self, logger: logging.Logger):
+        self.log = logger
+        self.input_gpu: Optional[torch.Tensor] = None
+        self.output_gpu: Optional[torch.Tensor] = None
+        self._h: Optional[int] = None
+        self._w: Optional[int] = None
+        self._scale: Optional[int] = None
+        self._dtype: Optional[torch.dtype] = None
+        self._device: Optional[torch.device] = None
+
+    def ensure(self, h: int, w: int, scale: int, dtype: torch.dtype, device: torch.device) -> None:
+        need_alloc = (
+            self.input_gpu is None
+            or self.output_gpu is None
+            or self._h != h
+            or self._w != w
+            or self._scale != scale
+            or self._dtype != dtype
+            or self._device != device
+        )
+        if not need_alloc:
+            return
+
+        had_buffers = self.input_gpu is not None and self.output_gpu is not None
+        self.input_gpu = torch.empty((1, 3, h, w), dtype=dtype, device=device)
+        self.output_gpu = torch.empty((1, 3, h * scale, w * scale), dtype=dtype, device=device)
+        self._h = h
+        self._w = w
+        self._scale = scale
+        self._dtype = dtype
+        self._device = device
+
+        msg = (
+            f"prealloc enabled: allocating input [1,3,{h},{w}] "
+            f"output [1,3,{h * scale},{w * scale}] dtype={dtype} device={device}"
+        )
+        if had_buffers:
+            self.log.warning(msg)
+        else:
+            self.log.info(msg)
+
+    def copy_in_from_cpu(self, cpu_tensor_or_numpy) -> torch.Tensor:
+        if self.input_gpu is None:
+            raise RuntimeError("PreallocBuffers.ensure() must be called before copy_in_from_cpu()")
+
+        if isinstance(cpu_tensor_or_numpy, np.ndarray):
+            arr = cpu_tensor_or_numpy.astype(np.float32) / 255.0
+            cpu = torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0)
+        else:
+            cpu = cpu_tensor_or_numpy
+
+        src = cpu.to(device=self.input_gpu.device, dtype=self.input_gpu.dtype, non_blocking=True)
+        self.input_gpu.copy_(src)
+        return self.input_gpu
+
+    def get_output(self) -> torch.Tensor:
+        if self.output_gpu is None:
+            raise RuntimeError("PreallocBuffers.ensure() must be called before get_output()")
+        return self.output_gpu
+
+    def clear(self) -> None:
+        self.input_gpu = None
+        self.output_gpu = None
+        self._h = None
+        self._w = None
+        self._scale = None
+        self._dtype = None
+        self._device = None
+
+
 # =============================================================================
 # WORKER CLASS
 # =============================================================================
@@ -518,6 +621,9 @@ class AIWorker:
         self.use_events = use_events
         self.prealloc_tensors = prealloc_tensors
         self.deterministic_flag = deterministic
+        self.tensor_pool: Optional[PreallocBuffers] = (
+            PreallocBuffers(log) if self.prealloc_tensors else None
+        )
         self.model_loader = ModelLoader(precision=precision)
         self.model: Optional[torch.nn.Module] = None
         self.model_scale: int = 4
@@ -558,6 +664,8 @@ class AIWorker:
 
     def cleanup(self) -> None:
         log.info("Cleanup...")
+        if self.tensor_pool is not None:
+            self.tensor_pool.clear()
         if self.mmap:
             try:
                 self.mmap.close()
@@ -1213,6 +1321,49 @@ class AIWorker:
     # CORE FRAME PROCESSING (shared by Zenoh fallback and polling loop)
     # -------------------------------------------------------------------------
 
+    def _inference_prealloc(self, img_rgb: np.ndarray) -> np.ndarray:
+        """Inference path using reusable input/output tensors.
+
+        Mirrors inference() semantics while avoiding per-frame CUDA tensor allocation.
+        """
+        if self.tensor_pool is None:
+            raise RuntimeError("Tensor pool unavailable")
+
+        use_fp16 = (_PRECISION_MODE == "fp16") or self.use_half
+        dtype = torch.float16 if use_fp16 else torch.float32
+        h, w = img_rgb.shape[:2]
+        self.tensor_pool.ensure(h, w, self.active_scale, dtype, self.device)
+        tensor = self.tensor_pool.copy_in_from_cpu(img_rgb)
+
+        if self.adapter is not None:
+            if use_fp16 and self.device.type == "cuda":
+                with torch.autocast("cuda", dtype=torch.float16):
+                    output = self.adapter.forward(tensor)
+            else:
+                output = self.adapter.forward(tensor)
+        else:
+            with torch.no_grad():
+                if use_fp16 and self.device.type == "cuda":
+                    with torch.autocast("cuda", dtype=torch.float16):
+                        output = self.model(tensor)
+                else:
+                    output = self.model(tensor)
+
+        out_buf = self.tensor_pool.get_output()
+        if out_buf.shape != output.shape:
+            # Some models may emit dynamic shapes (e.g. adapter crop/resize paths).
+            # Rebuild output buffer only when shape changes.
+            self.tensor_pool.output_gpu = torch.empty_like(output)
+            out_buf = self.tensor_pool.output_gpu
+            log.warning(
+                f"prealloc enabled: output shape changed to {tuple(output.shape)}; reallocating output buffer"
+            )
+        out_buf.copy_(output)
+
+        out_cpu = out_buf.squeeze(0).float().cpu().clamp_(0, 1).numpy()
+        out_cpu = out_cpu.transpose(1, 2, 0)
+        return (out_cpu * 255.0).round().astype(np.uint8)
+
     def _process_slot(self, slot_idx: int, research_params: Optional[Dict] = None) -> None:
         """
         Process a single video frame from shared memory slot.
@@ -1248,16 +1399,25 @@ class AIWorker:
         else:
             img_for_model = img_input  # Already RGB
 
-        # UNIFIED INFERENCE CALL
+        # Per-frame allocations in the default path:
+        # 1) np.copy() for SHM input view
+        # 2) CPU float32 normalization tensor
+        # 3) GPU input tensor via .to(device=...)
+        # 4) model output tensor on GPU
+        # 5) CPU output tensor via .cpu().numpy()
+        # Prealloc mode keeps behavior but reuses (3) and a reusable output buffer.
         with suppress_stdout():
-            out_from_model = inference(
-                self.model,
-                img_for_model,
-                self.device,
-                half=self.use_half,
-                adapter=self.adapter,
-                pinned_input=self._pinned_input,
-            )
+            if self.prealloc_tensors and self.tensor_pool is not None:
+                out_from_model = self._inference_prealloc(img_for_model)
+            else:
+                out_from_model = inference(
+                    self.model,
+                    img_for_model,
+                    self.device,
+                    half=self.use_half,
+                    adapter=self.adapter,
+                    pinned_input=self._pinned_input,
+                )
 
         # Convert output back to RGB for Rust
         if not self.expects_rgb:
@@ -1695,6 +1855,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_worker(args: argparse.Namespace) -> int:
     setup_logging(args.log_level)
+    if args.deterministic and args.precision != "deterministic":
+        log.warning(
+            "deterministic flag enabled; overriding precision to 'deterministic' for stable execution"
+        )
+        args.precision = "deterministic"
+
+    enforce_deterministic_mode(log, args.deterministic)
     try:
         _require_zenoh()
     except RuntimeError as e:
