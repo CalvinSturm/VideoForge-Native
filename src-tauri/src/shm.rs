@@ -585,6 +585,52 @@ mod tests {
     }
 
     #[test]
+    fn shm_protocol_schema_and_ring_metadata_are_valid() {
+        let raw = include_str!("../../ipc/shm_protocol.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw).expect("protocol json should parse");
+
+        assert_eq!(
+            parsed["schema_version"].as_str(),
+            Some("videoforge.shm_protocol.v1")
+        );
+
+        let ring_size_default = parsed["ring_size_default"]
+            .as_u64()
+            .expect("ring_size_default must exist");
+        let ring_size_max = parsed["ring_size_max"]
+            .as_u64()
+            .expect("ring_size_max must exist");
+
+        assert_eq!(ring_size_default, 6);
+        assert!(
+            ring_size_max >= ring_size_default,
+            "ring_size_max must be >= ring_size_default"
+        );
+    }
+
+    #[test]
+    fn effective_ring_size_remains_unchanged_with_schema_metadata() {
+        let raw = include_str!("../../ipc/shm_protocol.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw).expect("protocol json should parse");
+
+        let ring_size = parsed["ring_size"].as_u64().expect("ring_size must exist") as usize;
+        let ring_size_default = parsed["ring_size_default"]
+            .as_u64()
+            .expect("ring_size_default must exist") as usize;
+
+        assert_eq!(ring_size, RING_SIZE);
+        assert_eq!(
+            ring_size_default, RING_SIZE,
+            "default ring metadata must not change effective ring size"
+        );
+        // Header layout must continue to use the effective ring size constant.
+        assert_eq!(SLOT_HEADER_REGION, SLOT_HEADER_SIZE * RING_SIZE);
+        assert_eq!(HEADER_REGION_SIZE, GLOBAL_HEADER_SIZE + SLOT_HEADER_REGION);
+    }
+
+    #[test]
     fn slot_fsm_allows_expected_transitions() {
         let mut slot = SlotState::Empty;
         apply_transition(&mut slot, SlotState::RustWriting).expect("EMPTY -> RUST_WRITING");

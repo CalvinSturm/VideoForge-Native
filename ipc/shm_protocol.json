@@ -1,0 +1,25 @@
+{
+  "_comment": "VideoForge Shared Memory Protocol Constants - Single Source of Truth",
+  "schema_version": "videoforge.shm_protocol.v1",
+  "ring_size": 6,
+  "ring_size_default": 6,
+  "ring_size_max": 8,
+  "magic": "VFSHM001",
+  "version": 2,
+  "pixel_format_rgb24": 1,
+  "global_header_size": 36,
+  "slot_header_size": 16,
+  "slot_states": {
+    "EMPTY": 0,
+    "RUST_WRITING": 1,
+    "READY_FOR_AI": 2,
+    "AI_PROCESSING": 3,
+    "READY_FOR_ENCODE": 4,
+    "ENCODING": 5
+  },
+  "offsets": {
+    "state": 8,
+    "frame_bytes": 12,
+    "write_index": 0
+  }
+}

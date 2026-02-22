@@ -210,14 +210,24 @@ class Config:
             
             with open(protocol_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            
-            cls.RING_SIZE = data["ring_size"]
-            cls.SHM_MAGIC = data["magic"].encode("utf-8")
-            cls.SHM_VERSION = data["version"]
-            cls.PIXEL_FORMAT_RGB24 = data["pixel_format_rgb24"]
-            cls.GLOBAL_HEADER_SIZE = data["global_header_size"]
-            cls.SLOT_HEADER_SIZE = data["slot_header_size"]
-            
+
+            schema_version = data.get("schema_version")
+            if schema_version is not None:
+                log.debug(f"SHM protocol schema_version={schema_version}")
+            ring_size_default = data.get("ring_size_default")
+            ring_size_max = data.get("ring_size_max")
+            if ring_size_default is not None or ring_size_max is not None:
+                log.debug(
+                    f"SHM ring metadata default={ring_size_default} max={ring_size_max}"
+                )
+
+            cls.RING_SIZE = data.get("ring_size", cls.RING_SIZE)
+            cls.SHM_MAGIC = data.get("magic", cls.SHM_MAGIC.decode("utf-8")).encode("utf-8")
+            cls.SHM_VERSION = data.get("version", cls.SHM_VERSION)
+            cls.PIXEL_FORMAT_RGB24 = data.get("pixel_format_rgb24", cls.PIXEL_FORMAT_RGB24)
+            cls.GLOBAL_HEADER_SIZE = data.get("global_header_size", cls.GLOBAL_HEADER_SIZE)
+            cls.SLOT_HEADER_SIZE = data.get("slot_header_size", cls.SLOT_HEADER_SIZE)
+
             states = data.get("slot_states", {})
             cls.SLOT_EMPTY = states.get("EMPTY", 0)
             cls.SLOT_RUST_WRITING = states.get("RUST_WRITING", 1)
@@ -229,6 +239,7 @@ class Config:
             offsets = data.get("offsets", {})
             cls.STATE_FIELD_OFFSET = offsets.get("state", 8)
             cls.FRAME_BYTES_FIELD_OFFSET = offsets.get("frame_bytes", 12)
+            cls.WRITE_INDEX_OFFSET = offsets.get("write_index", 0)
             
             log.info(f"Loaded SHM protocol from {protocol_path}")
             
