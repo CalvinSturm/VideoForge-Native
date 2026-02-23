@@ -83,6 +83,11 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Check src-tauri with native_engine (GPU lane)
+        shell: pwsh
+        run: |
+          cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --features native_engine
+
       - name: Verify GPU fixture configuration
         shell: pwsh
         run: |
