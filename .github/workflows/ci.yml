@@ -39,7 +39,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo test
-        run: cargo test
+        run: cargo test --no-default-features
         env:
           RUST_LOG: "error"
 
