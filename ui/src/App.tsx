@@ -43,6 +43,13 @@ interface RaveCommandJson {
   [key: string]: unknown;
 }
 
+interface RaveErrorPayload {
+  category?: string;
+  message?: string;
+  detail?: string;
+  next_action?: string;
+}
+
 // Fallback model list when engine discovery fails
 const DEFAULT_MODELS = ["RCAN_x4", "EDSR_x4", "RealESRGAN_x4plus"];
 
@@ -365,6 +372,58 @@ const App: React.FC = () => {
     color: editState.color
   });
 
+  const hintForCategory = (category: string): string | undefined => {
+    switch (category) {
+      case "policy_violation":
+        return "Enable strict-profile requirements (audit/no-host-copies) or switch profile.";
+      case "provider_loader_error":
+        return "Check CUDA/driver/ORT/TensorRT provider installation and loader paths.";
+      case "runtime_dependency_missing":
+        return "Install missing runtime dependency and rerun.";
+      case "input_contract_error":
+        return "Fix input/CLI contract values (for example keep max_batch at 1).";
+      default:
+        return undefined;
+    }
+  };
+
+  const buildCategorizedError = (category: string, message: string): { category: string; message: string; detail?: string; nextAction?: string } => {
+    const hint = hintForCategory(category);
+    return hint ? { category, message, nextAction: hint } : { category, message };
+  };
+
+  const parseRaveError = (err: unknown): { category: string; message: string; detail?: string; nextAction?: string } => {
+    const raw = String(err);
+    try {
+      const payload = JSON.parse(raw) as RaveErrorPayload;
+      if (payload && typeof payload === "object" && payload.category && payload.message) {
+        return {
+          category: payload.category,
+          message: payload.message,
+          ...(payload.detail !== undefined ? { detail: payload.detail } : {})
+          , ...(payload.next_action !== undefined ? { nextAction: payload.next_action } : {})
+        };
+      }
+    } catch {
+      // fall back to heuristic classification below
+    }
+
+    const lower = raw.toLowerCase();
+    if (lower.includes("strict no-host-copies") || lower.includes("host copy audit")) {
+      return buildCategorizedError("policy_violation", raw);
+    }
+    if (lower.includes("provider") || lower.includes("onnxruntime") || lower.includes("tensorrt")) {
+      return buildCategorizedError("provider_loader_error", raw);
+    }
+    if (lower.includes("missing") || lower.includes("not found")) {
+      return buildCategorizedError("runtime_dependency_missing", raw);
+    }
+    if (lower.includes("max_batch")) {
+      return buildCategorizedError("input_contract_error", raw);
+    }
+    return buildCategorizedError("runtime_error", raw);
+  };
+
   const defaultRaveOutputPath = (input: string) => {
     const ext = input.split('.').pop()?.toLowerCase();
     if (ext) return input.replace(new RegExp(`\\.${ext}$`), `_rave_upscaled.mp4`);
@@ -510,9 +569,19 @@ const App: React.FC = () => {
       setActiveJob(finishedJob);
       setLastOutputPath(resultPath);
     } catch (err) {
-      addToast(`Error: ${err}`, "error");
-      setLogs(prev => [...prev, `[ERROR] Job ${jobId} failed: ${err}`]);
-      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'error', statusMessage: String(err), completedAt: Date.now() } : j));
+      const normalized = parseRaveError(err);
+      const msg = `[${normalized.category}] ${normalized.message}`;
+      addToast(`Error: ${msg}`, "error");
+      setLogs(prev => [...prev, `[ERROR][RAVE][${normalized.category}] Job ${jobId} failed: ${normalized.message}`]);
+      setJobs(prev => prev.map(j => j.id === jobId ? {
+        ...j,
+        status: 'error',
+        statusMessage: msg,
+        errorCategory: normalized.category,
+        ...(normalized.nextAction ? { errorHint: normalized.nextAction } : {}),
+        errorMessage: normalized.detail ? `${normalized.message} :: ${normalized.detail}` : normalized.message,
+        completedAt: Date.now()
+      } : j));
     } finally { setIsProcessing(false); }
   };
 
@@ -532,9 +601,19 @@ const App: React.FC = () => {
       setActiveJob(finishedJob);
       setLastOutputPath(resultPath);
     } catch (err) {
-      addToast(`Error: ${err}`, "error");
-      setLogs(prev => [...prev, `[ERROR] Export ${jobId} failed: ${err}`]);
-      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'error', statusMessage: String(err), completedAt: Date.now() } : j));
+      const normalized = parseRaveError(err);
+      const msg = `[${normalized.category}] ${normalized.message}`;
+      addToast(`Error: ${msg}`, "error");
+      setLogs(prev => [...prev, `[ERROR][${normalized.category}] Export ${jobId} failed: ${normalized.message}`]);
+      setJobs(prev => prev.map(j => j.id === jobId ? {
+        ...j,
+        status: 'error',
+        statusMessage: msg,
+        errorCategory: normalized.category,
+        ...(normalized.nextAction ? { errorHint: normalized.nextAction } : {}),
+        errorMessage: normalized.detail ? `${normalized.message} :: ${normalized.detail}` : normalized.message,
+        completedAt: Date.now()
+      } : j));
     } finally { setIsProcessing(false); }
   };
 
@@ -589,15 +668,18 @@ const App: React.FC = () => {
       ]);
       addToast(skipped ? "Validate completed (skipped)" : "Validate passed", skipped ? "warning" : "success");
     } catch (err) {
+      const normalized = parseRaveError(err);
       setJobs(prev => prev.map(j => j.id === jobId ? {
         ...j,
         status: "error",
-        statusMessage: String(err),
-        errorMessage: String(err),
+        statusMessage: `[${normalized.category}] ${normalized.message}`,
+        errorCategory: normalized.category,
+        ...(normalized.nextAction ? { errorHint: normalized.nextAction } : {}),
+        errorMessage: normalized.detail ? `${normalized.message} :: ${normalized.detail}` : normalized.message,
         completedAt: Date.now()
       } : j));
-      setLogs(prev => [...prev, `[RAVE] validate failed: ${err}`]);
-      addToast(`Validate failed: ${err}`, "error");
+      setLogs(prev => [...prev, `[RAVE][${normalized.category}] validate failed: ${normalized.message}`]);
+      addToast(`Validate failed: [${normalized.category}] ${normalized.message}`, "error");
     } finally {
       setIsProcessing(false);
     }
@@ -638,8 +720,18 @@ const App: React.FC = () => {
       setPreviewFile(resultPath); addToast("Preview Ready", "success");
       setRenderedRange({ start, end }); // Set specific sample range
     } catch (e) {
-      addToast("Preview Failed: " + e, "error");
-      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'error', errorMessage: String(e), completedAt: Date.now() } : j));
+      const normalized = parseRaveError(e);
+      addToast(`Preview Failed: [${normalized.category}] ${normalized.message}`, "error");
+      setLogs(prev => [...prev, `[ERROR][${normalized.category}] Preview ${jobId} failed: ${normalized.message}`]);
+      setJobs(prev => prev.map(j => j.id === jobId ? {
+        ...j,
+        status: 'error',
+        statusMessage: `[${normalized.category}] ${normalized.message}`,
+        errorCategory: normalized.category,
+        ...(normalized.nextAction ? { errorHint: normalized.nextAction } : {}),
+        errorMessage: normalized.detail ? `${normalized.message} :: ${normalized.detail}` : normalized.message,
+        completedAt: Date.now()
+      } : j));
     } finally { setIsProcessing(false); }
   };
 

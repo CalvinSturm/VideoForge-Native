@@ -7,6 +7,7 @@ Scope: Productionize `rave-*` integration in VideoForge with strict-policy guara
 ## References
 
 - `docs/WINDOWS_RAVE_RUNTIME.md` — Windows-first runtime setup, profile controls, and troubleshooting.
+- `docs/CI_GPU_STABILIZATION_CHECKLIST.md` — GPU CI calibration, threshold rollout, and release signoff checklist.
 
 ## Goals
 

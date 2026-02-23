@@ -76,7 +76,7 @@ export const LogsPanel: React.FC<LogsPanelProps> = ({ logs, logsEndRef, setLogs 
   useEffect(() => {
     if (logs.length > 0) {
       const lastLog = logs[logs.length - 1];
-      if (lastLog.includes("[ERROR]")) {
+      if (lastLog?.includes("[ERROR]")) {
         setIsCollapsed(false);
       }
     }
@@ -89,11 +89,14 @@ export const LogsPanel: React.FC<LogsPanelProps> = ({ logs, logsEndRef, setLogs 
     });
   }, [logs, showVerbose]);
 
-  const lastMessage = filteredLogs.length > 0 ? filteredLogs[filteredLogs.length - 1] : "WAITING...";
+  const lastMessage = filteredLogs.length > 0
+    ? (filteredLogs[filteredLogs.length - 1] ?? "WAITING...")
+    : "WAITING...";
 
   // Count by type
   const errorCount = logs.filter(l => l.includes("[ERROR]")).length;
   const systemCount = logs.filter(l => l.includes("[SYSTEM]")).length;
+  const hasCategorizedErrors = logs.some(l => l.includes("[policy_violation]") || l.includes("[provider_loader_error]") || l.includes("[runtime_dependency_missing") || l.includes("[input_contract_error]"));
 
   // Format log entry
   const formatLogEntry = (log: string, index: number) => {
@@ -329,6 +332,25 @@ export const LogsPanel: React.FC<LogsPanelProps> = ({ logs, logsEndRef, setLogs 
         display: isCollapsed ? 'none' : 'flex',
         flexDirection: 'column',
       }}>
+        {hasCategorizedErrors && (
+          <div style={{
+            margin: '8px 10px 6px',
+            padding: '8px 10px',
+            borderRadius: '6px',
+            border: '1px solid rgba(255,255,255,0.08)',
+            background: 'rgba(255,255,255,0.02)',
+            fontSize: '9px',
+            lineHeight: 1.5,
+            color: 'var(--text-muted)'
+          }}>
+            <div style={{ fontWeight: 700, color: 'var(--text-secondary)', marginBottom: '4px' }}>Error Categories</div>
+            <div>`policy_violation`: strict profile/audit policy failed.</div>
+            <div>`provider_loader_error`: CUDA/ORT/TensorRT provider/loader initialization failure.</div>
+            <div>`runtime_dependency_missing`: required runtime dependency missing/not found.</div>
+            <div>`input_contract_error`: CLI/JSON contract or unsupported input configuration.</div>
+          </div>
+        )}
+
         {filteredLogs.length === 0 ? (
           <div style={{
             flex: 1,

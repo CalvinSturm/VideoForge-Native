@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::rave_cli::{run_benchmark, run_upscale, run_validate, RaveCliConfig};
+use crate::rave_cli::{run_benchmark, run_upscale, run_validate, RaveCliConfig, RaveCliError};
 
 fn workspace_root() -> Result<PathBuf, String> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -49,6 +49,157 @@ fn ensure_profile_arg(mut args: Vec<String>, profile: &str) -> Vec<String> {
     args
 }
 
+fn validate_max_batch_arg(args: &[String]) -> Result<(), String> {
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = &args[idx];
+
+        if let Some(v) = arg.strip_prefix("--max-batch=") {
+            let parsed = v.parse::<usize>().map_err(|_| {
+                format!("Invalid --max-batch value '{v}'. Expected a positive integer.")
+            })?;
+            if parsed > 1 {
+                return Err(
+                    "Unsupported configuration: max_batch > 1 is not implemented. Set --max-batch 1."
+                        .to_string(),
+                );
+            }
+        } else if let Some(v) = arg.strip_prefix("--max_batch=") {
+            let parsed = v.parse::<usize>().map_err(|_| {
+                format!("Invalid --max_batch value '{v}'. Expected a positive integer.")
+            })?;
+            if parsed > 1 {
+                return Err(
+                    "Unsupported configuration: max_batch > 1 is not implemented. Set --max-batch 1."
+                        .to_string(),
+                );
+            }
+        } else if arg == "--max-batch" || arg == "--max_batch" {
+            let next = args
+                .get(idx + 1)
+                .ok_or_else(|| format!("Missing value for {arg}. Expected a positive integer."))?;
+            let parsed = next.parse::<usize>().map_err(|_| {
+                format!("Invalid {arg} value '{next}'. Expected a positive integer.")
+            })?;
+            if parsed > 1 {
+                return Err(
+                    "Unsupported configuration: max_batch > 1 is not implemented. Set --max-batch 1."
+                        .to_string(),
+                );
+            }
+            idx += 1;
+        }
+
+        idx += 1;
+    }
+
+    Ok(())
+}
+
+fn encode_rave_error(
+    category: &str,
+    message: &str,
+    detail: Option<&str>,
+    next_action: Option<&str>,
+) -> String {
+    let payload = if let Some(detail) = detail {
+        serde_json::json!({
+            "category": category,
+            "message": message,
+            "detail": detail,
+            "next_action": next_action
+        })
+    } else {
+        serde_json::json!({
+            "category": category,
+            "message": message,
+            "next_action": next_action
+        })
+    };
+    payload.to_string()
+}
+
+fn classify_exit_stderr(stderr: &str) -> &'static str {
+    let lower = stderr.to_ascii_lowercase();
+
+    if lower.contains("max_batch") {
+        return "input_contract_error";
+    }
+
+    if lower.contains("strict no-host-copies")
+        || lower.contains("host copy audit")
+        || lower.contains("production_strict")
+    {
+        return "policy_violation";
+    }
+
+    if (lower.contains("cuda")
+        || lower.contains("tensorrt")
+        || lower.contains("onnxruntime")
+        || lower.contains("provider")
+        || lower.contains("nvenc")
+        || lower.contains("nvdec"))
+        && (lower.contains("missing")
+            || lower.contains("not found")
+            || lower.contains("could not")
+            || lower.contains("failed to load"))
+    {
+        return "runtime_dependency_missing";
+    }
+
+    if lower.contains("provider")
+        || lower.contains("tensorrt")
+        || lower.contains("onnxruntime")
+        || lower.contains("driver")
+        || lower.contains("loader")
+    {
+        return "provider_loader_error";
+    }
+
+    "runtime_error"
+}
+
+fn map_rave_error(error: RaveCliError) -> String {
+    match error {
+        RaveCliError::Spawn(msg) => encode_rave_error(
+            "runtime_dependency_missing",
+            "Failed to launch rave-cli process.",
+            Some(&msg),
+            Some("Build `rave-cli` release binary and verify runtime dependencies are installed."),
+        ),
+        RaveCliError::Exit { status, stderr } => {
+            let category = classify_exit_stderr(&stderr);
+            let next_action = match category {
+                "policy_violation" => {
+                    Some("Enable required strict-profile capabilities (for example audit-no-host-copies) or switch to dev profile.")
+                }
+                "provider_loader_error" => {
+                    Some("Verify CUDA/driver/ORT/TensorRT provider libraries are installed and discoverable by the process.")
+                }
+                "runtime_dependency_missing" => {
+                    Some("Install the missing runtime dependency and rerun the command.")
+                }
+                "input_contract_error" => {
+                    Some("Fix input/CLI arguments to satisfy contract requirements (for example keep max_batch at 1).")
+                }
+                _ => Some("Inspect stderr details and rerun with corrected runtime/input configuration."),
+            };
+            encode_rave_error(
+                category,
+                &format!("rave-cli failed with exit status {status}."),
+                Some(&stderr),
+                next_action,
+            )
+        }
+        RaveCliError::JsonContract(msg) => encode_rave_error(
+            "input_contract_error",
+            "rave-cli JSON output contract was violated.",
+            Some(&msg),
+            Some("Ensure --json mode writes exactly one final JSON object to stdout and logs to stderr."),
+        ),
+    }
+}
+
 #[tauri::command]
 pub async fn rave_validate(
     fixture: Option<String>,
@@ -72,7 +223,7 @@ pub async fn rave_validate(
         mock_run.unwrap_or(false),
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(map_rave_error)?;
 
     Ok(res.json)
 }
@@ -83,6 +234,7 @@ pub async fn rave_upscale(
     strict_audit: Option<bool>,
     mock_run: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    validate_max_batch_arg(&args)?;
     let profile = resolve_profile()?;
     let root = workspace_root()?;
     let config = RaveCliConfig::from_workspace_root(root);
@@ -94,9 +246,65 @@ pub async fn rave_upscale(
         mock_run.unwrap_or(false),
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(map_rave_error)?;
 
     Ok(res.json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_exit_stderr, map_rave_error, validate_max_batch_arg};
+    use crate::rave_cli::RaveCliError;
+
+    #[test]
+    fn max_batch_allows_one() {
+        assert!(validate_max_batch_arg(&["--max-batch".to_string(), "1".to_string(),]).is_ok());
+        assert!(validate_max_batch_arg(&["--max-batch=1".to_string()]).is_ok());
+        assert!(validate_max_batch_arg(&["--max_batch=1".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn max_batch_rejects_above_one() {
+        let err = validate_max_batch_arg(&["--max-batch=2".to_string()])
+            .expect_err("max_batch > 1 must fail");
+        assert!(err.contains("max_batch > 1"));
+    }
+
+    #[test]
+    fn max_batch_rejects_above_one_positional() {
+        let err = validate_max_batch_arg(&[
+            "--foo".to_string(),
+            "bar".to_string(),
+            "--max_batch".to_string(),
+            "3".to_string(),
+        ])
+        .expect_err("max_batch > 1 must fail");
+        assert!(err.contains("max_batch > 1"));
+    }
+
+    #[test]
+    fn max_batch_requires_value() {
+        let err = validate_max_batch_arg(&["--max-batch".to_string()])
+            .expect_err("missing max-batch value must fail");
+        assert!(err.contains("Missing value"));
+    }
+
+    #[test]
+    fn classify_policy_violation_from_stderr() {
+        let category = classify_exit_stderr("strict no-host-copies requires audit");
+        assert_eq!(category, "policy_violation");
+    }
+
+    #[test]
+    fn map_error_returns_json_payload() {
+        let out = map_rave_error(RaveCliError::JsonContract(
+            "stdout contained 2 JSON objects".to_string(),
+        ));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("mapped error should be JSON");
+        assert_eq!(parsed["category"], "input_contract_error");
+        assert!(parsed.get("next_action").is_some());
+    }
 }
 
 #[tauri::command]
@@ -116,7 +324,7 @@ pub async fn rave_benchmark(
         mock_run.unwrap_or(false),
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(map_rave_error)?;
 
     Ok(res.json)
 }

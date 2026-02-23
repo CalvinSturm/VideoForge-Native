@@ -38,6 +38,13 @@ const formatPolicySummary = (job: Job): string | null => {
   return parts.length > 0 ? parts.join(" | ") : null;
 };
 
+const extractErrorCategory = (job: Job): string | null => {
+  if (job.errorCategory) return job.errorCategory;
+  if (!job.statusMessage) return null;
+  const m = job.statusMessage.match(/^\[([a-z_]+)\]/i);
+  return m?.[1] ?? null;
+};
+
 // --- ICONS ---
 const IconCheck = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#10b981" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
@@ -305,6 +312,7 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
             const etaText = isRunning ? formatEta(job.eta) : null;
             const filename = job.command.replace(/^(Upscale|Transcode|Export Edited|PREVIEW SAMPLE):\s*/i, "");
             const policySummary = formatPolicySummary(job);
+            const errorCategory = extractErrorCategory(job);
 
             const elapsedMs = job.startedAt
               ? (job.completedAt ?? Date.now()) - job.startedAt
@@ -498,7 +506,35 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
                     borderRadius: '4px',
                     wordBreak: 'break-all'
                   }}>
+                    {isError && errorCategory && (
+                      <div style={{
+                        display: 'inline-block',
+                        marginBottom: '6px',
+                        padding: '2px 6px',
+                        borderRadius: '4px',
+                        border: '1px solid rgba(239,68,68,0.35)',
+                        background: 'rgba(239,68,68,0.15)',
+                        color: '#fca5a5',
+                        fontSize: '8px',
+                        fontWeight: 700,
+                        letterSpacing: '0.05em',
+                        textTransform: 'uppercase'
+                      }}>
+                        {errorCategory}
+                      </div>
+                    )}
                     {job.errorMessage}
+                    {job.errorHint && (
+                      <div style={{
+                        marginTop: '6px',
+                        paddingTop: '6px',
+                        borderTop: '1px dashed rgba(239,68,68,0.25)',
+                        color: '#fda4af',
+                        lineHeight: 1.4
+                      }}>
+                        next_action: {job.errorHint}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

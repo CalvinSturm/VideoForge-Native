@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "target": "windows-gpu",
+  "note": "Initial baseline. Tune values after collecting stable GPU runner data.",
+  "baseline": {
+    "fps": 240.0,
+    "stages": {
+      "decode": 250.0,
+      "infer": 1800.0,
+      "encode": 400.0
+    }
+  },
+  "thresholds": {
+    "fps_drop_pct": 70.0,
+    "infer_increase_pct": 150.0,
+    "decode_increase_pct": 200.0,
+    "encode_increase_pct": 200.0
+  }
+}

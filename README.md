@@ -23,6 +23,8 @@
 
 - `docs/VIDEOFORGE_2_WEEK_EXECUTION_PLAN.md` — execution plan for `rave-*` integration.
 - `docs/WINDOWS_RAVE_RUNTIME.md` — Windows runtime setup, commands, and troubleshooting for RAVE.
+- `docs/CI_GPU_STABILIZATION_CHECKLIST.md` — GPU CI stabilization, threshold calibration, and release signoff.
+- `docs/RELEASE_SIGNOFF.md` — release signoff record template and required gate evidence.
 
 ---
 

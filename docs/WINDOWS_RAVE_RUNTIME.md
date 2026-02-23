@@ -119,6 +119,22 @@ Use:
 - Verify required runtime libraries are available in process environment.
 - Prefer actionable stderr diagnostics from `rave-cli`; parse JSON from stdout only.
 
+### F) Error category meanings (UI/Logs)
+
+VideoForge now tags many failures with a stable category.
+
+- `policy_violation`: strict profile policy failed (for example strict no-host-copies audit requirement).
+- `provider_loader_error`: runtime/provider loader or initialization failed (CUDA/ORT/TensorRT/driver path).
+- `runtime_dependency_missing`: required dependency is missing/not discoverable.
+- `input_contract_error`: unsupported/invalid input contract (for example `max_batch > 1`) or JSON contract mismatch.
+
+Suggested operator response:
+
+1. `policy_violation`: re-run with required strict features/capabilities enabled; verify profile intent.
+2. `provider_loader_error`: verify driver/runtime installation and provider library resolution.
+3. `runtime_dependency_missing`: install missing binary/library/tool and re-run.
+4. `input_contract_error`: fix CLI/input arguments; keep `max_batch` at `1` until micro-batching is implemented.
+
 ## 7) Quick PowerShell Session Template
 
 ```powershell
@@ -129,3 +145,33 @@ $env:RAVE_MOCK_RUN = "1"
 cargo build --manifest-path third_party\rave\Cargo.toml -p rave-cli --release
 cargo run --manifest-path third_party\rave\Cargo.toml -p rave-cli --features audit-no-host-copies --bin rave -- validate --profile production_strict --json --best-effort
 ```
+
+## 8) GPU Benchmark Threshold Gate (CI)
+
+CI artifacts include `rave_benchmark_gpu.stdout.json` and a threshold comparison report.
+
+Repo variables:
+
+- `ENABLE_GPU_CI=1` enables the GPU job.
+- `ENABLE_GPU_THRESHOLD_GATE=1` turns threshold violations into CI failures.
+
+Baseline file:
+
+- `tools/ci/rave_benchmark_baseline.windows-gpu.json`
+
+Comparator script:
+
+- `tools/ci/check_rave_benchmark_thresholds.ps1`
+- `tools/ci/check_rave_json_contract.ps1` (schema/required-field contract checks for validate/benchmark/upscale artifacts)
+- `tools/ci/calibrate_rave_gpu_baseline.ps1` (recompute baseline medians from collected benchmark artifacts)
+
+Recommended rollout:
+
+1. Run GPU CI with threshold gate disabled.
+2. Inspect benchmark artifacts over several runs.
+3. Tune baseline/threshold values for your runner class.
+4. Enable `ENABLE_GPU_THRESHOLD_GATE=1`.
+
+Reference checklist:
+
+- `docs/CI_GPU_STABILIZATION_CHECKLIST.md`

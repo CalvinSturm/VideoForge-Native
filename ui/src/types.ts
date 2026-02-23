@@ -39,6 +39,8 @@ export interface Job {
   statusMessage: string;
   paused: boolean;
   errorMessage?: string;
+  errorCategory?: string;
+  errorHint?: string;
   outputPath?: string;
   eta?: number;
   startedAt?: number;   // ms timestamp when job entered running state

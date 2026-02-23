@@ -53,6 +53,14 @@ jobs:
         env:
           RAVE_MOCK_RUN: "1"
 
+      - name: Check mock validate JSON contract
+        shell: pwsh
+        run: |
+          & pwsh -NoProfile -File tools/ci/check_rave_json_contract.ps1 `
+            -JsonPath "$env:GITHUB_WORKSPACE\artifacts\rave_validate_mock.stdout.json" `
+            -ExpectedCommand "validate" `
+            -RequiredFieldsCsv "ok,policy,host_copy_audit_enabled,host_copy_audit_disable_reason"
+
       - name: Upload RAVE mock artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -89,16 +97,62 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\artifacts" | Out-Null
           cargo run --manifest-path third_party/rave/Cargo.toml -p rave-cli --features audit-no-host-copies --bin rave -- validate --json --profile production_strict --best-effort 1> "$env:GITHUB_WORKSPACE\artifacts\rave_validate_gpu.stdout.json" 2> "$env:GITHUB_WORKSPACE\artifacts\rave_validate_gpu.stderr.log"
 
+      - name: Check GPU validate JSON contract
+        shell: pwsh
+        run: |
+          & pwsh -NoProfile -File tools/ci/check_rave_json_contract.ps1 `
+            -JsonPath "$env:GITHUB_WORKSPACE\artifacts\rave_validate_gpu.stdout.json" `
+            -ExpectedCommand "validate" `
+            -RequiredFieldsCsv "ok,policy,host_copy_audit_enabled,host_copy_audit_disable_reason"
+
       - name: Run GPU benchmark
         shell: pwsh
         run: |
           cargo run --manifest-path third_party/rave/Cargo.toml -p rave-cli --bin rave -- benchmark --json -i "$env:RAVE_GPU_INPUT" -m "$env:RAVE_GPU_MODEL" --profile production_strict 1> "$env:GITHUB_WORKSPACE\artifacts\rave_benchmark_gpu.stdout.json" 2> "$env:GITHUB_WORKSPACE\artifacts\rave_benchmark_gpu.stderr.log"
+
+      - name: Check GPU benchmark JSON contract
+        shell: pwsh
+        run: |
+          & pwsh -NoProfile -File tools/ci/check_rave_json_contract.ps1 `
+            -JsonPath "$env:GITHUB_WORKSPACE\artifacts\rave_benchmark_gpu.stdout.json" `
+            -ExpectedCommand "benchmark" `
+            -RequiredFieldsCsv "ok,fps,frames,elapsed_ms,stages.decode,stages.infer,stages.encode,policy"
+
+      - name: Compare GPU benchmark to baseline
+        shell: pwsh
+        env:
+          ENABLE_GPU_THRESHOLD_GATE: ${{ vars.ENABLE_GPU_THRESHOLD_GATE }}
+        run: |
+          $script = "$env:GITHUB_WORKSPACE\tools\ci\check_rave_benchmark_thresholds.ps1"
+          $current = "$env:GITHUB_WORKSPACE\artifacts\rave_benchmark_gpu.stdout.json"
+          $baseline = "$env:GITHUB_WORKSPACE\tools\ci\rave_benchmark_baseline.windows-gpu.json"
+          $report = "$env:GITHUB_WORKSPACE\artifacts\rave_benchmark_threshold_report.json"
+
+          $args = @(
+            "-CurrentJson", $current,
+            "-BaselineJson", $baseline,
+            "-ReportJson", $report
+          )
+
+          if ($env:ENABLE_GPU_THRESHOLD_GATE -eq "1") {
+            $args += "-Enforce"
+          }
+
+          & pwsh -NoProfile -File $script @args
 
       - name: Run GPU upscale
         shell: pwsh
         run: |
           $out = Join-Path "$env:GITHUB_WORKSPACE\artifacts" "rave_gpu_upscaled.mp4"
           cargo run --manifest-path third_party/rave/Cargo.toml -p rave-cli --bin rave -- upscale --json -i "$env:RAVE_GPU_INPUT" -m "$env:RAVE_GPU_MODEL" -o "$out" --profile production_strict 1> "$env:GITHUB_WORKSPACE\artifacts\rave_upscale_gpu.stdout.json" 2> "$env:GITHUB_WORKSPACE\artifacts\rave_upscale_gpu.stderr.log"
+
+      - name: Check GPU upscale JSON contract
+        shell: pwsh
+        run: |
+          & pwsh -NoProfile -File tools/ci/check_rave_json_contract.ps1 `
+            -JsonPath "$env:GITHUB_WORKSPACE\artifacts\rave_upscale_gpu.stdout.json" `
+            -ExpectedCommand "upscale" `
+            -RequiredFieldsCsv "ok,input,output,model,codec,width,height,elapsed_ms,policy"
 
       - name: Upload GPU RAVE artifacts
         if: always()
