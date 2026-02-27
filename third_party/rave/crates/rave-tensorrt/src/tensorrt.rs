@@ -32,12 +32,17 @@
 //! `Arc::strong_count == 1` before returning a slot, guaranteeing no
 //! concurrent reader.  Ring size must be ≥ `downstream_channel_capacity + 2`.
 
+#[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::env;
+#[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+#[cfg(target_os = "linux")]
 use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
@@ -79,13 +84,17 @@ unsafe fn create_tensor_from_device_memory(
     };
     if !status.0.is_null() {
         unsafe { (api.ReleaseStatus)(status.0) };
-        return Err(EngineError::Inference(ort::Error::new(
-            "Failed to create MemoryInfo",
-        )));
+        return Err(EngineError::Inference(
+            ort::Error::new("Failed to create MemoryInfo").to_string(),
+        ));
     }
 
     // Create Tensor
     let mut ort_value_ptr: *mut ort_sys::OrtValue = std::ptr::null_mut();
+    // SAFETY: mem_info_ptr is a valid OrtMemoryInfo created above; ptr is a
+    // caller-supplied device pointer of at least `bytes` bytes; shape is a
+    // valid non-empty slice of i64 dimension values; ort_value_ptr is an
+    // initialized null pointer used as the output parameter.
     let status = unsafe {
         (api.CreateTensorWithDataAsOrtValue)(
             mem_info_ptr,
@@ -98,17 +107,16 @@ unsafe fn create_tensor_from_device_memory(
         )
     };
 
-    // Release MemoryInfo (Tensor likely executes AddRef / Copy, or we hand over ownership?
-    // ORT docs say CreateTensorWithDataAsOrtValue does NOT take ownership of mem_info,
-    // but the resulting tensor keeps a reference?
-    // Actually, usually we should release our handle if we don't need it.
+    // ORT API contract: CreateTensorWithDataAsOrtValue does NOT take ownership
+    // of mem_info — it copies what it needs internally. We release our handle
+    // immediately after tensor creation, before any error check, as required.
     unsafe { (api.ReleaseMemoryInfo)(mem_info_ptr) };
 
     if !status.0.is_null() {
         unsafe { (api.ReleaseStatus)(status.0) };
-        return Err(EngineError::Inference(ort::Error::new(
-            "Failed to create Tensor",
-        )));
+        return Err(EngineError::Inference(
+            ort::Error::new("Failed to create Tensor").to_string(),
+        ));
     }
 
     // Wrap in OrtValue
@@ -119,10 +127,6 @@ unsafe fn create_tensor_from_device_memory(
         )
     })
 }
-
-// use half::f16; // If half is dependency. ort might export it?
-// I will guess ort::f16 or just try referencing it fully qualified if needed.
-// I'll stick to basic imports for now and use full path in code if unsafe.
 
 // ─── Precision policy ───────────────────────────────────────────────────────
 
@@ -144,7 +148,7 @@ pub enum PrecisionPolicy {
 /// Batch inference configuration.
 #[derive(Clone, Debug)]
 pub struct BatchConfig {
-    /// Maximum batch size for pipelined inference.
+    /// Maximum batch size for pipelined inference (`1..=8`).
     /// Must be ≤ model’s max dynamic batch axis.
     pub max_batch: usize,
     /// Collect at most this many frames before dispatching a batch,
@@ -161,10 +165,14 @@ impl Default for BatchConfig {
     }
 }
 
+/// Validate a [`BatchConfig`], returning an error if `max_batch` is out of range.
 pub fn validate_batch_config(cfg: &BatchConfig) -> Result<()> {
-    if cfg.max_batch > 1 {
+    if cfg.max_batch == 0 || cfg.max_batch > 8 {
         return Err(EngineError::InvariantViolation(
-            "micro-batching is not implemented; max_batch must be 1 (set max_batch=1)".into(),
+            format!(
+                "max_batch must be in [1, 8], got {} (set max_batch=1 for single-frame inference)",
+                cfg.max_batch
+            ),
         ));
     }
     Ok(())
@@ -183,6 +191,7 @@ pub struct InferenceMetrics {
 }
 
 impl InferenceMetrics {
+    /// Create a new zeroed [`InferenceMetrics`].
     pub const fn new() -> Self {
         Self {
             frames_inferred: AtomicU64::new(0),
@@ -191,6 +200,7 @@ impl InferenceMetrics {
         }
     }
 
+    /// Record a single frame's inference latency in microseconds.
     pub fn record(&self, elapsed_us: u64) {
         self.frames_inferred.fetch_add(1, Ordering::Relaxed);
         self.total_inference_us
@@ -199,6 +209,7 @@ impl InferenceMetrics {
             .fetch_max(elapsed_us, Ordering::Relaxed);
     }
 
+    /// Return a point-in-time snapshot of all inference counters.
     pub fn snapshot(&self) -> InferenceMetricsSnapshot {
         let frames = self.frames_inferred.load(Ordering::Relaxed);
         let total = self.total_inference_us.load(Ordering::Relaxed);
@@ -220,12 +231,26 @@ impl Default for InferenceMetrics {
 /// Snapshot of inference metrics for reporting.
 #[derive(Clone, Debug)]
 pub struct InferenceMetricsSnapshot {
+    /// Total frames inferred.
     pub frames_inferred: u64,
+    /// Average inference latency in microseconds.
     pub avg_inference_us: u64,
+    /// Peak single-frame inference latency in microseconds.
     pub peak_inference_us: u64,
 }
 
 // ─── Ring metrics ────────────────────────────────────────────────────────────
+
+/// A point-in-time snapshot of [`RingMetrics`] counters.
+#[derive(Debug, Clone, Copy)]
+pub struct RingMetricsSnapshot {
+    /// Number of times a slot was acquired and was already free (strong_count == 1).
+    pub reuse: u64,
+    /// Number of times `acquire()` found a slot still held downstream (strong_count > 1).
+    pub contention: u64,
+    /// Number of times a slot was used for the very first time (not a reuse).
+    pub first_use: u64,
+}
 
 /// Atomic counters for output ring buffer activity.
 #[derive(Debug)]
@@ -239,6 +264,7 @@ pub struct RingMetrics {
 }
 
 impl RingMetrics {
+    /// Create a new zeroed [`RingMetrics`].
     pub const fn new() -> Self {
         Self {
             slot_reuse_count: AtomicU64::new(0),
@@ -247,12 +273,13 @@ impl RingMetrics {
         }
     }
 
-    pub fn snapshot(&self) -> (u64, u64, u64) {
-        (
-            self.slot_reuse_count.load(Ordering::Relaxed),
-            self.slot_contention_events.load(Ordering::Relaxed),
-            self.slot_first_use_count.load(Ordering::Relaxed),
-        )
+    /// Returns a point-in-time snapshot of all ring counters.
+    pub fn snapshot(&self) -> RingMetricsSnapshot {
+        RingMetricsSnapshot {
+            reuse: self.slot_reuse_count.load(Ordering::Relaxed),
+            contention: self.slot_contention_events.load(Ordering::Relaxed),
+            first_use: self.slot_first_use_count.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -268,10 +295,13 @@ impl Default for RingMetrics {
 pub struct OutputRing {
     slots: Vec<Arc<cudarc::driver::CudaSlice<u8>>>,
     cursor: usize,
+    /// Size of each slot in bytes (`3 × out_w × out_h × sizeof(f32)`).
     pub slot_bytes: usize,
+    /// Input dimensions `(width, height)` used to allocate the current slots.
     pub alloc_dims: (u32, u32),
     /// Whether each slot has been used at least once (for first-use tracking).
     used: Vec<bool>,
+    /// Atomic counters tracking reuse, contention, and first-use events.
     pub metrics: RingMetrics,
 }
 
@@ -365,6 +395,7 @@ impl OutputRing {
         Ok(cloned)
     }
 
+    /// Return `true` if the current slot dimensions differ from `(in_w, in_h)`.
     pub fn needs_realloc(&self, in_w: u32, in_h: u32) -> bool {
         self.alloc_dims != (in_w, in_h)
     }
@@ -408,6 +439,7 @@ impl OutputRing {
         self.slots.len()
     }
 
+    /// Return `true` if the ring has no slots (should not happen in normal operation).
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
@@ -430,6 +462,11 @@ fn ort_element_type(format: PixelFormat) -> ort::tensor::TensorElementType {
 
 // ─── Backend ─────────────────────────────────────────────────────────────────
 
+/// TensorRT/CUDA ORT inference backend.
+///
+/// Implements [`UpscaleBackend`](rave_core::backend::UpscaleBackend) using
+/// ONNX Runtime with a TensorRT or CUDA execution provider.  Output buffers
+/// are managed via a fixed-size [`OutputRing`] to avoid per-frame allocation.
 pub struct TensorRtBackend {
     model_path: PathBuf,
     ctx: Arc<GpuContext>,
@@ -439,10 +476,11 @@ pub struct TensorRtBackend {
     meta: OnceLock<ModelMetadata>,
     selected_provider: OnceLock<String>,
     state: Mutex<Option<InferenceState>>,
+    /// Atomic inference latency and frame count metrics.
     pub inference_metrics: InferenceMetrics,
-    /// Phase 8: precision policy for TRT EP.
+    /// Precision policy used when building the TensorRT EP session.
     pub precision_policy: PrecisionPolicy,
-    /// Phase 8: batch configuration.
+    /// Batch configuration (must have `max_batch = 1` — batching not yet implemented).
     pub batch_config: BatchConfig,
 }
 
@@ -466,7 +504,6 @@ const RTLD_LOCAL: i32 = 0;
 #[cfg(target_os = "linux")]
 const RTLD_GLOBAL: i32 = 0x100;
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 enum OrtProviderKind {
     Cuda,
@@ -476,8 +513,8 @@ enum OrtProviderKind {
 #[cfg(target_os = "linux")]
 type ProviderCandidate = (PathBuf, &'static str);
 
-#[cfg(target_os = "linux")]
 impl OrtProviderKind {
+    #[cfg(target_os = "linux")]
     fn soname(self) -> &'static str {
         match self {
             OrtProviderKind::Cuda => "libonnxruntime_providers_cuda.so",
@@ -485,6 +522,7 @@ impl OrtProviderKind {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn label(self) -> &'static str {
         match self {
             OrtProviderKind::Cuda => "providers_cuda",
@@ -562,7 +600,7 @@ impl TensorRtBackend {
     }
 
     /// Access ring metrics (if initialized).
-    pub async fn ring_metrics(&self) -> Option<(u64, u64, u64)> {
+    pub async fn ring_metrics(&self) -> Option<RingMetricsSnapshot> {
         let guard = self.state.lock().await;
         guard
             .as_ref()
@@ -573,6 +611,29 @@ impl TensorRtBackend {
     /// Active ORT execution provider selected during initialization.
     pub fn selected_provider(&self) -> Option<&str> {
         self.selected_provider.get().map(String::as_str)
+    }
+
+    fn infer_scale_from_name(name: &str) -> Option<u32> {
+        let lower = name.to_ascii_lowercase();
+        let bytes = lower.as_bytes();
+        for i in 0..bytes.len() {
+            if bytes[i] != b'x' {
+                continue;
+            }
+            if i > 0 && bytes[i - 1].is_ascii_digit() {
+                let d = (bytes[i - 1] - b'0') as u32;
+                if d >= 2 {
+                    return Some(d);
+                }
+            }
+            if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+                let d = (bytes[i + 1] - b'0') as u32;
+                if d >= 2 {
+                    return Some(d);
+                }
+            }
+        }
+        None
     }
 
     fn extract_metadata(session: &Session) -> Result<ModelMetadata> {
@@ -633,11 +694,26 @@ impl TensorRtBackend {
         let oh = output_dims[2];
         let ow = output_dims[3];
 
+        let name = session
+            .metadata()
+            .map(|m| m.name().unwrap_or("unknown".to_string()))
+            .unwrap_or_else(|_| "unknown".to_string());
+
         let scale = if ih > 0 && oh > 0 && iw > 0 && ow > 0 {
             (oh / ih) as u32
+        } else if let Some(inferred) = Self::infer_scale_from_name(&name) {
+            warn!(
+                model_name = %name,
+                inferred_scale = inferred,
+                "Dynamic spatial axes — inferring upscale scale from model name"
+            );
+            inferred
         } else {
-            warn!("Dynamic spatial axes — defaulting to scale=4");
-            4
+            warn!(
+                model_name = %name,
+                "Dynamic spatial axes — unable to infer scale from metadata; defaulting to scale=2"
+            );
+            2
         };
 
         let min_input_hw = (
@@ -649,11 +725,6 @@ impl TensorRtBackend {
             if ih > 0 { ih as u32 } else { u32::MAX },
             if iw > 0 { iw as u32 } else { u32::MAX },
         );
-
-        let name = session
-            .metadata()
-            .map(|m| m.name().unwrap_or("unknown".to_string()))
-            .unwrap_or_else(|_| "unknown".to_string());
 
         Ok(ModelMetadata {
             name,
@@ -973,34 +1044,42 @@ Set ORT_DYLIB_PATH or ORT_LIB_LOCATION to a valid provider directory and re-run 
     /// When ORT is linked statically, TensorRT provider expects `Provider_GetHost`
     /// from `libonnxruntime_providers_shared.so` to already be present in the process.
     /// Preloading this bridge with `RTLD_GLOBAL` satisfies that symbol before TRT EP load.
-    #[cfg(target_os = "linux")]
     fn preload_ort_provider_pair(kind: OrtProviderKind) -> Result<()> {
-        let (dir, source) = Self::resolve_ort_provider_dir(kind)?;
-        let shared = dir.join("libonnxruntime_providers_shared.so");
-        let provider = dir.join(kind.soname());
+        #[cfg(target_os = "linux")]
+        {
+            let (dir, source) = Self::resolve_ort_provider_dir(kind)?;
+            let shared = dir.join("libonnxruntime_providers_shared.so");
+            let provider = dir.join(kind.soname());
 
-        Self::dlopen_path(&shared, RTLD_NOW | RTLD_GLOBAL).map_err(|e| {
-            EngineError::ModelMetadata(format!(
-                "Failed loading providers_shared from {} ({e}). \
+            Self::dlopen_path(&shared, RTLD_NOW | RTLD_GLOBAL).map_err(|e| {
+                EngineError::ModelMetadata(format!(
+                    "Failed loading providers_shared from {} ({e}). \
 Ensure ORT_DYLIB_PATH/ORT_LIB_LOCATION points to a valid ORT cache dir.",
-                shared.display()
-            ))
-        })?;
+                    shared.display()
+                ))
+            })?;
 
-        info!(
-            path = %provider.display(),
-            provider = kind.label(),
-            "Skipping explicit provider dlopen; relying on startup LD_LIBRARY_PATH + ORT registration"
-        );
+            info!(
+                path = %provider.display(),
+                provider = kind.label(),
+                "Skipping explicit provider dlopen; relying on startup LD_LIBRARY_PATH + ORT registration"
+            );
 
-        info!(
-            source,
-            dir = %dir.display(),
-            provider = kind.label(),
-            path = %provider.display(),
-            "ORT provider pair prepared (providers_shared preloaded, provider path configured)"
-        );
-        Ok(())
+            info!(
+                source,
+                dir = %dir.display(),
+                provider = kind.label(),
+                path = %provider.display(),
+                "ORT provider pair prepared (providers_shared preloaded, provider path configured)"
+            );
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = kind;
+            Ok(())
+        }
     }
 
     #[cfg(all(target_os = "linux", test))]
@@ -1016,6 +1095,7 @@ Ensure ORT_DYLIB_PATH/ORT_LIB_LOCATION points to a valid ORT cache dir.",
     }
 
     #[cfg(all(not(target_os = "linux"), test))]
+    #[allow(dead_code)]
     fn preload_ort_provider_bridge() -> Result<()> {
         Ok(())
     }
@@ -1186,6 +1266,76 @@ Ensure ORT_DYLIB_PATH/ORT_LIB_LOCATION points to a valid ORT cache dir.",
                 elem_type,
             )?;
 
+            binding.bind_output(&meta.output_name, output_tensor)?;
+        }
+
+        // Synchronous execution — ORT blocks until all TensorRT kernels complete.
+        session.run_binding(&binding)?;
+
+        Ok(())
+    }
+
+    /// Batched version of [`run_io_bound`] — runs N frames in a single ORT session call.
+    ///
+    /// `input_ptr` and `output_ptr` must point to **contiguous** N×C×H×W buffers.
+    fn run_io_bound_batch(
+        session: &mut Session,
+        meta: &ModelMetadata,
+        batch_size: usize,
+        in_w: u32,
+        in_h: u32,
+        format: PixelFormat,
+        input_ptr: u64,
+        input_bytes: usize,
+        output_ptr: u64,
+        output_bytes: usize,
+    ) -> Result<()> {
+        let in_w = in_w as i64;
+        let in_h = in_h as i64;
+        let out_w = in_w * meta.scale as i64;
+        let out_h = in_h * meta.scale as i64;
+        let n = batch_size as i64;
+
+        let input_shape: Vec<i64> = vec![n, meta.input_channels as i64, in_h, in_w];
+        let output_shape: Vec<i64> = vec![n, meta.input_channels as i64, out_h, out_w];
+
+        let elem_type = ort_element_type(format);
+        let elem_bytes = format.element_bytes();
+
+        let expected_out = (output_shape.iter().product::<i64>() as usize) * elem_bytes;
+        if output_bytes < expected_out {
+            return Err(EngineError::BufferTooSmall {
+                need: expected_out,
+                have: output_bytes,
+            });
+        }
+
+        let expected_in = (input_shape.iter().product::<i64>() as usize) * elem_bytes;
+        if input_bytes < expected_in {
+            return Err(EngineError::BufferTooSmall {
+                need: expected_in,
+                have: input_bytes,
+            });
+        }
+
+        let mut binding = session.create_binding()?;
+
+        // SAFETY — ORT IO Binding with raw device pointers (contiguous batch buffers):
+        unsafe {
+            let input_tensor = create_tensor_from_device_memory(
+                input_ptr as *mut _,
+                input_bytes,
+                &input_shape,
+                elem_type,
+            )?;
+            binding.bind_input(&meta.input_name, &input_tensor)?;
+
+            let output_tensor = create_tensor_from_device_memory(
+                output_ptr as *mut _,
+                output_bytes,
+                &output_shape,
+                elem_type,
+            )?;
             binding.bind_output(&meta.output_name, output_tensor)?;
         }
 
@@ -1593,6 +1743,164 @@ impl UpscaleBackend for TensorRtBackend {
         })
     }
 
+    async fn process_batch(&self, inputs: Vec<GpuTexture>) -> Result<Vec<GpuTexture>> {
+        let batch_size = inputs.len();
+        if batch_size == 0 {
+            return Ok(Vec::new());
+        }
+        // For single-frame batch, delegate to single-frame path (avoids staging copies).
+        if batch_size == 1 {
+            let result = self.process(inputs.into_iter().next().unwrap()).await?;
+            return Ok(vec![result]);
+        }
+
+        // Validate all inputs share the same dimensions and format.
+        let ref_w = inputs[0].width;
+        let ref_h = inputs[0].height;
+        let ref_fmt = inputs[0].format;
+        for (i, inp) in inputs.iter().enumerate().skip(1) {
+            if inp.width != ref_w || inp.height != ref_h || inp.format != ref_fmt {
+                return Err(EngineError::DimensionMismatch(format!(
+                    "Batch frame {} has dimensions {}×{} {:?}, expected {}×{} {:?}",
+                    i, inp.width, inp.height, inp.format, ref_w, ref_h, ref_fmt
+                )));
+            }
+        }
+
+        match ref_fmt {
+            PixelFormat::RgbPlanarF32 | PixelFormat::RgbPlanarF16 => {}
+            other => {
+                return Err(EngineError::FormatMismatch {
+                    expected: PixelFormat::RgbPlanarF32,
+                    actual: other,
+                });
+            }
+        }
+
+        let meta = self.meta.get().ok_or(EngineError::NotInitialized)?;
+        let mut guard = self.state.lock().await;
+        let state = guard.as_mut().ok_or(EngineError::NotInitialized)?;
+
+        // Lazy ring init / realloc.
+        match &mut state.ring {
+            Some(ring) if ring.needs_realloc(ref_w, ref_h) => {
+                ring.reallocate(&self.ctx, ref_w, ref_h, meta.scale)?;
+            }
+            None => {
+                state.ring = Some(OutputRing::new(
+                    &self.ctx, ref_w, ref_h, meta.scale,
+                    self.ring_size, self.min_ring_slots,
+                )?);
+            }
+            Some(_) => {}
+        }
+
+        let ring = state.ring.as_mut().unwrap();
+        let elem_bytes = ref_fmt.element_bytes();
+        let frame_elems = meta.input_channels as usize * ref_h as usize * ref_w as usize;
+        let in_frame_bytes = frame_elems * elem_bytes;
+        let out_w = ref_w * meta.scale;
+        let out_h = ref_h * meta.scale;
+        let out_frame_elems = meta.input_channels as usize * out_h as usize * out_w as usize;
+        let out_frame_bytes = out_frame_elems * elem_bytes;
+
+        // Allocate contiguous staging buffers for input and output.
+        let input_staging = self.ctx.alloc(in_frame_bytes * batch_size)?;
+        let output_staging = self.ctx.alloc(out_frame_bytes * batch_size)?;
+
+        // Pack individual frames into contiguous input staging buffer.
+        let input_staging_ptr = *input_staging.device_ptr();
+        for (i, inp) in inputs.iter().enumerate() {
+            let src_ptr = inp.device_ptr();
+            let dst_ptr = input_staging_ptr + (i * in_frame_bytes) as u64;
+            // SAFETY: Both pointers are valid CUDA device pointers of in_frame_bytes size.
+            unsafe {
+                cudarc::driver::result::memcpy_dtod_async(
+                    dst_ptr,
+                    src_ptr,
+                    in_frame_bytes,
+                    self.ctx.inference_stream.stream,
+                )
+                .map_err(|e| EngineError::Pipeline(format!("cuMemcpyDtoDAsync (batch pack): {e}")))?;
+            }
+        }
+        // Synchronize to ensure packing is complete before inference.
+        GpuContext::sync_stream(&self.ctx.inference_stream)?;
+
+        // Acquire N output ring slots.
+        let mut output_arcs = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            output_arcs.push(ring.acquire()?);
+        }
+
+        // ── Batched inference with latency measurement ──
+        let t_start = std::time::Instant::now();
+
+        let output_staging_ptr = *output_staging.device_ptr();
+        Self::run_io_bound_batch(
+            &mut state.session,
+            meta,
+            batch_size,
+            ref_w,
+            ref_h,
+            ref_fmt,
+            input_staging_ptr,
+            in_frame_bytes * batch_size,
+            output_staging_ptr,
+            out_frame_bytes * batch_size,
+        )?;
+
+        let elapsed_us = t_start.elapsed().as_micros() as u64;
+        // Record per-frame metric (amortized).
+        let per_frame_us = elapsed_us / batch_size as u64;
+        for _ in 0..batch_size {
+            self.inference_metrics.record(per_frame_us);
+        }
+
+        // Unpack batched output into individual ring slots.
+        for (i, output_arc) in output_arcs.iter().enumerate() {
+            let src_ptr = output_staging_ptr + (i * out_frame_bytes) as u64;
+            let dst_ptr = *(*output_arc).device_ptr();
+            // SAFETY: Both pointers are valid CUDA device pointers of out_frame_bytes size.
+            unsafe {
+                cudarc::driver::result::memcpy_dtod_async(
+                    dst_ptr,
+                    src_ptr,
+                    out_frame_bytes,
+                    self.ctx.inference_stream.stream,
+                )
+                .map_err(|e| EngineError::Pipeline(format!("cuMemcpyDtoDAsync (batch unpack): {e}")))?;
+            }
+        }
+        // Synchronize to ensure unpacking is complete before downstream reads.
+        GpuContext::sync_stream(&self.ctx.inference_stream)?;
+
+        // Free staging buffers (VRAM accounting handled by GpuContext drop).
+        drop(input_staging);
+        drop(output_staging);
+
+        // Build output textures.
+        let mut results = Vec::with_capacity(batch_size);
+        for output_arc in output_arcs {
+            results.push(GpuTexture {
+                data: output_arc,
+                width: out_w,
+                height: out_h,
+                pitch: (out_w as usize) * elem_bytes,
+                format: ref_fmt,
+            });
+        }
+
+        info!(
+            batch_size,
+            elapsed_us,
+            per_frame_us,
+            "Batched inference complete"
+        );
+
+        Ok(results)
+    }
+
     async fn shutdown(&self) -> Result<()> {
         let mut guard = self.state.lock().await;
         if let Some(state) = guard.take() {
@@ -1601,8 +1909,13 @@ impl UpscaleBackend for TensorRtBackend {
 
             // Report ring metrics.
             if let Some(ring) = &state.ring {
-                let (reuse, contention, first) = ring.metrics.snapshot();
-                info!(reuse, contention, first, "Final ring metrics");
+                let snap = ring.metrics.snapshot();
+                info!(
+                    reuse = snap.reuse,
+                    contention = snap.contention,
+                    first_use = snap.first_use,
+                    "Final ring metrics"
+                );
             }
 
             // Report inference metrics.
@@ -1649,15 +1962,23 @@ mod batch_config_tests {
     }
 
     #[test]
-    fn batch_config_validator_rejects_micro_batching() {
-        let cfg = BatchConfig {
-            max_batch: 2,
-            latency_deadline_us: 8_000,
-        };
-        let err = validate_batch_config(&cfg).expect_err("max_batch>1 must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("max_batch"));
-        assert!(msg.contains("not implemented"));
+    fn batch_config_validator_accepts_micro_batching() {
+        for n in 2usize..=8 {
+            let cfg = BatchConfig {
+                max_batch: n,
+                latency_deadline_us: 8_000,
+            };
+            validate_batch_config(&cfg)
+                .unwrap_or_else(|e| panic!("max_batch={n} should be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn batch_config_validator_rejects_out_of_range() {
+        let zero = BatchConfig { max_batch: 0, latency_deadline_us: 8_000 };
+        validate_batch_config(&zero).expect_err("max_batch=0 must be rejected");
+        let nine = BatchConfig { max_batch: 9, latency_deadline_us: 8_000 };
+        validate_batch_config(&nine).expect_err("max_batch=9 must be rejected");
     }
 }
 

@@ -10,9 +10,12 @@
 //! CUDA driver allocator.
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, c_char, c_void};
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once};
 
 use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, DeviceSlice};
 use tracing::{info, warn};
@@ -290,6 +293,7 @@ Ensure NVIDIA driver libraries are installed and visible via LD_LIBRARY_PATH \
     }
 
     #[cfg(not(target_os = "linux"))]
+    #[allow(dead_code)]
     fn is_wsl2() -> bool {
         false
     }
@@ -493,6 +497,16 @@ This is typically a WSL/Windows NVIDIA driver issue. Run scripts/wsl_gpu_healthc
 
     fn log_cuda_init_diagnostics_once() {
         CUDA_INIT_DIAG_ONCE.call_once(|| {
+            // IMPORTANT: cuInit MUST be called before cuDeviceGetCount.
+            // Previously these were in the wrong order, causing rc=3
+            // (CUDA_ERROR_NOT_INITIALIZED) from cuDeviceGetCount on Windows.
+            let rc_init = match Self::cu_init(0) {
+                Ok(rc) => rc,
+                Err(err) => {
+                    warn!(error = %err, "CUDA diagnostics could not call cuInit");
+                    -1
+                }
+            };
             let mut driver_version = -1i32;
             let rc_driver = match Self::cu_driver_get_version(&mut driver_version) {
                 Ok(rc) => rc,
@@ -506,13 +520,6 @@ This is typically a WSL/Windows NVIDIA driver issue. Run scripts/wsl_gpu_healthc
                 Ok(rc) => rc,
                 Err(err) => {
                     warn!(error = %err, "CUDA diagnostics could not query device count");
-                    -1
-                }
-            };
-            let rc_init = match Self::cu_init(0) {
-                Ok(rc) => rc,
-                Err(err) => {
-                    warn!(error = %err, "CUDA diagnostics could not call cuInit");
                     -1
                 }
             };
@@ -534,9 +541,11 @@ This is typically a WSL/Windows NVIDIA driver issue. Run scripts/wsl_gpu_healthc
                 libcuda_from_dladdr = ?libcuda_dladdr_path,
                 libnvidia_encode = ?libnvidia_encode_path,
                 cu_init_rc = rc_init,
+                cu_init_status = cuda_error_name(rc_init),
                 cu_driver_get_version_rc = rc_driver,
                 cu_driver_version = driver_version,
                 cu_device_get_count_rc = rc_count,
+                cu_device_get_count_status = cuda_error_name(rc_count),
                 cu_device_count = device_count,
                 "CUDA init diagnostics"
             );
@@ -577,6 +586,21 @@ Use WSL NVIDIA driver libcuda instead: export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$
         Self::preload_wsl_libcuda()?;
         Self::preload_wsl_nvenc_for_diagnostics();
         Self::ensure_cuda_init_for_wsl()?;
+
+        // Explicit cuInit(0) before diagnostics. On Linux/WSL this was
+        // already handled by ensure_cuda_init_for_wsl(). On Windows the
+        // WSL function is a no-op, so diagnostics previously ran without
+        // any cuInit call, causing cuDeviceGetCount to return rc=3
+        // (CUDA_ERROR_NOT_INITIALIZED). cuInit is idempotent so calling
+        // it twice is safe.
+        let cu_init_rc = Self::cu_init(0)?;
+        if cu_init_rc != CUDA_SUCCESS {
+            return Err(EngineError::Pipeline(format!(
+                "cuInit(0) failed with rc={cu_init_rc} ({})",
+                cuda_error_name(cu_init_rc)
+            )));
+        }
+
         Self::log_cuda_init_diagnostics_once();
         Self::validate_no_cuda_stub()?;
 
@@ -770,6 +794,29 @@ Use WSL NVIDIA driver libcuda instead: export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$
 // SAFETY: GpuContext manages thread-safe CUDA usage via internal synchronization/Mutex.
 unsafe impl Send for GpuContext {}
 unsafe impl Sync for GpuContext {}
+
+// ─── CUDA error code helpers ────────────────────────────────────────────────
+
+/// Map a CUDA driver API error code to a human-readable name.
+///
+/// Covers the common codes encountered during initialization and
+/// device enumeration.  Unknown codes are returned as `"CUDA_UNKNOWN_<N>"`.
+fn cuda_error_name(code: CUresult) -> &'static str {
+    match code {
+        0 => "CUDA_SUCCESS",
+        1 => "CUDA_ERROR_INVALID_VALUE",
+        2 => "CUDA_ERROR_OUT_OF_MEMORY",
+        3 => "CUDA_ERROR_NOT_INITIALIZED",
+        4 => "CUDA_ERROR_DEINITIALIZED",
+        100 => "CUDA_ERROR_NO_DEVICE",
+        101 => "CUDA_ERROR_INVALID_DEVICE",
+        200 => "CUDA_ERROR_INVALID_IMAGE",
+        201 => "CUDA_ERROR_INVALID_CONTEXT",
+        304 => "CUDA_ERROR_OPERATING_SYSTEM",
+        999 => "CUDA_ERROR_UNKNOWN",
+        _ => "CUDA_ERROR_OTHER",
+    }
+}
 
 impl Drop for GpuContext {
     fn drop(&mut self) {

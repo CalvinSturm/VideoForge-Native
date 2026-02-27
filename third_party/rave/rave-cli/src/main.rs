@@ -9,42 +9,48 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{io::IsTerminal, sync::atomic::Ordering};
+use std::{
+    io::{IsTerminal, Read, Write},
+    sync::atomic::Ordering,
+};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 
 use rave_core::backend::UpscaleBackend;
-use rave_core::codec_traits::FrameEncoder;
+use rave_core::codec_traits::{DecodedFrame, FrameDecoder, FrameEncoder};
 use rave_core::context::GpuContext;
 use rave_core::error::{EngineError, Result};
 use rave_core::ffi_types::cudaVideoCodec;
 use rave_core::host_copy_audit::{
     HostCopyAuditStatus, host_copy_audit_status, require_host_copy_audit_if_strict,
 };
-use rave_core::types::FrameEnvelope;
+use rave_core::types::{FrameEnvelope, GpuTexture, PixelFormat};
 use rave_pipeline::pipeline::{PipelineConfig, PipelineMetrics, UpscalePipeline};
-use rave_pipeline::runtime::{
-    Decoder as PipelineDecoder, Encoder as PipelineEncoder, ResolvedInput, RuntimeRequest,
-    RuntimeSetup, create_context_and_kernels as pipeline_create_context_and_kernels,
-    create_decoder as pipeline_create_decoder,
-    create_nvenc_encoder as pipeline_create_nvenc_encoder,
-    parse_precision as pipeline_parse_precision, prepare_runtime as pipeline_prepare_runtime,
-    resolve_input as pipeline_resolve_input,
-};
 use rave_pipeline::{
     AuditLevel, BatchConfig as GraphBatchConfig, DeterminismObserved, DeterminismPolicy,
     DeterminismSkipReason, EnhanceConfig, GRAPH_SCHEMA_VERSION, PipelineReport,
     PrecisionPolicyConfig, ProfilePreset, RunContract, StageConfig, StageGraph, StageId,
     enforce_determinism_policy,
 };
+use rave_runtime_nvidia::{
+    Decoder as PipelineDecoder, Encoder as PipelineEncoder, ResolvedInput, RuntimeRequest,
+    RuntimeSetup, create_context_and_kernels as pipeline_create_context_and_kernels,
+    create_decoder as pipeline_create_decoder,
+    create_nvenc_encoder as pipeline_create_nvenc_encoder, is_container as pipeline_is_container,
+    parse_precision as pipeline_parse_precision, prepare_runtime as pipeline_prepare_runtime,
+    resolve_input as pipeline_resolve_input,
+};
 
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 #[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, c_char, c_void};
+#[cfg(not(target_os = "linux"))]
+use std::ffi::{CStr, c_char};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "linux")]
@@ -140,6 +146,15 @@ struct SharedVideoArgs {
     /// Input height override.
     #[arg(long = "height")]
     height: Option<u32>,
+
+    /// Maximum frames per inference batch (1-8, default 1).
+    #[arg(long = "max-batch", default_value_t = 1)]
+    max_batch: usize,
+
+    /// How long to wait for additional frames when filling a batch, in
+    /// microseconds (default 8000 = 8 ms). Ignored when --max-batch=1.
+    #[arg(long = "batch-latency-us")]
+    batch_latency_us: Option<u64>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -349,27 +364,20 @@ struct ProbeDeviceResult {
     error: Option<String>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "linux"))]
 type CUresult = i32;
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "linux"))]
 type CUdevice = i32;
-
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "linux"))]
 const CUDA_SUCCESS: CUresult = 0;
 
 #[cfg(not(target_os = "linux"))]
 unsafe extern "C" {
-    #[cfg(target_os = "linux")]
     fn cuInit(flags: u32) -> CUresult;
-    #[cfg(target_os = "linux")]
     fn cuDriverGetVersion(driver_version: *mut i32) -> CUresult;
-    #[cfg(target_os = "linux")]
     fn cuDeviceGetCount(count: *mut i32) -> CUresult;
-    #[cfg(target_os = "linux")]
     fn cuDeviceGet(device: *mut CUdevice, ordinal: i32) -> CUresult;
-    #[cfg(target_os = "linux")]
     fn cuDeviceGetName(name: *mut c_char, len: i32, dev: CUdevice) -> CUresult;
-    #[cfg(target_os = "linux")]
     fn cuDeviceTotalMem_v2(bytes: *mut usize, dev: CUdevice) -> CUresult;
 }
 
@@ -538,6 +546,381 @@ impl FrameEncoder for SkipEncoder {
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+struct SoftwareNv12Decoder {
+    child: Option<Child>,
+    stdout: Option<ChildStdout>,
+    ctx: Arc<GpuContext>,
+    width: usize,
+    height: usize,
+    pitch: usize,
+    frame_idx: u64,
+    frame_duration_us: i64,
+    frame_buf: Vec<u8>,
+}
+
+impl SoftwareNv12Decoder {
+    fn new(setup: &RuntimeSetup, input_path: &Path) -> Result<Self> {
+        let width = setup.input.width as usize;
+        let height = setup.input.height as usize;
+        let pitch = width;
+        let fps_num = setup.input.fps_num.max(1) as i64;
+        let fps_den = setup.input.fps_den.max(1) as i64;
+        let frame_duration_us = (1_000_000_i64 * fps_den) / fps_num;
+
+        let mut cmd = ProcessCommand::new("ffmpeg");
+        cmd.arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-i")
+            .arg(input_path)
+            .arg("-an")
+            .arg("-sn")
+            .arg("-dn")
+            .arg("-vsync")
+            .arg("0")
+            .arg("-pix_fmt")
+            .arg("nv12")
+            .arg("-f")
+            .arg("rawvideo")
+            .arg("-")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| {
+            EngineError::Decode(format!(
+                "Software decode fallback unavailable (failed to launch ffmpeg): {e}"
+            ))
+        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| EngineError::Decode("ffmpeg stdout pipe unavailable".into()))?;
+
+        let frame_bytes = pitch * height * 3 / 2;
+        Ok(Self {
+            child: Some(child),
+            stdout: Some(stdout),
+            ctx: setup.ctx.clone(),
+            width,
+            height,
+            pitch,
+            frame_idx: 0,
+            frame_duration_us,
+            frame_buf: vec![0u8; frame_bytes],
+        })
+    }
+
+    fn read_next_frame(&mut self) -> Result<Option<()>> {
+        let stdout = self
+            .stdout
+            .as_mut()
+            .ok_or_else(|| EngineError::Decode("software decoder stdout closed".into()))?;
+        let mut filled = 0usize;
+        while filled < self.frame_buf.len() {
+            let read = stdout.read(&mut self.frame_buf[filled..]).map_err(|e| {
+                EngineError::Decode(format!("software decoder ffmpeg read failed: {e}"))
+            })?;
+            if read == 0 {
+                if filled == 0 {
+                    return Ok(None);
+                }
+                return Err(EngineError::Decode(format!(
+                    "software decoder received truncated frame: got {} of {} bytes",
+                    filled,
+                    self.frame_buf.len()
+                )));
+            }
+            filled += read;
+        }
+        Ok(Some(()))
+    }
+}
+
+impl FrameDecoder for SoftwareNv12Decoder {
+    fn decode_next(&mut self) -> Result<Option<DecodedFrame>> {
+        if self.read_next_frame()?.is_none() {
+            if let Some(mut child) = self.child.take() {
+                let status = child.wait().map_err(|e| {
+                    EngineError::Decode(format!(
+                        "software decoder failed waiting for ffmpeg exit: {e}"
+                    ))
+                })?;
+                if !status.success() {
+                    return Err(EngineError::Decode(format!(
+                        "software decoder ffmpeg exited with {status}"
+                    )));
+                }
+            }
+            self.stdout = None;
+            return Ok(None);
+        }
+
+        let gpu = self
+            .ctx
+            .device()
+            .htod_sync_copy(&self.frame_buf)
+            .map_err(|e| {
+                EngineError::Decode(format!("software decoder host->device copy failed: {e}"))
+            })?;
+
+        let texture = GpuTexture {
+            data: Arc::new(gpu),
+            width: self.width as u32,
+            height: self.height as u32,
+            pitch: self.pitch,
+            format: PixelFormat::Nv12,
+        };
+        let frame_idx = self.frame_idx;
+        self.frame_idx += 1;
+        Ok(Some(DecodedFrame {
+            envelope: FrameEnvelope {
+                texture,
+                frame_index: frame_idx,
+                pts: frame_idx as i64 * self.frame_duration_us,
+                is_keyframe: frame_idx == 0,
+            },
+            decode_event: None,
+            event_return: None,
+        }))
+    }
+}
+
+impl Drop for SoftwareNv12Decoder {
+    fn drop(&mut self) {
+        self.stdout = None;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+enum UpscaleDecoder {
+    Nvdec(PipelineDecoder),
+    Software(SoftwareNv12Decoder),
+}
+
+impl FrameDecoder for UpscaleDecoder {
+    fn decode_next(&mut self) -> Result<Option<DecodedFrame>> {
+        match self {
+            Self::Nvdec(dec) => dec.decode_next(),
+            Self::Software(dec) => dec.decode_next(),
+        }
+    }
+}
+
+struct SoftwareHevcEncoder {
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    ctx: Arc<GpuContext>,
+    width: usize,
+    height: usize,
+    tight_nv12: Vec<u8>,
+}
+
+impl SoftwareHevcEncoder {
+    fn new(setup: &RuntimeSetup, output_path: &Path, fps_num: u32, fps_den: u32) -> Result<Self> {
+        let fps_den = fps_den.max(1);
+        let mut cmd = ProcessCommand::new("ffmpeg");
+        cmd.arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-y")
+            .arg("-f")
+            .arg("rawvideo")
+            .arg("-pix_fmt")
+            .arg("nv12")
+            .arg("-s:v")
+            .arg(format!("{}x{}", setup.out_width, setup.out_height))
+            .arg("-framerate")
+            .arg(format!("{fps_num}/{fps_den}"))
+            .arg("-i")
+            .arg("-")
+            .arg("-an")
+            .arg("-c:v")
+            .arg("libx265")
+            .arg("-preset")
+            .arg("medium");
+
+        if !pipeline_is_container(output_path) {
+            cmd.arg("-f").arg("hevc");
+        }
+        cmd.arg(output_path);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| {
+            EngineError::Encode(format!(
+                "Software encode fallback unavailable (failed to launch ffmpeg): {e}"
+            ))
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| EngineError::Encode("ffmpeg stdin pipe unavailable".into()))?;
+
+        Ok(Self {
+            child: Some(child),
+            stdin: Some(stdin),
+            ctx: setup.ctx.clone(),
+            width: setup.out_width as usize,
+            height: setup.out_height as usize,
+            tight_nv12: Vec::new(),
+        })
+    }
+
+    fn tight_size_bytes(&self) -> usize {
+        self.width * self.height * 3 / 2
+    }
+
+    fn repack_nv12_tight(&mut self, src: &[u8], src_pitch: usize) -> Result<&[u8]> {
+        let y_size_tight = self.width * self.height;
+        let uv_size_tight = y_size_tight / 2;
+        let total_tight = y_size_tight + uv_size_tight;
+        let src_required = src_pitch * self.height * 3 / 2;
+        if src.len() < src_required {
+            return Err(EngineError::Encode(format!(
+                "Software encoder readback size too small: got {} bytes, need at least {} bytes",
+                src.len(),
+                src_required
+            )));
+        }
+
+        self.tight_nv12.resize(total_tight, 0);
+        for row in 0..self.height {
+            let src_off = row * src_pitch;
+            let dst_off = row * self.width;
+            self.tight_nv12[dst_off..dst_off + self.width]
+                .copy_from_slice(&src[src_off..src_off + self.width]);
+        }
+
+        let uv_src_base = src_pitch * self.height;
+        let uv_dst_base = y_size_tight;
+        for row in 0..(self.height / 2) {
+            let src_off = uv_src_base + row * src_pitch;
+            let dst_off = uv_dst_base + row * self.width;
+            self.tight_nv12[dst_off..dst_off + self.width]
+                .copy_from_slice(&src[src_off..src_off + self.width]);
+        }
+
+        Ok(&self.tight_nv12)
+    }
+}
+
+impl FrameEncoder for SoftwareHevcEncoder {
+    fn encode(&mut self, frame: FrameEnvelope) -> Result<()> {
+        if frame.texture.format != rave_core::types::PixelFormat::Nv12 {
+            return Err(EngineError::Encode(format!(
+                "Software fallback encoder expected NV12 frame, got {:?}",
+                frame.texture.format
+            )));
+        }
+        if frame.texture.width as usize != self.width
+            || frame.texture.height as usize != self.height
+        {
+            return Err(EngineError::Encode(format!(
+                "Software fallback encoder frame size mismatch: got {}x{}, expected {}x{}",
+                frame.texture.width, frame.texture.height, self.width, self.height
+            )));
+        }
+
+        self.ctx.sync_all().map_err(|e| {
+            EngineError::Encode(format!(
+                "Software fallback failed to synchronize CUDA streams: {e}"
+            ))
+        })?;
+        let host = self
+            .ctx
+            .device()
+            .dtoh_sync_copy(&*frame.texture.data)
+            .map_err(|e| {
+                EngineError::Encode(format!("Software fallback DtoH readback failed: {e}"))
+            })?;
+
+        let payload: Vec<u8> = if frame.texture.pitch == self.width {
+            let tight = self.tight_size_bytes();
+            if host.len() < tight {
+                return Err(EngineError::Encode(format!(
+                    "Software encoder readback too small for tight NV12: got {} bytes, need {} bytes",
+                    host.len(),
+                    tight
+                )));
+            }
+            host[..tight].to_vec()
+        } else {
+            self.repack_nv12_tight(&host, frame.texture.pitch)?.to_vec()
+        };
+
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| EngineError::Encode("Software fallback encoder stdin closed".into()))?;
+        stdin.write_all(&payload).map_err(|e| {
+            EngineError::Encode(format!(
+                "Software fallback failed writing frame to ffmpeg stdin: {e}"
+            ))
+        })?;
+
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        drop(self.stdin.take());
+        let child = self
+            .child
+            .take()
+            .ok_or_else(|| EngineError::Encode("Software fallback process missing".into()))?;
+        let output = child.wait_with_output().map_err(|e| {
+            EngineError::Encode(format!(
+                "Software fallback failed waiting for ffmpeg process: {e}"
+            ))
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Encode(format!(
+                "Software fallback ffmpeg encode failed (exit {}): {}",
+                output.status,
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SoftwareHevcEncoder {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+enum UpscaleEncoder {
+    Nvenc(PipelineEncoder),
+    Software(SoftwareHevcEncoder),
+}
+
+impl FrameEncoder for UpscaleEncoder {
+    fn encode(&mut self, frame: FrameEnvelope) -> Result<()> {
+        match self {
+            Self::Nvenc(enc) => enc.encode(frame),
+            Self::Software(enc) => enc.encode(frame),
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        match self {
+            Self::Nvenc(enc) => enc.flush(),
+            Self::Software(enc) => enc.flush(),
+        }
     }
 }
 
@@ -1032,9 +1415,10 @@ async fn run_upscale(args: UpscaleArgs) -> Result<()> {
 
     let wall_start = Instant::now();
     let setup = prepare_runtime(&args.shared, resolved).await?;
-    let decoder = create_decoder(&setup, &args.shared.input)?;
-    let encoder = create_nvenc_encoder(
+    let decoder = create_upscale_decoder(&setup, &args.shared.input)?;
+    let encoder = create_upscale_encoder(
         &setup,
+        args.shared.profile,
         &args.output,
         args.bitrate.unwrap_or(0),
         resolved.fps_num,
@@ -1053,6 +1437,8 @@ async fn run_upscale(args: UpscaleArgs) -> Result<()> {
             enable_profiler: true,
             strict_no_host_copies,
             strict_invariants,
+            max_batch: args.shared.max_batch,
+            batch_latency_deadline_us: args.shared.batch_latency_us.unwrap_or(8_000),
         }
     });
     let progress_mode = resolve_progress_mode(args.progress, args.jsonl);
@@ -1221,6 +1607,8 @@ async fn run_upscale_with_graph(
             enable_profiler: true,
             strict_no_host_copies,
             strict_invariants,
+            max_batch: args.shared.max_batch,
+            batch_latency_deadline_us: args.shared.batch_latency_us.unwrap_or(8_000),
         }
     });
 
@@ -1921,6 +2309,8 @@ async fn run_validate(args: ValidateArgs) -> Result<()> {
             enable_profiler: true,
             strict_no_host_copies,
             strict_invariants,
+            max_batch: 1,
+            batch_latency_deadline_us: 8_000,
         }
     });
 
@@ -2187,7 +2577,7 @@ Run with: LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/cuda-12/targets/x86_64-lin
         });
     }
 
-    let decoder = create_decoder(setup, &args.shared.input)?;
+    let decoder = create_upscale_decoder(setup, &args.shared.input)?;
     let pipeline = UpscalePipeline::new(setup.ctx.clone(), setup.kernels.clone(), {
         let (strict_no_host_copies, strict_invariants) =
             strict_pipeline_flags_for_profile(args.shared.profile);
@@ -2200,6 +2590,8 @@ Run with: LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/cuda-12/targets/x86_64-lin
             enable_profiler: true,
             strict_no_host_copies,
             strict_invariants,
+            max_batch: args.shared.max_batch,
+            batch_latency_deadline_us: args.shared.batch_latency_us.unwrap_or(8_000),
         }
     });
     let metrics = pipeline.metrics();
@@ -2655,9 +3047,68 @@ fn enumerate_cuda_devices() -> Result<(i32, Vec<CudaDeviceInfo>)> {
 
 #[cfg(not(target_os = "linux"))]
 fn enumerate_cuda_devices() -> Result<(i32, Vec<CudaDeviceInfo>)> {
-    Err(EngineError::Pipeline(
-        "Device enumeration is currently supported on Linux only".into(),
-    ))
+    // SAFETY: FFI calls into CUDA driver API with valid pointers.
+    let rc_init = unsafe { cuInit(0) };
+    if rc_init != CUDA_SUCCESS {
+        return Err(EngineError::Pipeline(format!(
+            "cuInit failed with rc={rc_init}"
+        )));
+    }
+
+    let mut driver_version = -1i32;
+    let rc_drv = unsafe { cuDriverGetVersion(&mut driver_version as *mut i32) };
+    if rc_drv != CUDA_SUCCESS {
+        return Err(EngineError::Pipeline(format!(
+            "cuDriverGetVersion failed with rc={rc_drv}"
+        )));
+    }
+
+    let mut count = 0i32;
+    let rc_count = unsafe { cuDeviceGetCount(&mut count as *mut i32) };
+    if rc_count != CUDA_SUCCESS {
+        return Err(EngineError::Pipeline(format!(
+            "cuDeviceGetCount failed with rc={rc_count}"
+        )));
+    }
+
+    let mut devices = Vec::<CudaDeviceInfo>::new();
+    for ordinal in 0..count {
+        let mut dev: CUdevice = -1;
+        let rc_get = unsafe { cuDeviceGet(&mut dev as *mut CUdevice, ordinal) };
+        if rc_get != CUDA_SUCCESS {
+            return Err(EngineError::Pipeline(format!(
+                "cuDeviceGet({ordinal}) failed with rc={rc_get}"
+            )));
+        }
+
+        let mut name_buf = [0 as c_char; 100];
+        let rc_name =
+            unsafe { cuDeviceGetName(name_buf.as_mut_ptr(), name_buf.len() as i32, dev) };
+        if rc_name != CUDA_SUCCESS {
+            return Err(EngineError::Pipeline(format!(
+                "cuDeviceGetName({ordinal}) failed with rc={rc_name}"
+            )));
+        }
+        let name = unsafe { CStr::from_ptr(name_buf.as_ptr()) }
+            .to_string_lossy()
+            .trim()
+            .to_string();
+
+        let mut total_mem = 0usize;
+        let rc_mem = unsafe { cuDeviceTotalMem_v2(&mut total_mem as *mut usize, dev) };
+        if rc_mem != CUDA_SUCCESS {
+            return Err(EngineError::Pipeline(format!(
+                "cuDeviceTotalMem_v2({ordinal}) failed with rc={rc_mem}"
+            )));
+        }
+
+        devices.push(CudaDeviceInfo {
+            ordinal,
+            name,
+            total_mem_bytes: total_mem as u64,
+        });
+    }
+    Ok((driver_version, devices))
 }
 
 fn is_nvenc_failure(err: &EngineError) -> bool {
@@ -2725,6 +3176,29 @@ fn create_decoder(setup: &RuntimeSetup, input_path: &Path) -> Result<PipelineDec
     pipeline_create_decoder(setup, input_path)
 }
 
+fn prefer_software_decode() -> bool {
+    let prefer_nvdec = std::env::var("RAVE_PREFER_NVDEC")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if prefer_nvdec {
+        return false;
+    }
+    std::env::consts::OS == "windows"
+}
+
+fn create_upscale_decoder(setup: &RuntimeSetup, input_path: &Path) -> Result<UpscaleDecoder> {
+    if prefer_software_decode() {
+        tracing::warn!(
+            "Using software decode fallback (ffmpeg raw NV12 path). Set RAVE_PREFER_NVDEC=1 to force NVDEC."
+        );
+        return Ok(UpscaleDecoder::Software(SoftwareNv12Decoder::new(
+            setup, input_path,
+        )?));
+    }
+    Ok(UpscaleDecoder::Nvdec(create_decoder(setup, input_path)?))
+}
+
 fn create_nvenc_encoder(
     setup: &RuntimeSetup,
     output_path: &Path,
@@ -2733,6 +3207,45 @@ fn create_nvenc_encoder(
     fps_den: u32,
 ) -> Result<PipelineEncoder> {
     pipeline_create_nvenc_encoder(setup, output_path, bitrate_kbps, fps_num, fps_den)
+}
+
+fn create_upscale_encoder(
+    setup: &RuntimeSetup,
+    profile: ProfileArg,
+    output_path: &Path,
+    bitrate_kbps: u32,
+    fps_num: u32,
+    fps_den: u32,
+) -> Result<UpscaleEncoder> {
+    tracing::info!(
+        width = setup.out_width,
+        height = setup.out_height,
+        fps = format!("{fps_num}/{fps_den}"),
+        bitrate_kbps,
+        "NVENC capability probe starting"
+    );
+    match create_nvenc_encoder(setup, output_path, bitrate_kbps, fps_num, fps_den) {
+        Ok(enc) => {
+            tracing::info!("NVENC capability probe succeeded");
+            Ok(UpscaleEncoder::Nvenc(enc))
+        }
+        Err(err) if is_nvenc_failure(&err) => {
+            let (strict_no_host_copies, _) = strict_pipeline_flags_for_profile(profile);
+            if strict_no_host_copies {
+                return Err(EngineError::Encode(format!(
+                    "NVENC unavailable and software encode fallback is disabled for profile {:?}: {}",
+                    profile, err
+                )));
+            }
+            tracing::warn!(
+                error = %err,
+                "NVENC capability probe failed; falling back to software HEVC encode via ffmpeg/libx265"
+            );
+            let fallback = SoftwareHevcEncoder::new(setup, output_path, fps_num, fps_den)?;
+            Ok(UpscaleEncoder::Software(fallback))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn parse_precision_policy(s: &str) -> Result<PrecisionPolicyConfig> {

@@ -377,6 +377,14 @@ pub const NV_ENC_PRESET_P7_GUID: GUID = GUID {
     Data4: [0x93, 0x1B, 0x53, 0xE5, 0x6F, 0x78, 0x84, 0x3B],
 };
 
+/// Balanced quality/performance preset GUID (P4).
+pub const NV_ENC_PRESET_P4_GUID: GUID = GUID {
+    Data1: 0x90A7B826,
+    Data2: 0xDF06,
+    Data3: 0x4862,
+    Data4: [0xB9, 0xD2, 0xCD, 0x6D, 0x73, 0xA0, 0x86, 0x81],
+};
+
 /// H.265 Main profile GUID.
 pub const NV_ENC_HEVC_PROFILE_MAIN_GUID: GUID = GUID {
     Data1: 0xB514C39A,
@@ -456,8 +464,8 @@ pub enum NV_ENC_TUNING_INFO {
 
 // ─── NVENC params structs ────────────────────────────────────────────────
 
-pub const NVENCAPI_MAJOR_VERSION: u32 = 12;
-pub const NVENCAPI_MINOR_VERSION: u32 = 2;
+pub const NVENCAPI_MAJOR_VERSION: u32 = 13;
+pub const NVENCAPI_MINOR_VERSION: u32 = 0;
 
 /// NVENC API version: `MAJOR | (MINOR << 24)`.
 /// Matches the SDK macro `NVENCAPI_VERSION`.
@@ -685,8 +693,11 @@ pub struct NV_ENCODE_API_FUNCTION_LIST {
     pub version: u32,
     pub reserved: u32,
     pub nvEncOpenEncodeSession: *const c_void,
-    pub nvEncGetEncodeGUIDs: *const c_void,
+    pub nvEncGetEncodeGUIDCount: *const c_void,
+    pub nvEncGetEncodeProfileGUIDCount: *const c_void,
     pub nvEncGetEncodeProfileGUIDs: *const c_void,
+    pub nvEncGetEncodeGUIDs: *const c_void,
+    pub nvEncGetInputFormatCount: *const c_void,
     pub nvEncGetInputFormats: *const c_void,
     pub nvEncGetEncodeCaps: *const c_void,
     pub nvEncGetEncodePresetCount: *const c_void,
@@ -729,7 +740,7 @@ pub struct NV_ENCODE_API_FUNCTION_LIST {
     pub nvEncUnregisterResource:
         Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
     pub nvEncReconfigureEncoder: *const c_void,
-    pub reserved2: *const c_void,
+    pub reserved1: *const c_void,
     pub nvEncCreateMVBuffer: *const c_void,
     pub nvEncDestroyMVBuffer: *const c_void,
     pub nvEncRunMotionEstimationOnly: *const c_void,

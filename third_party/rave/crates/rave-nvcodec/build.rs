@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Build script — locate CUDA toolkit, Video Codec SDK, and FFmpeg.
 //!
 //! Required environment variables:
@@ -9,7 +10,7 @@
 //!   2. CUDA_PATH/lib/x64 (fallback)
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 fn find_linux_cuda_root() -> Option<PathBuf> {
@@ -53,11 +54,34 @@ fn resolve_cuda_root() -> Option<PathBuf> {
     None
 }
 
+fn resolve_nvcodec_dir(manifest_dir: &Path) -> Option<PathBuf> {
+    let rave_root = manifest_dir.parent()?.parent()?;
+    let mut candidates = vec![
+        // Vendored inside the rave repo.
+        rave_root.join("third_party").join("nvcodec"),
+    ];
+    // Parent app layout: <app>/third_party/{rave,nvcodec,ffmpeg}.
+    if let Some(parent_third_party) = rave_root.parent() {
+        candidates.push(parent_third_party.join("nvcodec"));
+    }
+
+    candidates.into_iter().find(|dir| {
+        dir.exists() && dir.join("nvcuvid.lib").exists() && dir.join("nvencodeapi.lib").exists()
+    })
+}
+
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(rave_nvcodec_stub)");
+    println!("cargo:rustc-check-cfg=cfg(docsrs)");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
     println!("cargo:rerun-if-changed=build.rs");
+
+    if env::var_os("DOCS_RS").is_some() {
+        println!("cargo:warning=DOCS_RS detected; building rave-nvcodec in stub mode");
+        println!("cargo:rustc-cfg=rave_nvcodec_stub");
+        return;
+    }
 
     // ── CUDA Toolkit ────────────────────────────────────────────────────────
 
@@ -119,27 +143,18 @@ fn main() {
     // ── Video Codec SDK (nvcuvid + nvEncodeAPI) ─────────────────────────────
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let nvcodec_dir = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .unwrap()
-        .join("third_party")
-        .join("nvcodec");
+    let nvcodec_dir = resolve_nvcodec_dir(&manifest_dir);
 
     if cfg!(target_os = "windows") {
-        if nvcodec_dir.exists()
-            && nvcodec_dir.join("nvcuvid.lib").exists()
-            && nvcodec_dir.join("nvencodeapi.lib").exists()
-        {
+        if let Some(nvcodec_dir) = nvcodec_dir {
             println!("cargo:rustc-link-search=native={}", nvcodec_dir.display());
         } else {
             // Fallback: expect libs in CUDA toolkit directory
             println!(
-                "cargo:warning=Video Codec SDK libs not found in {}. Falling back to CUDA lib dir.",
-                nvcodec_dir.display()
+                "cargo:warning=Video Codec SDK libs not found in expected nvcodec locations. Falling back to CUDA lib dir."
             );
         }
-    } else if nvcodec_dir.exists() {
+    } else if let Some(nvcodec_dir) = nvcodec_dir {
         // Linux toolchains consume .so/.a, but adding this path is harmless and
         // supports repos that vendor Linux NVCodec artifacts in third_party/nvcodec.
         println!("cargo:rustc-link-search=native={}", nvcodec_dir.display());

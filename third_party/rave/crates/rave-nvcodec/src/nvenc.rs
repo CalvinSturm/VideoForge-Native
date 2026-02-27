@@ -45,28 +45,7 @@ use rave_core::types::{FrameEnvelope, PixelFormat};
 
 // ─── NVENC configuration ─────────────────────────────────────────────────
 
-/// Encoder configuration parameters.
-#[derive(Clone, Debug)]
-pub struct NvEncConfig {
-    /// Target width.
-    pub width: u32,
-    /// Target height.
-    pub height: u32,
-    /// Framerate numerator.
-    pub fps_num: u32,
-    /// Framerate denominator.
-    pub fps_den: u32,
-    /// Average bitrate in bits/sec (0 = CQP mode).
-    pub bitrate: u32,
-    /// Max bitrate in bits/sec (VBR mode).
-    pub max_bitrate: u32,
-    /// GOP length (frames between IDR).
-    pub gop_length: u32,
-    /// B-frame interval (0 = no B-frames).
-    pub b_frames: u32,
-    /// NV12 row pitch (must match incoming frame pitch).
-    pub nv12_pitch: u32,
-}
+pub use crate::config::NvEncConfig;
 
 // ─── Registration cache ──────────────────────────────────────────────────
 
@@ -109,11 +88,11 @@ impl CudaContextGuard {
     fn make_current(target_ctx: CUcontext) -> Result<Self> {
         let mut prev_ctx: CUcontext = ptr::null_mut();
         unsafe {
-            check_cu(cuCtxGetCurrent(&mut prev_ctx), "cuCtxGetCurrent")?;
+            check_cu_encode(cuCtxGetCurrent(&mut prev_ctx), "cuCtxGetCurrent")?;
         }
         if prev_ctx != target_ctx {
             unsafe {
-                check_cu(cuCtxSetCurrent(target_ctx), "cuCtxSetCurrent")?;
+                check_cu_encode(cuCtxSetCurrent(target_ctx), "cuCtxSetCurrent")?;
             }
         }
         Ok(Self {
@@ -140,6 +119,41 @@ fn ptr_hex(ptr: *mut c_void) -> String {
 
 fn nvenc_version_parts(v: u32) -> (u32, u32) {
     (v & 0x00ff_ffff, (v >> 24) & 0xff)
+}
+
+#[derive(Clone, Copy)]
+struct PresetAttempt {
+    preset: GUID,
+    tuning: NV_ENC_TUNING_INFO,
+}
+
+fn preset_attempts() -> [PresetAttempt; 6] {
+    [
+        PresetAttempt {
+            preset: NV_ENC_PRESET_P7_GUID,
+            tuning: NV_ENC_TUNING_INFO::HIGH_QUALITY,
+        },
+        PresetAttempt {
+            preset: NV_ENC_PRESET_P7_GUID,
+            tuning: NV_ENC_TUNING_INFO::LOW_LATENCY,
+        },
+        PresetAttempt {
+            preset: NV_ENC_PRESET_P7_GUID,
+            tuning: NV_ENC_TUNING_INFO::UNDEFINED,
+        },
+        PresetAttempt {
+            preset: NV_ENC_PRESET_P4_GUID,
+            tuning: NV_ENC_TUNING_INFO::HIGH_QUALITY,
+        },
+        PresetAttempt {
+            preset: NV_ENC_PRESET_P4_GUID,
+            tuning: NV_ENC_TUNING_INFO::LOW_LATENCY,
+        },
+        PresetAttempt {
+            preset: NV_ENC_PRESET_P4_GUID,
+            tuning: NV_ENC_TUNING_INFO::UNDEFINED,
+        },
+    ]
 }
 
 fn resolved_libnvidia_encode_path() -> Option<String> {
@@ -275,7 +289,7 @@ impl NvEncoder {
 
         let mut current_ctx: CUcontext = ptr::null_mut();
         unsafe {
-            check_cu(
+            check_cu_encode(
                 cuCtxGetCurrent(&mut current_ctx),
                 "cuCtxGetCurrent (before nvEncOpenEncodeSessionEx)",
             )?;
@@ -318,7 +332,13 @@ impl NvEncoder {
         let get_preset_fn = if fns.nvEncGetEncodePresetConfig.is_null() {
             None
         } else {
-            // SAFETY: Function pointer layout matches NVENC API declaration.
+            // SAFETY: `fns` was populated by `NvEncodeAPICreateInstance`, which
+            // guarantees that non-null entries in `NV_ENCODE_API_FUNCTION_LIST`
+            // point to functions with the declared signature.
+            // `nvEncGetEncodePresetConfig` is stored as `*const c_void` in the
+            // function table for binary-compatibility reasons; its true signature
+            // matches `GetPresetFn` exactly.  The null check above ensures this
+            // pointer is valid before the transmute.
             Some(unsafe {
                 mem::transmute::<*const c_void, GetPresetFn>(fns.nvEncGetEncodePresetConfig)
             })
@@ -327,58 +347,87 @@ impl NvEncoder {
         let mut preset_config: NV_ENC_PRESET_CONFIG = unsafe { std::mem::zeroed() };
         let mut got_preset = false;
         let version_candidates = [8, 7, 6, 5, 4, 3, 2, 1];
+        let mut selected_preset_guid = NV_ENC_PRESET_P7_GUID;
+        let mut selected_tuning = NV_ENC_TUNING_INFO::HIGH_QUALITY;
 
         if let Some(get_preset_ex_fn) = fns.nvEncGetEncodePresetConfigEx {
-            for ver in version_candidates {
-                preset_config = unsafe { std::mem::zeroed() };
-                preset_config.version = nvenc_struct_version(ver);
-                preset_config.presetCfg.version = nvenc_struct_version(ver);
-                let status = unsafe {
-                    get_preset_ex_fn(
-                        encoder,
-                        NV_ENC_CODEC_HEVC_GUID,
-                        NV_ENC_PRESET_P7_GUID,
-                        NV_ENC_TUNING_INFO::HIGH_QUALITY,
-                        &mut preset_config,
-                    )
-                };
-                if status == NV_ENC_SUCCESS {
-                    got_preset = true;
-                    info!(
-                        struct_version = format_args!("{:#010x}", preset_config.version),
-                        "Loaded NVENC preset via nvEncGetEncodePresetConfigEx"
+            'outer_ex: for attempt in preset_attempts() {
+                for ver in version_candidates {
+                    preset_config = unsafe { std::mem::zeroed() };
+                    preset_config.version = nvenc_struct_version(ver);
+                    preset_config.presetCfg.version = nvenc_struct_version(ver);
+                    let status = unsafe {
+                        get_preset_ex_fn(
+                            encoder,
+                            NV_ENC_CODEC_HEVC_GUID,
+                            attempt.preset,
+                            attempt.tuning,
+                            &mut preset_config,
+                        )
+                    };
+                    if status == NV_ENC_SUCCESS {
+                        got_preset = true;
+                        selected_preset_guid = attempt.preset;
+                        selected_tuning = attempt.tuning;
+                        info!(
+                            struct_version = format_args!("{:#010x}", preset_config.version),
+                            tuning = ?selected_tuning,
+                            "Loaded NVENC preset via nvEncGetEncodePresetConfigEx"
+                        );
+                        break 'outer_ex;
+                    }
+                    if status == NV_ENC_ERR_INVALID_VERSION
+                        || status == NV_ENC_ERR_UNSUPPORTED_PARAM
+                        || status == NV_ENC_ERR_INVALID_PARAM
+                    {
+                        continue;
+                    }
+                    warn!(
+                        status = status,
+                        status_name = nvenc_status_name(status),
+                        "nvEncGetEncodePresetConfigEx returned non-retryable status; trying fallback attempts"
                     );
                     break;
-                }
-                if status != NV_ENC_ERR_INVALID_VERSION {
-                    check_nvenc(status, "nvEncGetEncodePresetConfigEx")?;
                 }
             }
         }
 
         if !got_preset && let Some(get_preset_legacy_fn) = get_preset_fn {
-            for ver in version_candidates {
-                preset_config = unsafe { std::mem::zeroed() };
-                preset_config.version = nvenc_struct_version(ver);
-                preset_config.presetCfg.version = nvenc_struct_version(ver);
-                let status = unsafe {
-                    get_preset_legacy_fn(
-                        encoder,
-                        NV_ENC_CODEC_HEVC_GUID,
-                        NV_ENC_PRESET_P7_GUID,
-                        &mut preset_config,
-                    )
-                };
-                if status == NV_ENC_SUCCESS {
-                    got_preset = true;
-                    info!(
-                        struct_version = format_args!("{:#010x}", preset_config.version),
-                        "Loaded NVENC preset via legacy nvEncGetEncodePresetConfig"
+            'outer_legacy: for preset_guid in [NV_ENC_PRESET_P7_GUID, NV_ENC_PRESET_P4_GUID] {
+                for ver in version_candidates {
+                    preset_config = unsafe { std::mem::zeroed() };
+                    preset_config.version = nvenc_struct_version(ver);
+                    preset_config.presetCfg.version = nvenc_struct_version(ver);
+                    let status = unsafe {
+                        get_preset_legacy_fn(
+                            encoder,
+                            NV_ENC_CODEC_HEVC_GUID,
+                            preset_guid,
+                            &mut preset_config,
+                        )
+                    };
+                    if status == NV_ENC_SUCCESS {
+                        got_preset = true;
+                        selected_preset_guid = preset_guid;
+                        selected_tuning = NV_ENC_TUNING_INFO::UNDEFINED;
+                        info!(
+                            struct_version = format_args!("{:#010x}", preset_config.version),
+                            "Loaded NVENC preset via legacy nvEncGetEncodePresetConfig"
+                        );
+                        break 'outer_legacy;
+                    }
+                    if status == NV_ENC_ERR_INVALID_VERSION
+                        || status == NV_ENC_ERR_UNSUPPORTED_PARAM
+                        || status == NV_ENC_ERR_INVALID_PARAM
+                    {
+                        continue;
+                    }
+                    warn!(
+                        status = status,
+                        status_name = nvenc_status_name(status),
+                        "Legacy nvEncGetEncodePresetConfig returned non-retryable status; trying fallback attempts"
                     );
                     break;
-                }
-                if status != NV_ENC_ERR_INVALID_VERSION {
-                    check_nvenc(status, "nvEncGetEncodePresetConfig")?;
                 }
             }
         }
@@ -388,33 +437,36 @@ impl NvEncoder {
             preset_config.presetCfg
         } else {
             warn!(
-                "Could not query NVENC preset config due to version mismatch; using default encoder config"
+                "Could not query NVENC preset config; using NVENC internal defaults (encodeConfig=null)"
             );
             unsafe { std::mem::zeroed() }
         };
-        if enc_config.version == 0 {
-            enc_config.version = nvenc_struct_version(8);
-        }
-        enc_config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
-        enc_config.gopLength = config.gop_length;
-        enc_config.frameIntervalP = (config.b_frames + 1) as i32;
+        let use_custom_enc_config = got_preset;
+        if use_custom_enc_config {
+            if enc_config.version == 0 {
+                enc_config.version = nvenc_struct_version(8);
+            }
+            enc_config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
+            enc_config.gopLength = config.gop_length;
+            enc_config.frameIntervalP = (config.b_frames + 1) as i32;
 
-        if config.bitrate > 0 {
-            // VBR mode.
-            enc_config.rcParams.rateControlMode = 2; // NV_ENC_PARAMS_RC_VBR
-            enc_config.rcParams.averageBitRate = config.bitrate;
-            enc_config.rcParams.maxBitRate = if config.max_bitrate > 0 {
-                config.max_bitrate
-            } else {
-                config.bitrate * 3 / 2
-            };
+            if config.bitrate > 0 {
+                // VBR mode.
+                enc_config.rcParams.rateControlMode = 2; // NV_ENC_PARAMS_RC_VBR
+                enc_config.rcParams.averageBitRate = config.bitrate;
+                enc_config.rcParams.maxBitRate = if config.max_bitrate > 0 {
+                    config.max_bitrate
+                } else {
+                    config.bitrate * 3 / 2
+                };
+            }
+            // If bitrate == 0, the preset default (typically CQP) is used.
         }
-        // If bitrate == 0, the preset default (typically CQP) is used.
 
         let mut init_params: NV_ENC_INITIALIZE_PARAMS = unsafe { std::mem::zeroed() };
         init_params.version = nvenc_struct_version(8);
         init_params.encodeGUID = NV_ENC_CODEC_HEVC_GUID;
-        init_params.presetGUID = NV_ENC_PRESET_P7_GUID;
+        init_params.presetGUID = selected_preset_guid;
         init_params.encodeWidth = config.width;
         init_params.encodeHeight = config.height;
         init_params.darWidth = config.width;
@@ -422,8 +474,12 @@ impl NvEncoder {
         init_params.frameRateNum = config.fps_num;
         init_params.frameRateDen = config.fps_den;
         init_params.enablePTD = 1; // Enable picture-type decision.
-        init_params.encodeConfig = &mut enc_config;
-        init_params.tuningInfo = NV_ENC_TUNING_INFO::HIGH_QUALITY;
+        init_params.encodeConfig = if use_custom_enc_config {
+            &mut enc_config
+        } else {
+            ptr::null_mut()
+        };
+        init_params.tuningInfo = selected_tuning;
         init_params.maxEncodeWidth = config.width;
         init_params.maxEncodeHeight = config.height;
 
@@ -433,24 +489,43 @@ impl NvEncoder {
 
         // Retry with older structure versions if runtime rejects the compiled one.
         let mut init_ok = false;
-        for ver in version_candidates {
-            init_params.version = nvenc_struct_version(ver);
-            let status = unsafe { init_fn(encoder, &mut init_params) };
-            if status == NV_ENC_SUCCESS {
-                init_ok = true;
-                break;
-            }
-            if status != NV_ENC_ERR_INVALID_VERSION {
+        'init_outer: for attempt in preset_attempts() {
+            init_params.presetGUID = attempt.preset;
+            init_params.tuningInfo = attempt.tuning;
+            for ver in version_candidates {
+                init_params.version = nvenc_struct_version(ver);
+                let status = unsafe { init_fn(encoder, &mut init_params) };
+                if status == NV_ENC_SUCCESS {
+                    init_ok = true;
+                    selected_preset_guid = attempt.preset;
+                    selected_tuning = attempt.tuning;
+                    break 'init_outer;
+                }
+                if status == NV_ENC_ERR_INVALID_VERSION
+                    || status == NV_ENC_ERR_UNSUPPORTED_PARAM
+                    || status == NV_ENC_ERR_INVALID_PARAM
+                {
+                    continue;
+                }
                 check_nvenc(status, "nvEncInitializeEncoder")?;
             }
         }
         if !init_ok {
             return Err(EngineError::Encode(
-                "nvEncInitializeEncoder: all struct-version retries returned NV_ENC_ERR_INVALID_VERSION".into(),
+                "nvEncInitializeEncoder: all preset/tuning/version retries failed".into(),
             ));
         }
 
-        info!("NVENC encoder initialized — HEVC P7 High Quality");
+        info!(
+            preset_guid = format_args!(
+                "{:08x}-{:04x}-{:04x}",
+                selected_preset_guid.Data1,
+                selected_preset_guid.Data2,
+                selected_preset_guid.Data3
+            ),
+            tuning = ?selected_tuning,
+            "NVENC encoder initialized"
+        );
 
         // ── Create bitstream buffer ──
         let create_bs_fn = fns

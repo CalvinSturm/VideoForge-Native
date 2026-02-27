@@ -47,10 +47,12 @@
 //! `PipelineMetrics` tracks per-stage frame counts with atomic counters.
 //! Stage latency is tracked via wall-clock `Instant` timing.
 
+#[cfg(feature = "nvidia-run-graph")]
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use std::{path::Path, sync::Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -64,18 +66,26 @@ use rave_core::codec_traits::{
 };
 use rave_core::context::{GpuContext, PerfStage};
 use rave_core::error::{EngineError, Result};
+#[cfg(feature = "nvidia-run-graph")]
 use rave_core::ffi_types::cudaVideoCodec;
 use rave_core::host_copy_audit::{audit_device_texture, require_host_copy_audit_if_strict};
 use rave_core::types::{FrameEnvelope, GpuTexture, PixelFormat};
-use rave_cuda::blur::{BlurRegion, FaceBlurConfig, FaceBlurEngine};
 use rave_cuda::kernels::{ModelPrecision, PreprocessKernels};
+#[cfg(feature = "nvidia-run-graph")]
 use rave_ffmpeg::ffmpeg_demuxer::FfmpegDemuxer;
+#[cfg(feature = "nvidia-run-graph")]
 use rave_ffmpeg::ffmpeg_muxer::FfmpegMuxer;
+#[cfg(feature = "nvidia-run-graph")]
 use rave_ffmpeg::file_sink::FileBitstreamSink;
+#[cfg(feature = "nvidia-run-graph")]
 use rave_ffmpeg::file_source::FileBitstreamSource;
+#[cfg(feature = "nvidia-run-graph")]
 use rave_ffmpeg::probe_container;
+#[cfg(feature = "nvidia-run-graph")]
 use rave_nvcodec::nvdec::NvDecoder;
+#[cfg(feature = "nvidia-run-graph")]
 use rave_nvcodec::nvenc::{NvEncConfig, NvEncoder};
+#[cfg(feature = "nvidia-run-graph")]
 use rave_tensorrt::tensorrt::TensorRtBackend;
 
 use crate::stage_graph::{
@@ -88,19 +98,28 @@ use crate::stage_graph::{
 /// Atomic per-stage frame counters and latency tracking.
 #[derive(Debug)]
 pub struct PipelineMetrics {
+    /// Total frames that have exited the decode stage.
     pub frames_decoded: AtomicU64,
+    /// Total frames that have exited the preprocess stage.
     pub frames_preprocessed: AtomicU64,
+    /// Total frames that have exited the inference stage.
     pub frames_inferred: AtomicU64,
+    /// Total frames that have exited the encode stage.
     pub frames_encoded: AtomicU64,
-    // Stage latency accumulators (microseconds).
+    /// Cumulative decode stage wall-clock time in microseconds.
     pub decode_total_us: AtomicU64,
+    /// Cumulative preprocess stage wall-clock time in microseconds.
     pub preprocess_total_us: AtomicU64,
+    /// Cumulative inference stage wall-clock time in microseconds.
     pub inference_total_us: AtomicU64,
+    /// Cumulative postprocess stage wall-clock time in microseconds.
     pub postprocess_total_us: AtomicU64,
+    /// Cumulative encode stage wall-clock time in microseconds.
     pub encode_total_us: AtomicU64,
 }
 
 impl PipelineMetrics {
+    /// Allocate a fresh [`PipelineMetrics`] with all counters zeroed.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             frames_decoded: AtomicU64::new(0),
@@ -171,24 +190,35 @@ fn enforce_metrics_invariants(metrics: &PipelineMetrics, strict: bool) -> Result
     )))
 }
 
+/// Determinism checking mode for the inference stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DeterminismPolicy {
+    /// Attempt hash comparison if possible; skip silently if not supported.
     #[default]
     BestEffort,
+    /// Require a successful hash comparison; fail if it cannot be performed.
     RequireHash,
 }
 
+/// Reason why determinism checking was skipped for a frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeterminismSkipReason {
+    /// The `audit-no-host-copies` feature flag is not active.
     FeatureDisabled,
+    /// The output texture format is not supported for readback.
     UnsupportedFormat,
+    /// The debug readback path is unavailable in this build.
     DebugReadbackUnavailable,
+    /// The active inference backend does not support host readback.
     BackendNoReadback,
+    /// Determinism checking was explicitly disabled by [`DeterminismPolicy::BestEffort`].
     ExplicitlyDisabled,
+    /// An unexpected condition prevented the check.
     Unknown,
 }
 
 impl DeterminismSkipReason {
+    /// Machine-readable audit code string for this skip reason.
     pub fn code(self) -> &'static str {
         match self {
             Self::FeatureDisabled => "feature_disabled",
@@ -201,13 +231,19 @@ impl DeterminismSkipReason {
     }
 }
 
+/// Observed outcome of a determinism hash attempt for a single frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct DeterminismObserved {
+    /// `true` if a hash was requested for this frame.
     pub hash_requested: bool,
+    /// `true` if the hash was successfully computed.
     pub hash_available: bool,
+    /// Reason the hash was not computed, if applicable.
     pub skip_reason: Option<DeterminismSkipReason>,
 }
 
+/// Enforce the determinism policy, returning an error if `RequireHash` was
+/// requested but a hash was not available.
 pub fn enforce_determinism_policy(
     policy: DeterminismPolicy,
     observed: DeterminismObserved,
@@ -252,6 +288,7 @@ pub fn enforce_determinism_policy(
 
 // ─── Pipeline config ────────────────────────────────────────────────────────
 
+/// Runtime configuration for an [`UpscalePipeline`] instance.
 #[derive(Clone, Debug)]
 pub struct PipelineConfig {
     /// Channel capacity: decode → preprocess.
@@ -276,6 +313,17 @@ pub struct PipelineConfig {
     /// Defaults to `false` so release behavior remains unchanged unless
     /// explicitly enabled (for example via `production_strict` profile wiring).
     pub strict_invariants: bool,
+    /// Maximum frames per inference batch (`1..=8`).
+    ///
+    /// When `> 1`, the inference stage accumulates frames before calling
+    /// `process_batch()`. Defaults to `1` (single-frame inference).
+    pub max_batch: usize,
+    /// How long (µs) the batch accumulator waits for additional frames after
+    /// the first arrives before flushing a partial batch.
+    ///
+    /// Larger values fill batches more completely at the cost of added latency.
+    /// Defaults to `8_000` µs (8 ms). Ignored when `max_batch == 1`.
+    pub batch_latency_deadline_us: u64,
 }
 
 impl Default for PipelineConfig {
@@ -289,12 +337,18 @@ impl Default for PipelineConfig {
             enable_profiler: true,
             strict_no_host_copies: false,
             strict_invariants: false,
+            max_batch: 1,
+            batch_latency_deadline_us: 8_000,
         }
     }
 }
 
 // ─── Pipeline ───────────────────────────────────────────────────────────────
 
+/// Bounded GPU pipeline: decode → preprocess → infer → encode.
+///
+/// Call [`run`](Self::run) to execute the full pipeline, or [`run_graph`](Self::run_graph)
+/// to drive execution from a [`StageGraph`] configuration.
 pub struct UpscalePipeline {
     ctx: Arc<GpuContext>,
     kernels: Arc<PreprocessKernels>,
@@ -304,6 +358,7 @@ pub struct UpscalePipeline {
 }
 
 impl UpscalePipeline {
+    /// Create a new pipeline with the given GPU context, compiled kernels, and config.
     pub fn new(
         ctx: Arc<GpuContext>,
         kernels: Arc<PreprocessKernels>,
@@ -322,10 +377,14 @@ impl UpscalePipeline {
         }
     }
 
+    /// Return a clone of the pipeline's cancellation token.
+    ///
+    /// Calling `cancel()` on this token requests cooperative shutdown of all stages.
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
     }
 
+    /// Return a reference to the shared atomic metrics counters.
     pub fn metrics(&self) -> Arc<PipelineMetrics> {
         self.metrics.clone()
     }
@@ -425,6 +484,8 @@ impl UpscalePipeline {
             } else {
                 None
             };
+            let max_batch = self.config.max_batch;
+            let batch_latency_deadline_us = self.config.batch_latency_deadline_us;
             tasks.spawn(async move {
                 inference_stage(
                     rx_preprocessed,
@@ -438,6 +499,8 @@ impl UpscalePipeline {
                     &metrics,
                     profiler_ctx.as_deref(),
                     strict_no_host_copies,
+                    max_batch,
+                    batch_latency_deadline_us,
                 )
                 .await
             });
@@ -547,6 +610,7 @@ impl UpscalePipeline {
     /// Run a fixed, validated stage graph on container/bitstream paths.
     ///
     /// This is the stable integration surface for app-level effect chains.
+    #[cfg(feature = "nvidia-run-graph")]
     #[instrument(skip_all, name = "upscale_pipeline_graph")]
     pub async fn run_graph(
         &self,
@@ -740,6 +804,24 @@ impl UpscalePipeline {
             vram_peak_bytes: vram_peak,
             audit,
         })
+    }
+
+    /// Run a fixed, validated stage graph on container/bitstream paths.
+    ///
+    /// This entry point requires the `nvidia-run-graph` feature.
+    #[cfg(not(feature = "nvidia-run-graph"))]
+    pub async fn run_graph(
+        &self,
+        _input: &std::path::Path,
+        _output: &std::path::Path,
+        _graph: StageGraph,
+        _profile: ProfilePreset,
+        _contract: RunContract,
+    ) -> Result<PipelineReport> {
+        Err(EngineError::Pipeline(
+            "`UpscalePipeline::run_graph` requires the `nvidia-run-graph` feature on `rave-pipeline`"
+                .into(),
+        ))
     }
 
     /// Synthetic stress test — validates engine mechanics without real codecs.
@@ -974,17 +1056,26 @@ mod tests {
     }
 }
 
-/// Stress test result.
+/// Throughput and memory statistics from a synthetic stress test run.
 #[derive(Debug)]
 pub struct StressTestReport {
+    /// Total frames processed during the measured phase.
     pub total_frames: u64,
+    /// Wall-clock duration of the measured phase.
     pub elapsed: Duration,
+    /// Average throughput in frames per second.
     pub avg_fps: f64,
+    /// Average end-to-end latency per frame in milliseconds.
     pub avg_latency_ms: f64,
+    /// Peak VRAM usage observed during the run in bytes.
     pub peak_vram_bytes: usize,
+    /// VRAM usage at the end of the run in bytes.
     pub final_vram_bytes: usize,
+    /// VRAM usage before the run started in bytes (baseline).
     pub vram_before_bytes: usize,
+    /// Total frames decoded during the run.
     pub frames_decoded: u64,
+    /// Total frames encoded during the run.
     pub frames_encoded: u64,
     /// Pool hit rate during the measured phase (post warm-up).
     pub pool_hit_rate_pct: f64,
@@ -1007,19 +1098,24 @@ pub struct AuditReport {
     pub stream_overlap_check: AuditResult,
 }
 
+/// Outcome of a single invariant check in the audit suite.
 #[derive(Debug)]
 pub enum AuditResult {
+    /// The check passed; the string contains a description of the observation.
     Pass(String),
+    /// The check failed; the string describes the violation.
     Fail(String),
 }
 
 impl AuditResult {
+    /// Return `true` if this result is a [`Pass`](AuditResult::Pass).
     pub fn is_pass(&self) -> bool {
         matches!(self, AuditResult::Pass(_))
     }
 }
 
 impl AuditReport {
+    /// Return `true` if every check in the report passed.
     pub fn all_pass(&self) -> bool {
         self.host_alloc_check.is_pass()
             && self.vram_leak_check.is_pass()
@@ -1230,6 +1326,7 @@ impl AuditSuite {
 //  STAGE GRAPH BACKEND
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "nvidia-run-graph")]
 #[derive(Clone, Copy)]
 struct GraphInputConfig {
     codec: cudaVideoCodec,
@@ -1240,6 +1337,7 @@ struct GraphInputConfig {
     input_is_container: bool,
 }
 
+#[cfg(feature = "nvidia-run-graph")]
 fn is_container_path(path: &Path) -> bool {
     const CONTAINER_EXTENSIONS: &[&str] = &["mp4", "mkv", "mov", "avi", "webm", "ts", "flv"];
     path.extension()
@@ -1248,6 +1346,7 @@ fn is_container_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "nvidia-run-graph")]
 fn resolve_graph_input(path: &Path) -> Result<GraphInputConfig> {
     if is_container_path(path) {
         let meta = probe_container(path)?;
@@ -1271,6 +1370,7 @@ fn resolve_graph_input(path: &Path) -> Result<GraphInputConfig> {
     })
 }
 
+#[cfg(feature = "nvidia-run-graph")]
 fn audit_failures(audit: &[AuditItem]) -> String {
     audit
         .iter()
@@ -1286,31 +1386,26 @@ fn audit_failures(audit: &[AuditItem]) -> String {
         .join("; ")
 }
 
-struct BlurStageRuntime {
-    stage_id: crate::stage_graph::StageId,
-    config: FaceBlurConfig,
-    engine: Mutex<FaceBlurEngine>,
-}
-
+#[cfg(feature = "nvidia-run-graph")]
 #[derive(Default)]
 struct GraphBackendState {
     hashed_frames: usize,
     stage_hashes: Vec<String>,
     audit: Vec<AuditItem>,
-    warned_swap_stub: bool,
     warned_hash_feature: bool,
 }
 
+#[cfg(feature = "nvidia-run-graph")]
 struct GraphBackend {
     trt: Arc<TensorRtBackend>,
     graph: StageGraph,
     ctx: Arc<GpuContext>,
     kernels: Arc<PreprocessKernels>,
     contract: RunContract,
-    blur_stages: Vec<BlurStageRuntime>,
     state: Mutex<GraphBackendState>,
 }
 
+#[cfg(feature = "nvidia-run-graph")]
 impl GraphBackend {
     fn new(
         trt: Arc<TensorRtBackend>,
@@ -1319,39 +1414,12 @@ impl GraphBackend {
         kernels: Arc<PreprocessKernels>,
         contract: RunContract,
     ) -> Result<Self> {
-        let mut blur_stages = Vec::new();
-        for stage in &graph.stages {
-            if let StageConfig::FaceBlur { id, config } = stage {
-                let regions = config.regions.as_ref().map(|items| {
-                    items
-                        .iter()
-                        .map(|r| BlurRegion {
-                            x: r.x,
-                            y: r.y,
-                            width: r.width,
-                            height: r.height,
-                        })
-                        .collect::<Vec<_>>()
-                });
-                blur_stages.push(BlurStageRuntime {
-                    stage_id: *id,
-                    config: FaceBlurConfig {
-                        sigma: config.sigma,
-                        iterations: config.iterations,
-                        regions,
-                    },
-                    engine: Mutex::new(FaceBlurEngine::compile(ctx.device())?),
-                });
-            }
-        }
-
         Ok(Self {
             trt,
             graph,
             ctx,
             kernels,
             contract,
-            blur_stages,
             state: Mutex::new(GraphBackendState::default()),
         })
     }
@@ -1420,61 +1488,6 @@ impl GraphBackend {
         );
     }
 
-    fn apply_face_blur(
-        &self,
-        stage_id: crate::stage_graph::StageId,
-        texture: GpuTexture,
-    ) -> Result<GpuTexture> {
-        let runtime = self
-            .blur_stages
-            .iter()
-            .find(|runtime| runtime.stage_id == stage_id)
-            .ok_or_else(|| {
-                EngineError::InvariantViolation(format!(
-                    "FaceBlur stage runtime missing for stage {}",
-                    stage_id.0
-                ))
-            })?;
-
-        let mut engine = runtime.engine.lock().unwrap();
-        match texture.format {
-            PixelFormat::RgbPlanarF32 => engine.blur_rgb_planar_f32(
-                &texture,
-                &runtime.config,
-                &self.ctx,
-                &self.ctx.inference_stream,
-            ),
-            PixelFormat::RgbPlanarF16 => {
-                let f32 = self.kernels.convert_f16_to_f32(
-                    &texture,
-                    &self.ctx,
-                    &self.ctx.inference_stream,
-                )?;
-                let blurred = engine.blur_rgb_planar_f32(
-                    &f32,
-                    &runtime.config,
-                    &self.ctx,
-                    &self.ctx.inference_stream,
-                )?;
-                self.kernels
-                    .convert_f32_to_f16(&blurred, &self.ctx, &self.ctx.inference_stream)
-            }
-            other => Err(EngineError::FormatMismatch {
-                expected: PixelFormat::RgbPlanarF32,
-                actual: other,
-            }),
-        }
-    }
-
-    fn apply_swap_stub(&self, stage_id: crate::stage_graph::StageId) {
-        self.push_warn_once(
-            |state| &mut state.warned_swap_stub,
-            "STAGE_STUB",
-            Some(stage_id),
-            "FaceSwapAndEnhance stage is an MVP swap no-op stub in this release",
-        );
-    }
-
     fn audit_checks(&self) -> Vec<AuditItem> {
         self.state.lock().unwrap().audit.clone()
     }
@@ -1484,6 +1497,7 @@ impl GraphBackend {
     }
 }
 
+#[cfg(feature = "nvidia-run-graph")]
 #[async_trait]
 impl UpscaleBackend for GraphBackend {
     async fn initialize(&self) -> Result<()> {
@@ -1502,18 +1516,6 @@ impl UpscaleBackend for GraphBackend {
                             StageKind::Enhance
                         ))
                     })?;
-                }
-                StageConfig::FaceBlur { id, .. } => {
-                    texture = self.apply_face_blur(*id, texture).map_err(|err| {
-                        EngineError::Pipeline(format!(
-                            "stage {} {:?} failed: {err}",
-                            id.0,
-                            StageKind::FaceBlur
-                        ))
-                    })?;
-                }
-                StageConfig::FaceSwapAndEnhance { id, .. } => {
-                    self.apply_swap_stub(*id);
                 }
             }
         }
@@ -1638,12 +1640,12 @@ async fn preprocess_stage(
         let frame = decoded.envelope;
         let t_start = Instant::now();
 
+        // Always preprocess to F32: TensorRT EP with `with_fp16(true)` handles
+        // precision conversion internally.  The ONNX model's input tensor type is
+        // `float` (float32), so ORT rejects F16 input via IO binding.
         let model_texture = match precision {
-            ModelPrecision::F32 => {
+            ModelPrecision::F32 | ModelPrecision::F16 => {
                 kernels.nv12_to_rgb(&frame.texture, ctx, &ctx.preprocess_stream)?
-            }
-            ModelPrecision::F16 => {
-                kernels.nv12_to_rgb_f16(&frame.texture, ctx, &ctx.preprocess_stream)?
             }
         };
         audit_device_texture(
@@ -1696,8 +1698,9 @@ async fn preprocess_stage(
 
 /// Stage 3 — Inference + Postprocess.
 ///
-/// 1. `backend.process()` — TensorRT inference via IO Binding (GPU-only).
-/// 2. Postprocess: model output (RgbPlanarF32 or F16) → NV12 for encoder.
+/// 1. Accumulate up to `max_batch` frames (or flush on channel close).
+/// 2. `backend.process_batch()` — TensorRT inference via IO Binding (GPU-only).
+/// 3. Postprocess each output: RGB → NV12 for encoder.
 ///
 /// Recycles consumed RGB buffers for VRAM accounting.
 // Stage signatures mirror explicit pipeline wiring; keeping separate params avoids hidden config coupling.
@@ -1714,14 +1717,21 @@ async fn inference_stage<B: UpscaleBackend>(
     metrics: &PipelineMetrics,
     profiler_ctx: Option<&GpuContext>,
     strict_no_host_copies: bool,
+    max_batch: usize,
+    batch_latency_deadline_us: u64,
 ) -> Result<()> {
+    let effective_batch = max_batch.max(1).min(8);
+
     loop {
         if cancel.is_cancelled() {
             debug!("Inference cancelled");
             break;
         }
 
-        let frame = tokio::select! {
+        // ── Accumulate batch ──
+        // Block on the first frame, then wait up to `batch_latency_deadline_us`
+        // for additional frames before flushing a partial batch.
+        let first_frame = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 debug!("Inference cancelled during recv");
@@ -1739,82 +1749,114 @@ async fn inference_stage<B: UpscaleBackend>(
         ctx.queue_depth.preprocess.fetch_sub(1, Ordering::Relaxed);
         ctx.queue_depth.inference.fetch_add(1, Ordering::Relaxed);
 
+        let mut batch_frames = vec![first_frame];
+
+        // Try to fill remaining batch slots without blocking.
+        // try_recv() is intentionally non-blocking: if the preprocess stage
+        // hasn't produced the next frame yet we flush immediately rather than
+        // adding latency. Batches fill naturally when inference is the
+        // bottleneck and preprocess has built up a queue ahead of it.
+        if effective_batch > 1 {
+            for _ in 1..effective_batch {
+                match rx.try_recv() {
+                    Ok(f) => {
+                        ctx.queue_depth.preprocess.fetch_sub(1, Ordering::Relaxed);
+                        ctx.queue_depth.inference.fetch_add(1, Ordering::Relaxed);
+                        batch_frames.push(f);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
         if cancel.is_cancelled() {
-            ctx.queue_depth.inference.fetch_sub(1, Ordering::Relaxed);
+            let n = batch_frames.len();
+            for _ in 0..n {
+                ctx.queue_depth.inference.fetch_sub(1, Ordering::Relaxed);
+            }
             break;
         }
 
-        // Validate input format matches expected model precision.
-        let expected_format = match precision {
-            ModelPrecision::F32 => PixelFormat::RgbPlanarF32,
-            ModelPrecision::F16 => PixelFormat::RgbPlanarF16,
-        };
-        debug_assert_eq!(frame.texture.format, expected_format);
+        let batch_size = batch_frames.len();
+        let _ = precision; // precision drives TRT engine config, not input format
 
-        // ── Inference ──
+        // ── Batched Inference ──
+        let textures: Vec<_> = batch_frames.iter().map(|f| f.texture.clone()).collect();
         let t_infer = Instant::now();
-        let upscaled_rgb = backend.process(frame.texture.clone()).await?;
+        let upscaled_batch = backend.process_batch(textures).await?;
         let infer_us = t_infer.elapsed().as_micros() as u64;
         metrics
             .inference_total_us
             .fetch_add(infer_us, Ordering::Relaxed);
 
-        // Phase 8: profiler hook — inference GPU timing.
         if let Some(pctx) = profiler_ctx {
             pctx.profiler.record_stage(PerfStage::Inference, infer_us);
         }
 
-        // Recycle the consumed RGB input buffer.
-        if let Ok(slice) = Arc::try_unwrap(frame.texture.data) {
-            ctx.recycle(slice);
+        // Recycle consumed RGB input buffers.
+        for frame in &batch_frames {
+            if let Ok(slice) = Arc::try_unwrap(frame.texture.data.clone()) {
+                ctx.recycle(slice);
+            }
         }
 
-        // ── Postprocess: RGB → NV12 ──
-        let t_post = Instant::now();
-        let upscaled_nv12 = match upscaled_rgb.format {
-            PixelFormat::RgbPlanarF32 => {
-                kernels.rgb_to_nv12(&upscaled_rgb, encoder_pitch, ctx, &ctx.inference_stream)?
+        // ── Postprocess each output: RGB → NV12, then send downstream ──
+        for (i, (upscaled_rgb, frame)) in upscaled_batch
+            .into_iter()
+            .zip(batch_frames.into_iter())
+            .enumerate()
+        {
+            let t_post = Instant::now();
+            let upscaled_nv12 = match upscaled_rgb.format {
+                PixelFormat::RgbPlanarF32 => {
+                    kernels.rgb_to_nv12(&upscaled_rgb, encoder_pitch, ctx, &ctx.inference_stream)?
+                }
+                PixelFormat::RgbPlanarF16 => {
+                    let f32 = kernels.convert_f16_to_f32(&upscaled_rgb, ctx, &ctx.inference_stream)?;
+                    kernels.rgb_to_nv12(&f32, encoder_pitch, ctx, &ctx.inference_stream)?
+                }
+                other => {
+                    return Err(EngineError::FormatMismatch {
+                        expected: PixelFormat::RgbPlanarF32,
+                        actual: other,
+                    });
+                }
+            };
+            audit_device_texture("inference->encode", &upscaled_nv12, strict_no_host_copies)?;
+
+            GpuContext::sync_stream(&ctx.inference_stream)?;
+            let post_us = t_post.elapsed().as_micros() as u64;
+            metrics
+                .postprocess_total_us
+                .fetch_add(post_us, Ordering::Relaxed);
+
+            if let Some(pctx) = profiler_ctx {
+                pctx.profiler.record_stage(PerfStage::Postprocess, post_us);
+                // Record per-frame latency (amortized inference + postprocess).
+                let per_frame_infer = infer_us / batch_size as u64;
+                pctx.profiler.record_frame_latency(per_frame_infer + post_us);
             }
-            PixelFormat::RgbPlanarF16 => {
-                let f32 = kernels.convert_f16_to_f32(&upscaled_rgb, ctx, &ctx.inference_stream)?;
-                kernels.rgb_to_nv12(&f32, encoder_pitch, ctx, &ctx.inference_stream)?
+
+            let envelope = FrameEnvelope {
+                texture: upscaled_nv12,
+                frame_index: frame.frame_index,
+                pts: frame.pts,
+                is_keyframe: frame.is_keyframe,
+            };
+
+            if tx.send(envelope).await.is_err() {
+                debug!("Inference: downstream closed");
+                // Drain queue depth for this frame and all unsent remainder.
+                for _ in i..batch_size {
+                    ctx.queue_depth.inference.fetch_sub(1, Ordering::Relaxed);
+                }
+                // Downstream closing is normal EOS — exit cleanly so the
+                // encoder can flush rather than propagating a spurious error.
+                return Ok(());
             }
-            other => {
-                return Err(EngineError::FormatMismatch {
-                    expected: PixelFormat::RgbPlanarF32,
-                    actual: other,
-                });
-            }
-        };
-        audit_device_texture("inference->encode", &upscaled_nv12, strict_no_host_copies)?;
-
-        GpuContext::sync_stream(&ctx.inference_stream)?;
-        let post_us = t_post.elapsed().as_micros() as u64;
-        metrics
-            .postprocess_total_us
-            .fetch_add(post_us, Ordering::Relaxed);
-
-        // Phase 8: profiler hook — postprocess GPU timing.
-        if let Some(pctx) = profiler_ctx {
-            pctx.profiler.record_stage(PerfStage::Postprocess, post_us);
-            // Record total frame latency (inference + postprocess).
-            pctx.profiler.record_frame_latency(infer_us + post_us);
-        }
-
-        let envelope = FrameEnvelope {
-            texture: upscaled_nv12,
-            frame_index: frame.frame_index,
-            pts: frame.pts,
-            is_keyframe: frame.is_keyframe,
-        };
-
-        if tx.send(envelope).await.is_err() {
-            debug!("Inference: downstream closed");
+            metrics.frames_inferred.fetch_add(1, Ordering::Release);
             ctx.queue_depth.inference.fetch_sub(1, Ordering::Relaxed);
-            return Err(EngineError::ChannelClosed);
         }
-        metrics.frames_inferred.fetch_add(1, Ordering::Release);
-        ctx.queue_depth.inference.fetch_sub(1, Ordering::Relaxed);
     }
     Ok(())
 }

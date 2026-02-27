@@ -23,6 +23,12 @@ __pypackages__/
 # Rust
 /target/
 **/*.rs.bk
+**/target/
+**/debug/
+**/release/
+**/incremental/
+**/.fingerprint/
+**/deps/
 
 # Node / TypeScript / Tauri / Electron
 node_modules/
@@ -47,5 +53,24 @@ Thumbs.db
 .claude/
 CLAUDE.md
 weights/
-.mp4/
+
+# Large runtime/build outputs
+artifacts/downloads/
+artifacts/benchmarks/
+third_party/**/bin/
+third_party/**/lib/
+**/*.exe
+**/*.dll
+**/*.lib
+**/*.pdb
+**/*.exp
+**/*.obj
+**/*.o
+**/*.a
+**/*.so
+**/*.dylib
+*.mp4
+*.mkv
+*.mov
+*.avi
 

@@ -13,7 +13,7 @@
 //! All functions in this module are `unsafe extern "C"`.  The safe wrappers
 //! in `nvdec.rs` and `nvenc.rs` enforce invariants documented below.
 
-#![allow(non_camel_case_types, non_snake_case, dead_code)]
+#![allow(non_camel_case_types, non_snake_case, dead_code, missing_docs)]
 
 use std::ffi::c_void;
 use std::os::raw::{c_int, c_short, c_uint, c_ulong, c_ulonglong};
@@ -375,6 +375,14 @@ pub const NV_ENC_PRESET_P7_GUID: GUID = GUID {
     Data2: 0x6F71,
     Data3: 0x4C13,
     Data4: [0x93, 0x1B, 0x53, 0xE5, 0x6F, 0x78, 0x84, 0x3B],
+};
+
+/// Balanced quality/performance preset GUID (P4).
+pub const NV_ENC_PRESET_P4_GUID: GUID = GUID {
+    Data1: 0x90A7B826,
+    Data2: 0xDF06,
+    Data3: 0x4862,
+    Data4: [0xB9, 0xD2, 0xCD, 0x6D, 0x73, 0xA0, 0x86, 0x81],
 };
 
 /// H.265 Main profile GUID.
@@ -834,13 +842,32 @@ pub enum CUmemorytype {
 //  HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Convert a CUDA result to an engine Result.
+/// Convert a CUDA result to an engine `Result`, mapping failures to
+/// [`EngineError::Decode`](rave_core::error::EngineError::Decode).
+///
+/// Use in decode-side code paths (NVDEC, parser, stream sync during decode).
 #[inline]
 pub fn check_cu(result: CUresult, context: &str) -> rave_core::error::Result<()> {
     if result == CUDA_SUCCESS {
         Ok(())
     } else {
         Err(rave_core::error::EngineError::Decode(format!(
+            "{context}: CUDA error code {result}"
+        )))
+    }
+}
+
+/// Convert a CUDA result to an engine `Result`, mapping failures to
+/// [`EngineError::Encode`](rave_core::error::EngineError::Encode).
+///
+/// Use in encode-side code paths (NVENC session, context switching for encoder,
+/// stream sync during encode).
+#[inline]
+pub fn check_cu_encode(result: CUresult, context: &str) -> rave_core::error::Result<()> {
+    if result == CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(rave_core::error::EngineError::Encode(format!(
             "{context}: CUDA error code {result}"
         )))
     }

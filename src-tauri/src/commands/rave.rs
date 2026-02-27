@@ -58,21 +58,19 @@ fn validate_max_batch_arg(args: &[String]) -> Result<(), String> {
             let parsed = v.parse::<usize>().map_err(|_| {
                 format!("Invalid --max-batch value '{v}'. Expected a positive integer.")
             })?;
-            if parsed > 1 {
-                return Err(
-                    "Unsupported configuration: max_batch > 1 is not implemented. Set --max-batch 1."
-                        .to_string(),
-                );
+            if parsed == 0 || parsed > 8 {
+                return Err(format!(
+                    "Invalid --max-batch value '{parsed}'. Must be in range 1–8."
+                ));
             }
         } else if let Some(v) = arg.strip_prefix("--max_batch=") {
             let parsed = v.parse::<usize>().map_err(|_| {
                 format!("Invalid --max_batch value '{v}'. Expected a positive integer.")
             })?;
-            if parsed > 1 {
-                return Err(
-                    "Unsupported configuration: max_batch > 1 is not implemented. Set --max-batch 1."
-                        .to_string(),
-                );
+            if parsed == 0 || parsed > 8 {
+                return Err(format!(
+                    "Invalid --max_batch value '{parsed}'. Must be in range 1–8."
+                ));
             }
         } else if arg == "--max-batch" || arg == "--max_batch" {
             let next = args
@@ -81,11 +79,10 @@ fn validate_max_batch_arg(args: &[String]) -> Result<(), String> {
             let parsed = next.parse::<usize>().map_err(|_| {
                 format!("Invalid {arg} value '{next}'. Expected a positive integer.")
             })?;
-            if parsed > 1 {
-                return Err(
-                    "Unsupported configuration: max_batch > 1 is not implemented. Set --max-batch 1."
-                        .to_string(),
-                );
+            if parsed == 0 || parsed > 8 {
+                return Err(format!(
+                    "Invalid {arg} value '{parsed}'. Must be in range 1–8."
+                ));
             }
             idx += 1;
         }
@@ -257,29 +254,41 @@ mod tests {
     use crate::rave_cli::RaveCliError;
 
     #[test]
-    fn max_batch_allows_one() {
-        assert!(validate_max_batch_arg(&["--max-batch".to_string(), "1".to_string(),]).is_ok());
-        assert!(validate_max_batch_arg(&["--max-batch=1".to_string()]).is_ok());
-        assert!(validate_max_batch_arg(&["--max_batch=1".to_string()]).is_ok());
+    fn max_batch_allows_one_through_eight() {
+        for n in 1usize..=8 {
+            assert!(
+                validate_max_batch_arg(&[format!("--max-batch={n}")]).is_ok(),
+                "--max-batch={n} should be accepted"
+            );
+        }
+        assert!(validate_max_batch_arg(&["--max-batch".to_string(), "4".to_string()]).is_ok());
+        assert!(validate_max_batch_arg(&["--max_batch=4".to_string()]).is_ok());
     }
 
     #[test]
-    fn max_batch_rejects_above_one() {
-        let err = validate_max_batch_arg(&["--max-batch=2".to_string()])
-            .expect_err("max_batch > 1 must fail");
-        assert!(err.contains("max_batch > 1"));
+    fn max_batch_rejects_zero() {
+        let err = validate_max_batch_arg(&["--max-batch=0".to_string()])
+            .expect_err("max_batch=0 must fail");
+        assert!(err.contains("1–8"));
     }
 
     #[test]
-    fn max_batch_rejects_above_one_positional() {
+    fn max_batch_rejects_above_eight() {
+        let err = validate_max_batch_arg(&["--max-batch=9".to_string()])
+            .expect_err("max_batch=9 must fail");
+        assert!(err.contains("1–8"));
+    }
+
+    #[test]
+    fn max_batch_rejects_above_eight_positional() {
         let err = validate_max_batch_arg(&[
             "--foo".to_string(),
             "bar".to_string(),
             "--max_batch".to_string(),
-            "3".to_string(),
+            "9".to_string(),
         ])
-        .expect_err("max_batch > 1 must fail");
-        assert!(err.contains("max_batch > 1"));
+        .expect_err("max_batch=9 must fail");
+        assert!(err.contains("1–8"));
     }
 
     #[test]

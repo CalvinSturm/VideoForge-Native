@@ -1,0 +1,47 @@
+# --- Project Specific ---
+/target/
+/third-party/nvidia-sdk/
+third_party/
+
+# --- Large Binaries / Assets (should not be in repo) ---
+*.dll
+*.exe
+*.onnx
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.lib
+*.a
+
+# --- Models & Test Data ---
+models/
+test_videos/
+
+# --- Rust Build Artifacts ---
+target/
+debug/
+
+# --- NVIDIA / CUDA Artifacts ---
+*.ptx
+*.cubin
+*.fatbin
+nvcodec/
+
+# --- FFmpeg ---
+ffmpeg/
+
+# --- OS & IDE Specific ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Rust Formatting & Debugging ---
+**/*.rs.bk
+*.pdb
+
+# --- Claude ---
+.claude

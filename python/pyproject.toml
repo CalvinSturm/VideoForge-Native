@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "videoforge-sidecar"
+version = "0.1.0"
+description = "VideoForge AI Worker – deterministic super-resolution sidecar"
+requires-python = ">=3.10"
+
+dependencies = [
+    # --- Core inference ---
+    "torch>=2.0.1",
+    "torchvision>=0.15.2",
+    "torchaudio>=2.0.2",
+
+    # --- Model ecosystems ---
+    "basicsr",
+    "realesrgan",
+    "spandrel",
+
+    # --- Numerical / image ---
+    "numpy<2",
+    "pillow<10",
+    "opencv-python>=4.8",
+
+    # --- IPC (lazy-loaded at runtime) ---
+    "zenoh>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+]
+
+# --- PyTorch custom index (CUDA 11.7 wheels) ---
+# Install with: pip install -e ".[dev]" --extra-index-url https://download.pytorch.org/whl/cu117

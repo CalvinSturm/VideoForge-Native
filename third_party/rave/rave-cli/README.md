@@ -1,3 +1,5 @@
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](../LICENSE)
+
 # rave-cli
 
 Command-line interface for the RAVE GPU video pipeline.
