@@ -181,24 +181,53 @@ pub struct CUVIDPICPARAMS {
 #[derive(Clone, Copy, Debug)]
 pub struct CUVIDEOFORMAT {
     pub codec: cudaVideoCodec,
-    pub frame_rate_num: c_uint,
-    pub frame_rate_den: c_uint,
+    pub frame_rate: CUVIDEOFORMAT_frame_rate,
     pub progressive_sequence: u8,
     pub bit_depth_luma_minus8: u8,
     pub bit_depth_chroma_minus8: u8,
     pub min_num_decode_surfaces: u8,
     pub coded_width: c_uint,
     pub coded_height: c_uint,
-    pub display_area_left: c_short,
-    pub display_area_top: c_short,
-    pub display_area_right: c_short,
-    pub display_area_bottom: c_short,
+    pub display_area: CUVIDEOFORMAT_display_area,
     pub chroma_format: cudaVideoChromaFormat,
     pub bitrate: c_uint,
-    pub display_aspect_ratio_x: c_uint,
-    pub display_aspect_ratio_y: c_uint,
-    pub video_signal_description: [u8; 8],
+    pub display_aspect_ratio: CUVIDEOFORMAT_display_aspect_ratio,
+    pub video_signal_description: CUVIDEOFORMAT_video_signal_description,
     pub seqhdr_data_length: c_uint,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CUVIDEOFORMAT_frame_rate {
+    pub numerator: c_uint,
+    pub denominator: c_uint,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CUVIDEOFORMAT_display_area {
+    pub left: c_int,
+    pub top: c_int,
+    pub right: c_int,
+    pub bottom: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CUVIDEOFORMAT_display_aspect_ratio {
+    pub x: c_int,
+    pub y: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CUVIDEOFORMAT_video_signal_description {
+    /// Bitfield-packed flags from `nvcuvid.h`.
+    /// bits 0..=2 video_format, bit 3 full_range, bits 4..=7 reserved.
+    pub flags: u8,
+    pub color_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coefficients: u8,
 }
 
 /// Parser dispatch info for a decoded picture.
@@ -214,15 +243,45 @@ pub struct CUVIDPARSERDISPINFO {
 
 /// Callback: sequence header parsed (reports format).
 pub type PFNVIDSEQUENCECALLBACK =
-    unsafe extern "C" fn(user_data: *mut c_void, format: *mut CUVIDEOFORMAT) -> c_int;
+    unsafe extern "system" fn(user_data: *mut c_void, format: *mut CUVIDEOFORMAT) -> c_int;
 
 /// Callback: a picture has been decoded.
 pub type PFNVIDDECODECALLBACK =
-    unsafe extern "C" fn(user_data: *mut c_void, pic_params: *mut CUVIDPICPARAMS) -> c_int;
+    unsafe extern "system" fn(user_data: *mut c_void, pic_params: *mut CUVIDPICPARAMS) -> c_int;
 
 /// Callback: a decoded picture is ready for display.
 pub type PFNVIDDISPLAYCALLBACK =
-    unsafe extern "C" fn(user_data: *mut c_void, disp_info: *mut CUVIDPARSERDISPINFO) -> c_int;
+    unsafe extern "system" fn(user_data: *mut c_void, disp_info: *mut CUVIDPARSERDISPINFO) -> c_int;
+
+/// Opaque AV1 operating-point info passed to parser callback.
+#[repr(C)]
+pub struct CUVIDOPERATINGPOINTINFO {
+    _private: [u8; 0],
+}
+
+/// Opaque SEI message info passed to parser callback.
+#[repr(C)]
+pub struct CUVIDSEIMESSAGEINFO {
+    _private: [u8; 0],
+}
+
+/// Opaque extended video format info.
+#[repr(C)]
+pub struct CUVIDEOFORMATEX {
+    _private: [u8; 0],
+}
+
+/// Callback: parser requests AV1 operating point selection.
+pub type PFNVIDOPPOINTCALLBACK = unsafe extern "system" fn(
+    user_data: *mut c_void,
+    op_info: *mut CUVIDOPERATINGPOINTINFO,
+) -> c_int;
+
+/// Callback: parser reports parsed SEI message batch.
+pub type PFNVIDSEIMSGCALLBACK = unsafe extern "system" fn(
+    user_data: *mut c_void,
+    sei_info: *mut CUVIDSEIMESSAGEINFO,
+) -> c_int;
 
 /// Parser creation params.
 #[repr(C)]
@@ -232,15 +291,18 @@ pub struct CUVIDPARSERPARAMS {
     pub ulClockRate: c_uint,
     pub ulErrorThreshold: c_uint,
     pub ulMaxDisplayDelay: c_uint,
-    pub bAnnexb: c_uint,
-    pub uReserved: c_uint,
-    pub Reserved: [c_uint; 4],
+    /// Bitfield-packed parser flags from `nvcuvid.h`:
+    /// bit 0 = bAnnexb, bit 1 = bMemoryOptimize, bits 2..31 reserved.
+    pub ulParserFlags: c_uint,
+    pub uReserved1: [c_uint; 4],
     pub pUserData: *mut c_void,
     pub pfnSequenceCallback: Option<PFNVIDSEQUENCECALLBACK>,
     pub pfnDecodePicture: Option<PFNVIDDECODECALLBACK>,
     pub pfnDisplayPicture: Option<PFNVIDDISPLAYCALLBACK>,
-    pub pvReserved2: [*mut c_void; 7],
-    pub pExtVideoInfo: *mut c_void,
+    pub pfnGetOperatingPoint: Option<PFNVIDOPPOINTCALLBACK>,
+    pub pfnGetSEIMsg: Option<PFNVIDSEIMSGCALLBACK>,
+    pub pvReserved2: [*mut c_void; 5],
+    pub pExtVideoInfo: *mut CUVIDEOFORMATEX,
 }
 
 /// Bitstream packet fed to the parser.
@@ -275,6 +337,8 @@ pub struct CUVIDPROCPARAMS {
     pub Reserved1: c_uint,
     pub output_stream: CUstream,
     pub Reserved: [c_uint; 46],
+    pub histogram_dptr: *mut c_ulonglong,
+    pub Reserved2: [*mut c_void; 1],
 }
 
 // ─── NVDEC functions ─────────────────────────────────────────────────────
@@ -314,46 +378,125 @@ unsafe extern "C" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  NVENC — nvEncodeAPI.h
+//  NVENC — nvEncodeAPI.h (bindgen-generated)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// NVENC status code.
-pub type NVENCSTATUS = c_int;
-pub const NV_ENC_SUCCESS: NVENCSTATUS = 0;
-pub const NV_ENC_ERR_NO_ENCODE_DEVICE: NVENCSTATUS = 1;
-pub const NV_ENC_ERR_UNSUPPORTED_DEVICE: NVENCSTATUS = 2;
-pub const NV_ENC_ERR_INVALID_ENCODERDEVICE: NVENCSTATUS = 3;
-pub const NV_ENC_ERR_INVALID_DEVICE: NVENCSTATUS = 4;
-pub const NV_ENC_ERR_DEVICE_NOT_EXIST: NVENCSTATUS = 5;
-pub const NV_ENC_ERR_INVALID_PTR: NVENCSTATUS = 6;
-pub const NV_ENC_ERR_INVALID_EVENT: NVENCSTATUS = 7;
-pub const NV_ENC_ERR_INVALID_PARAM: NVENCSTATUS = 8;
-pub const NV_ENC_ERR_INVALID_CALL: NVENCSTATUS = 9;
-pub const NV_ENC_ERR_OUT_OF_MEMORY: NVENCSTATUS = 10;
-pub const NV_ENC_ERR_ENCODER_NOT_INITIALIZED: NVENCSTATUS = 11;
-pub const NV_ENC_ERR_UNSUPPORTED_PARAM: NVENCSTATUS = 12;
-pub const NV_ENC_ERR_LOCK_BUSY: NVENCSTATUS = 13;
-pub const NV_ENC_ERR_NOT_ENOUGH_BUFFER: NVENCSTATUS = 14;
-pub const NV_ENC_ERR_INVALID_VERSION: NVENCSTATUS = 15;
-pub const NV_ENC_ERR_MAP_FAILED: NVENCSTATUS = 16;
-pub const NV_ENC_ERR_NEED_MORE_INPUT: NVENCSTATUS = 17;
-pub const NV_ENC_ERR_ENCODER_BUSY: NVENCSTATUS = 18;
-pub const NV_ENC_ERR_EVENT_NOT_REGISTERD: NVENCSTATUS = 19;
-pub const NV_ENC_ERR_GENERIC: NVENCSTATUS = 20;
-
-/// GUID type mirroring Windows GUID layout.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GUID {
-    pub Data1: u32,
-    pub Data2: u16,
-    pub Data3: u16,
-    pub Data4: [u8; 8],
+#[allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    unused_imports,
+    dead_code,
+    clippy::all
+)]
+mod nvenc_generated {
+    include!("nvenc_bindings_generated.rs");
 }
 
-// ─── Well-known GUIDs ────────────────────────────────────────────────────
+pub use nvenc_generated::{
+    GUID, NVENCSTATUS, NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE, NVENCAPI_MAJOR_VERSION,
+    NVENCAPI_MINOR_VERSION, NVENCAPI_VERSION, NV_ENCODE_API_FUNCTION_LIST, NV_ENC_BUFFER_FORMAT,
+    NV_ENC_BUFFER_USAGE,
+    NV_ENC_CODEC_CONFIG, NV_ENC_CONFIG, NV_ENC_CONFIG_HEVC, NV_ENC_CREATE_BITSTREAM_BUFFER,
+    NV_ENC_CREATE_INPUT_BUFFER, NV_ENC_DEVICE_TYPE, NV_ENC_INITIALIZE_PARAMS,
+    NV_ENC_INPUT_RESOURCE_TYPE, NV_ENC_LOCK_BITSTREAM, NV_ENC_LOCK_INPUT_BUFFER,
+    NV_ENC_MAP_INPUT_RESOURCE, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
+    NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_PARAMS, NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE,
+    NV_ENC_PRESET_CONFIG, NV_ENC_RC_PARAMS, NV_ENC_REGISTER_RESOURCE, NV_ENC_TUNING_INFO,
+    NvEncodeAPICreateInstance, NvEncodeAPIGetMaxSupportedVersion,
+};
 
-/// H.264 encode GUID.
+pub const NV_ENC_SUCCESS: NVENCSTATUS = nvenc_generated::_NVENCSTATUS_NV_ENC_SUCCESS;
+pub const NV_ENC_ERR_NO_ENCODE_DEVICE: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_NO_ENCODE_DEVICE;
+pub const NV_ENC_ERR_UNSUPPORTED_DEVICE: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_UNSUPPORTED_DEVICE;
+pub const NV_ENC_ERR_INVALID_ENCODERDEVICE: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_INVALID_ENCODERDEVICE;
+pub const NV_ENC_ERR_INVALID_DEVICE: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_INVALID_DEVICE;
+pub const NV_ENC_ERR_DEVICE_NOT_EXIST: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_DEVICE_NOT_EXIST;
+pub const NV_ENC_ERR_INVALID_PTR: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_INVALID_PTR;
+pub const NV_ENC_ERR_INVALID_EVENT: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_INVALID_EVENT;
+pub const NV_ENC_ERR_INVALID_PARAM: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_INVALID_PARAM;
+pub const NV_ENC_ERR_INVALID_CALL: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_INVALID_CALL;
+pub const NV_ENC_ERR_OUT_OF_MEMORY: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_OUT_OF_MEMORY;
+pub const NV_ENC_ERR_ENCODER_NOT_INITIALIZED: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_ENCODER_NOT_INITIALIZED;
+pub const NV_ENC_ERR_UNSUPPORTED_PARAM: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_UNSUPPORTED_PARAM;
+pub const NV_ENC_ERR_LOCK_BUSY: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_LOCK_BUSY;
+pub const NV_ENC_ERR_NOT_ENOUGH_BUFFER: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_NOT_ENOUGH_BUFFER;
+pub const NV_ENC_ERR_INVALID_VERSION: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_INVALID_VERSION;
+pub const NV_ENC_ERR_MAP_FAILED: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_MAP_FAILED;
+pub const NV_ENC_ERR_NEED_MORE_INPUT: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_NEED_MORE_INPUT;
+pub const NV_ENC_ERR_ENCODER_BUSY: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_ENCODER_BUSY;
+pub const NV_ENC_ERR_EVENT_NOT_REGISTERD: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_EVENT_NOT_REGISTERD;
+pub const NV_ENC_ERR_GENERIC: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_GENERIC;
+pub const NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY;
+pub const NV_ENC_ERR_UNIMPLEMENTED: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_UNIMPLEMENTED;
+pub const NV_ENC_ERR_RESOURCE_REGISTER_FAILED: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_RESOURCE_REGISTER_FAILED;
+pub const NV_ENC_ERR_RESOURCE_NOT_REGISTERED: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_RESOURCE_NOT_REGISTERED;
+pub const NV_ENC_ERR_RESOURCE_NOT_MAPPED: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_RESOURCE_NOT_MAPPED;
+pub const NV_ENC_ERR_NEED_MORE_OUTPUT: NVENCSTATUS =
+    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_NEED_MORE_OUTPUT;
+
+pub const NV_ENC_DEVICE_TYPE_DIRECTX: NV_ENC_DEVICE_TYPE =
+    nvenc_generated::_NV_ENC_DEVICE_TYPE_NV_ENC_DEVICE_TYPE_DIRECTX;
+pub const NV_ENC_DEVICE_TYPE_CUDA: NV_ENC_DEVICE_TYPE =
+    nvenc_generated::_NV_ENC_DEVICE_TYPE_NV_ENC_DEVICE_TYPE_CUDA;
+pub const NV_ENC_DEVICE_TYPE_OPENGL: NV_ENC_DEVICE_TYPE =
+    nvenc_generated::_NV_ENC_DEVICE_TYPE_NV_ENC_DEVICE_TYPE_OPENGL;
+
+pub const NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX: NV_ENC_INPUT_RESOURCE_TYPE =
+    nvenc_generated::_NV_ENC_INPUT_RESOURCE_TYPE_NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
+pub const NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR: NV_ENC_INPUT_RESOURCE_TYPE =
+    nvenc_generated::_NV_ENC_INPUT_RESOURCE_TYPE_NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
+pub const NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY: NV_ENC_INPUT_RESOURCE_TYPE =
+    nvenc_generated::_NV_ENC_INPUT_RESOURCE_TYPE_NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY;
+pub const NV_ENC_INPUT_RESOURCE_TYPE_OPENGL_TEX: NV_ENC_INPUT_RESOURCE_TYPE =
+    nvenc_generated::_NV_ENC_INPUT_RESOURCE_TYPE_NV_ENC_INPUT_RESOURCE_TYPE_OPENGL_TEX;
+
+pub const NV_ENC_BUFFER_FORMAT_NV12: NV_ENC_BUFFER_FORMAT =
+    nvenc_generated::_NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_NV12;
+pub const NV_ENC_INPUT_IMAGE: NV_ENC_BUFFER_USAGE =
+    nvenc_generated::_NV_ENC_BUFFER_USAGE_NV_ENC_INPUT_IMAGE;
+
+pub const NV_ENC_PIC_TYPE_IDR: NV_ENC_PIC_TYPE =
+    nvenc_generated::_NV_ENC_PIC_TYPE_NV_ENC_PIC_TYPE_IDR;
+pub const NV_ENC_PIC_STRUCT_FRAME: NV_ENC_PIC_STRUCT =
+    nvenc_generated::_NV_ENC_PIC_STRUCT_NV_ENC_PIC_STRUCT_FRAME;
+
+pub const NV_ENC_TUNING_INFO_UNDEFINED: NV_ENC_TUNING_INFO =
+    nvenc_generated::NV_ENC_TUNING_INFO_NV_ENC_TUNING_INFO_UNDEFINED;
+pub const NV_ENC_TUNING_INFO_HIGH_QUALITY: NV_ENC_TUNING_INFO =
+    nvenc_generated::NV_ENC_TUNING_INFO_NV_ENC_TUNING_INFO_HIGH_QUALITY;
+pub const NV_ENC_TUNING_INFO_LOW_LATENCY: NV_ENC_TUNING_INFO =
+    nvenc_generated::NV_ENC_TUNING_INFO_NV_ENC_TUNING_INFO_LOW_LATENCY;
+
+pub const NV_ENC_PARAMS_RC_VBR: NV_ENC_PARAMS_RC_MODE =
+    nvenc_generated::_NV_ENC_PARAMS_RC_MODE_NV_ENC_PARAMS_RC_VBR;
+
+// Well-known GUIDs used by engine codepaths.
 pub const NV_ENC_CODEC_H264_GUID: GUID = GUID {
     Data1: 0x6BC82762,
     Data2: 0x4E63,
@@ -361,7 +504,6 @@ pub const NV_ENC_CODEC_H264_GUID: GUID = GUID {
     Data4: [0xAA, 0x85, 0x1A, 0x4F, 0x6A, 0x21, 0xF5, 0x07],
 };
 
-/// H.265/HEVC encode GUID.
 pub const NV_ENC_CODEC_HEVC_GUID: GUID = GUID {
     Data1: 0x790CDC88,
     Data2: 0x4522,
@@ -369,7 +511,6 @@ pub const NV_ENC_CODEC_HEVC_GUID: GUID = GUID {
     Data4: [0x94, 0x25, 0xBD, 0xA9, 0x97, 0x5F, 0x76, 0x03],
 };
 
-/// Low-latency high-quality preset GUID (P7).
 pub const NV_ENC_PRESET_P7_GUID: GUID = GUID {
     Data1: 0x84848C12,
     Data2: 0x6F71,
@@ -377,7 +518,6 @@ pub const NV_ENC_PRESET_P7_GUID: GUID = GUID {
     Data4: [0x93, 0x1B, 0x53, 0xE5, 0x6F, 0x78, 0x84, 0x3B],
 };
 
-/// Balanced quality/performance preset GUID (P4).
 pub const NV_ENC_PRESET_P4_GUID: GUID = GUID {
     Data1: 0x90A7B826,
     Data2: 0xDF06,
@@ -385,7 +525,6 @@ pub const NV_ENC_PRESET_P4_GUID: GUID = GUID {
     Data4: [0xB9, 0xD2, 0xCD, 0x6D, 0x73, 0xA0, 0x86, 0x81],
 };
 
-/// H.265 Main profile GUID.
 pub const NV_ENC_HEVC_PROFILE_MAIN_GUID: GUID = GUID {
     Data1: 0xB514C39A,
     Data2: 0xB55B,
@@ -393,7 +532,6 @@ pub const NV_ENC_HEVC_PROFILE_MAIN_GUID: GUID = GUID {
     Data4: [0x87, 0x87, 0x67, 0xED, 0x5E, 0x28, 0x49, 0x4D],
 };
 
-/// H.265 Main10 profile GUID.
 pub const NV_ENC_HEVC_PROFILE_MAIN10_GUID: GUID = GUID {
     Data1: 0xFA4D2B6C,
     Data2: 0x3A5B,
@@ -401,381 +539,21 @@ pub const NV_ENC_HEVC_PROFILE_MAIN10_GUID: GUID = GUID {
     Data4: [0x80, 0x18, 0x0A, 0x3F, 0x5E, 0x3C, 0x9B, 0x44],
 };
 
-// ─── NVENC enums ─────────────────────────────────────────────────────────
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NV_ENC_DEVICE_TYPE {
-    DIRECTX = 0,
-    CUDA = 1,
-    OPENGL = 2,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NV_ENC_INPUT_RESOURCE_TYPE {
-    DIRECTX = 0,
-    CUDADEVICEPTR = 1,
-    CUDAARRAY = 2,
-    OPENGL_TEX = 3,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NV_ENC_BUFFER_FORMAT {
-    UNDEFINED = 0x00000000,
-    NV12 = 0x00000001,
-    YV12 = 0x00000010,
-    IYUV = 0x00000100,
-    YUV444 = 0x00001000,
-    YUV420_10BIT = 0x00010000,
-    ARGB = 0x01000000,
-    ABGR = 0x02000000,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NV_ENC_PIC_TYPE {
-    P = 0,
-    B = 1,
-    I = 2,
-    IDR = 3,
-    BI = 4,
-    SKIPPED = 5,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NV_ENC_PIC_STRUCT {
-    FRAME = 0x01,
-    FIELD_TOP_BOTTOM = 0x02,
-    FIELD_BOTTOM_TOP = 0x03,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NV_ENC_TUNING_INFO {
-    UNDEFINED = 0,
-    HIGH_QUALITY = 1,
-    LOW_LATENCY = 2,
-    ULTRA_LOW_LATENCY = 3,
-    LOSSLESS = 4,
-}
-
-// ─── NVENC params structs ────────────────────────────────────────────────
-
-pub const NVENCAPI_MAJOR_VERSION: u32 = 13;
-pub const NVENCAPI_MINOR_VERSION: u32 = 0;
-
-/// NVENC API version: `MAJOR | (MINOR << 24)`.
-/// Matches the SDK macro `NVENCAPI_VERSION`.
-pub const NVENCAPI_VERSION: u32 = NVENCAPI_MAJOR_VERSION | (NVENCAPI_MINOR_VERSION << 24);
-
 /// Compute a struct version field: `NVENCAPI_VERSION | (struct_ver << 16) | (0x7 << 28)`.
-/// Matches the SDK macro `NVENC_STRUCT_VERSION(ver)`.
 #[inline]
 pub const fn nvenc_struct_version(struct_ver: u32) -> u32 {
     NVENCAPI_VERSION | (struct_ver << 16) | (0x7 << 28)
 }
 
-/// Session open params.
-#[repr(C)]
-pub struct NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
-    pub version: u32,
-    pub deviceType: NV_ENC_DEVICE_TYPE,
-    pub device: *mut c_void,
-    pub reserved: *mut c_void,
-    pub apiVersion: u32,
-    pub reserved1: [u32; 253],
-    pub reserved2: [*mut c_void; 64],
+/// Compute a struct version field using a runtime-negotiated NVENC API version.
+#[inline]
+pub const fn nvenc_struct_version_with_api(api_version: u32, struct_ver: u32) -> u32 {
+    api_version | (struct_ver << 16) | (0x7 << 28)
 }
 
-/// Rate control params (simplified).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct NV_ENC_RC_PARAMS {
-    pub version: u32,
-    pub rateControlMode: u32,
-    pub constQP_interP: u32,
-    pub constQP_interB: u32,
-    pub constQP_intra: u32,
-    pub averageBitRate: u32,
-    pub maxBitRate: u32,
-    pub vbvBufferSize: u32,
-    pub vbvInitialDelay: u32,
-    pub reserved: [u32; 247],
-}
-
-/// HEVC-specific config (simplified).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct NV_ENC_CONFIG_HEVC {
-    pub level: u32,
-    pub tier: u32,
-    pub minCUSize: u32,
-    pub maxCUSize: u32,
-    pub reserved: [u32; 252],
-}
-
-/// Codec-specific config union (simplified — only HEVC used).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union NV_ENC_CODEC_CONFIG {
-    pub hevcConfig: NV_ENC_CONFIG_HEVC,
-    pub reserved: [u32; 256],
-}
-
-/// Encoder configuration.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct NV_ENC_CONFIG {
-    pub version: u32,
-    pub profileGUID: GUID,
-    pub gopLength: u32,
-    pub frameIntervalP: i32,
-    pub monoChromeEncoding: u32,
-    pub frameFieldMode: u32,
-    pub mvPrecision: u32,
-    pub rcParams: NV_ENC_RC_PARAMS,
-    pub encodeCodecConfig: NV_ENC_CODEC_CONFIG,
-    pub reserved: [u32; 278],
-    pub reserved2: [*mut c_void; 64],
-}
-
-/// Encoder initialization params.
-#[repr(C)]
-pub struct NV_ENC_INITIALIZE_PARAMS {
-    pub version: u32,
-    pub encodeGUID: GUID,
-    pub presetGUID: GUID,
-    pub encodeWidth: u32,
-    pub encodeHeight: u32,
-    pub darWidth: u32,
-    pub darHeight: u32,
-    pub frameRateNum: u32,
-    pub frameRateDen: u32,
-    pub enableEncodeAsync: u32,
-    pub enablePTD: u32,
-    pub reportSliceOffsets: u32,
-    pub enableSubFrameWrite: u32,
-    pub enableExternalMEHints: u32,
-    pub enableMEOnlyMode: u32,
-    pub enableWeightedPrediction: u32,
-    pub enableOutputInVidmem: u32,
-    pub reserved1: u32,
-    pub privDataSize: u32,
-    pub privData: *mut c_void,
-    pub encodeConfig: *mut NV_ENC_CONFIG,
-    pub maxEncodeWidth: u32,
-    pub maxEncodeHeight: u32,
-    pub maxMEHintCountsPerBlock: [u32; 2],
-    pub tuningInfo: NV_ENC_TUNING_INFO,
-    pub reserved: [u32; 289],
-    pub reserved2: [*mut c_void; 64],
-}
-
-/// Register external resource.
-#[repr(C)]
-pub struct NV_ENC_REGISTER_RESOURCE {
-    pub version: u32,
-    pub resourceType: NV_ENC_INPUT_RESOURCE_TYPE,
-    pub width: u32,
-    pub height: u32,
-    pub pitch: u32,
-    pub subResourceIndex: u32,
-    pub resourceToRegister: *mut c_void,
-    pub registeredResource: *mut c_void,
-    pub bufferFormat: NV_ENC_BUFFER_FORMAT,
-    pub bufferUsage: u32,
-    pub pInputFencePoint: *mut c_void,
-    pub pOutputFencePoint: *mut c_void,
-    pub reserved: [u32; 247],
-    pub reserved2: [*mut c_void; 62],
-}
-
-/// Map input resource.
-#[repr(C)]
-pub struct NV_ENC_MAP_INPUT_RESOURCE {
-    pub version: u32,
-    pub subResourceIndex: u32,
-    pub inputResource: *mut c_void,
-    pub registeredResource: *mut c_void,
-    pub mappedResource: *mut c_void,
-    pub mappedBufferFmt: NV_ENC_BUFFER_FORMAT,
-    pub reserved: [u32; 251],
-    pub reserved2: [*mut c_void; 63],
-}
-
-/// Create bitstream buffer.
-#[repr(C)]
-pub struct NV_ENC_CREATE_BITSTREAM_BUFFER {
-    pub version: u32,
-    pub bitstreamBuffer: *mut c_void,
-    pub size: u32,
-    pub memoryHeap: u32,
-    pub reserved: [u32; 252],
-    pub reserved2: [*mut c_void; 64],
-}
-
-/// Encode picture params.
-#[repr(C)]
-pub struct NV_ENC_PIC_PARAMS {
-    pub version: u32,
-    pub inputWidth: u32,
-    pub inputHeight: u32,
-    pub inputPitch: u32,
-    pub encodePicFlags: u32,
-    pub frameIdx: u32,
-    pub inputTimeStamp: u64,
-    pub inputDuration: u64,
-    pub inputBuffer: *mut c_void,
-    pub outputBitstream: *mut c_void,
-    pub completionEvent: *mut c_void,
-    pub bufferFmt: NV_ENC_BUFFER_FORMAT,
-    pub pictureStruct: NV_ENC_PIC_STRUCT,
-    pub pictureType: NV_ENC_PIC_TYPE,
-    pub codecPicParams: [u32; 256],
-    pub meHintCountsPerBlock: [u32; 2],
-    pub meExternalHints: *mut c_void,
-    pub reserved1: [u32; 6],
-    pub reserved2: [*mut c_void; 2],
-    pub qpDeltaMap: *mut i8,
-    pub qpDeltaMapSize: u32,
-    pub reservedBitFields: u32,
-    pub meHintRefPicDist: [u32; 2],
-    pub alphaBuffer: *mut c_void,
-    pub reserved3: [u32; 286],
-    pub reserved4: [*mut c_void; 60],
-}
-
-/// Lock bitstream output.
-#[repr(C)]
-pub struct NV_ENC_LOCK_BITSTREAM {
-    pub version: u32,
-    pub doNotWait: u32,
-    pub ltrFrame: u32,
-    pub reservedBitFields: u32,
-    pub outputBitstream: *mut c_void,
-    pub sliceOffsets: *mut u32,
-    pub frameIdx: u32,
-    pub hwEncodeStatus: u32,
-    pub numSlices: u32,
-    pub bitstreamSizeInBytes: u32,
-    pub outputTimeStamp: u64,
-    pub outputDuration: u64,
-    pub bitstreamBufferPtr: *mut c_void,
-    pub pictureType: NV_ENC_PIC_TYPE,
-    pub pictureStruct: NV_ENC_PIC_STRUCT,
-    pub frameAvgQP: u32,
-    pub frameSatd: u32,
-    pub ltrFrameIdx: u32,
-    pub ltrFrameBitmap: u32,
-    pub temporalId: u32,
-    pub reserved: [u32; 13],
-    pub intraMBCount: u32,
-    pub interMBCount: u32,
-    pub averageMVX: i32,
-    pub averageMVY: i32,
-    pub reserved1: [u32; 226],
-    pub reserved2: [*mut c_void; 64],
-}
-
-/// End-of-stream flag for NV_ENC_PIC_PARAMS.
-pub const NV_ENC_PIC_FLAG_EOS: u32 = 0x01;
-/// Force IDR flag.
-pub const NV_ENC_PIC_FLAG_FORCEIDR: u32 = 0x04;
-
-// ─── NVENC function pointer table ────────────────────────────────────────
-
-/// Subset of the NV_ENCODE_API_FUNCTION_LIST that we actually call.
-#[repr(C)]
-pub struct NV_ENCODE_API_FUNCTION_LIST {
-    pub version: u32,
-    pub reserved: u32,
-    pub nvEncOpenEncodeSession: *const c_void,
-    pub nvEncGetEncodeGUIDCount: *const c_void,
-    pub nvEncGetEncodeProfileGUIDCount: *const c_void,
-    pub nvEncGetEncodeProfileGUIDs: *const c_void,
-    pub nvEncGetEncodeGUIDs: *const c_void,
-    pub nvEncGetInputFormatCount: *const c_void,
-    pub nvEncGetInputFormats: *const c_void,
-    pub nvEncGetEncodeCaps: *const c_void,
-    pub nvEncGetEncodePresetCount: *const c_void,
-    pub nvEncGetEncodePresetGUIDs: *const c_void,
-    pub nvEncGetEncodePresetConfig: *const c_void,
-    pub nvEncInitializeEncoder:
-        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_INITIALIZE_PARAMS) -> NVENCSTATUS>,
-    pub nvEncCreateInputBuffer: *const c_void,
-    pub nvEncDestroyInputBuffer: *const c_void,
-    pub nvEncCreateBitstreamBuffer: Option<
-        unsafe extern "C" fn(*mut c_void, *mut NV_ENC_CREATE_BITSTREAM_BUFFER) -> NVENCSTATUS,
-    >,
-    pub nvEncDestroyBitstreamBuffer:
-        Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
-    pub nvEncEncodePicture:
-        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_PIC_PARAMS) -> NVENCSTATUS>,
-    pub nvEncLockBitstream:
-        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_LOCK_BITSTREAM) -> NVENCSTATUS>,
-    pub nvEncUnlockBitstream: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
-    pub nvEncLockInputBuffer: *const c_void,
-    pub nvEncUnlockInputBuffer: *const c_void,
-    pub nvEncGetEncodeStats: *const c_void,
-    pub nvEncGetSequenceParams: *const c_void,
-    pub nvEncRegisterAsyncEvent: *const c_void,
-    pub nvEncUnregisterAsyncEvent: *const c_void,
-    pub nvEncMapInputResource:
-        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_MAP_INPUT_RESOURCE) -> NVENCSTATUS>,
-    pub nvEncUnmapInputResource:
-        Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
-    pub nvEncDestroyEncoder: Option<unsafe extern "C" fn(*mut c_void) -> NVENCSTATUS>,
-    pub nvEncInvalidateRefFrames: *const c_void,
-    pub nvEncOpenEncodeSessionEx: Option<
-        unsafe extern "C" fn(
-            *mut NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
-            *mut *mut c_void,
-        ) -> NVENCSTATUS,
-    >,
-    pub nvEncRegisterResource:
-        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_REGISTER_RESOURCE) -> NVENCSTATUS>,
-    pub nvEncUnregisterResource:
-        Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
-    pub nvEncReconfigureEncoder: *const c_void,
-    pub reserved1: *const c_void,
-    pub nvEncCreateMVBuffer: *const c_void,
-    pub nvEncDestroyMVBuffer: *const c_void,
-    pub nvEncRunMotionEstimationOnly: *const c_void,
-    pub nvEncGetLastErrorString: *const c_void,
-    pub nvEncSetIOCudaStreams: *const c_void,
-    pub nvEncGetEncodePresetConfigEx: Option<
-        unsafe extern "C" fn(
-            *mut c_void,
-            GUID,
-            GUID,
-            NV_ENC_TUNING_INFO,
-            *mut NV_ENC_PRESET_CONFIG,
-        ) -> NVENCSTATUS,
-    >,
-    pub nvEncGetSequenceParamEx: *const c_void,
-    pub nvEncLookaheadPicture: *const c_void,
-    pub reserved3: [*const c_void; 275],
-}
-
-/// Preset config wrapper.
-#[repr(C)]
-pub struct NV_ENC_PRESET_CONFIG {
-    pub version: u32,
-    pub presetCfg: NV_ENC_CONFIG,
-    pub reserved: [u32; 255],
-    pub reserved2: [*mut c_void; 64],
-}
-
-unsafe extern "C" {
-    /// Entry point to get the NVENC function table.
-    pub fn NvEncodeAPICreateInstance(
-        function_list: *mut NV_ENCODE_API_FUNCTION_LIST,
-    ) -> NVENCSTATUS;
-}
-
+/// End-of-stream / keyframe flags for NV_ENC_PIC_PARAMS::encodePicFlags.
+pub const NV_ENC_PIC_FLAG_EOS: u32 = 0x08;
+pub const NV_ENC_PIC_FLAG_FORCEIDR: u32 = 0x02;
 // ═══════════════════════════════════════════════════════════════════════════
 //  CUDA DRIVER — event functions (not in cudarc)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -786,6 +564,8 @@ pub type CUevent = *mut c_void;
 pub const CU_EVENT_DISABLE_TIMING: c_uint = 0x02;
 
 unsafe extern "C" {
+    pub fn cuCtxGetCurrent(pctx: *mut CUcontext) -> CUresult;
+    pub fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult;
     pub fn cuEventCreate(phEvent: *mut CUevent, Flags: c_uint) -> CUresult;
     pub fn cuEventDestroy_v2(hEvent: CUevent) -> CUresult;
     pub fn cuEventRecord(hEvent: CUevent, hStream: CUstream) -> CUresult;
@@ -797,6 +577,9 @@ unsafe extern "C" {
 // ═══════════════════════════════════════════════════════════════════════════
 
 unsafe extern "C" {
+    pub fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
+    pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
+    pub fn cuMemcpy2D_v2(pCopy: *const CUDA_MEMCPY2D) -> CUresult;
     pub fn cuMemcpy2DAsync_v2(pCopy: *const CUDA_MEMCPY2D, hStream: CUstream) -> CUresult;
 }
 
@@ -847,14 +630,57 @@ pub fn check_cu(result: CUresult, context: &str) -> crate::error::Result<()> {
     }
 }
 
+/// Convert a CUDA result to an encode-context engine Result.
+#[inline]
+pub fn check_cu_encode(result: CUresult, context: &str) -> crate::error::Result<()> {
+    if result == CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(crate::error::EngineError::Encode(format!(
+            "{context}: CUDA error code {result}"
+        )))
+    }
+}
+
 /// Convert an NVENC status to an engine Result.
 #[inline]
 pub fn check_nvenc(status: NVENCSTATUS, context: &str) -> crate::error::Result<()> {
     if status == NV_ENC_SUCCESS {
         Ok(())
     } else {
+        let name = match status {
+            NV_ENC_ERR_NO_ENCODE_DEVICE => "NV_ENC_ERR_NO_ENCODE_DEVICE",
+            NV_ENC_ERR_UNSUPPORTED_DEVICE => "NV_ENC_ERR_UNSUPPORTED_DEVICE",
+            NV_ENC_ERR_INVALID_ENCODERDEVICE => "NV_ENC_ERR_INVALID_ENCODERDEVICE",
+            NV_ENC_ERR_INVALID_DEVICE => "NV_ENC_ERR_INVALID_DEVICE",
+            NV_ENC_ERR_DEVICE_NOT_EXIST => "NV_ENC_ERR_DEVICE_NOT_EXIST",
+            NV_ENC_ERR_INVALID_PTR => "NV_ENC_ERR_INVALID_PTR",
+            NV_ENC_ERR_INVALID_EVENT => "NV_ENC_ERR_INVALID_EVENT",
+            NV_ENC_ERR_INVALID_PARAM => "NV_ENC_ERR_INVALID_PARAM",
+            NV_ENC_ERR_INVALID_CALL => "NV_ENC_ERR_INVALID_CALL",
+            NV_ENC_ERR_OUT_OF_MEMORY => "NV_ENC_ERR_OUT_OF_MEMORY",
+            NV_ENC_ERR_ENCODER_NOT_INITIALIZED => "NV_ENC_ERR_ENCODER_NOT_INITIALIZED",
+            NV_ENC_ERR_UNSUPPORTED_PARAM => "NV_ENC_ERR_UNSUPPORTED_PARAM",
+            NV_ENC_ERR_LOCK_BUSY => "NV_ENC_ERR_LOCK_BUSY",
+            NV_ENC_ERR_NOT_ENOUGH_BUFFER => "NV_ENC_ERR_NOT_ENOUGH_BUFFER",
+            NV_ENC_ERR_INVALID_VERSION => "NV_ENC_ERR_INVALID_VERSION",
+            NV_ENC_ERR_MAP_FAILED => "NV_ENC_ERR_MAP_FAILED",
+            NV_ENC_ERR_NEED_MORE_INPUT => "NV_ENC_ERR_NEED_MORE_INPUT",
+            NV_ENC_ERR_ENCODER_BUSY => "NV_ENC_ERR_ENCODER_BUSY",
+            NV_ENC_ERR_EVENT_NOT_REGISTERD => "NV_ENC_ERR_EVENT_NOT_REGISTERD",
+            NV_ENC_ERR_GENERIC => "NV_ENC_ERR_GENERIC",
+            NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY => "NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY",
+            NV_ENC_ERR_UNIMPLEMENTED => "NV_ENC_ERR_UNIMPLEMENTED",
+            NV_ENC_ERR_RESOURCE_REGISTER_FAILED => "NV_ENC_ERR_RESOURCE_REGISTER_FAILED",
+            NV_ENC_ERR_RESOURCE_NOT_REGISTERED => "NV_ENC_ERR_RESOURCE_NOT_REGISTERED",
+            NV_ENC_ERR_RESOURCE_NOT_MAPPED => "NV_ENC_ERR_RESOURCE_NOT_MAPPED",
+            NV_ENC_ERR_NEED_MORE_OUTPUT => "NV_ENC_ERR_NEED_MORE_OUTPUT",
+            _ => "NV_ENC_ERR_UNKNOWN",
+        };
         Err(crate::error::EngineError::Encode(format!(
-            "{context}: NVENC error code {status}"
+            "{context}: NVENC error {name} ({})",
+            status as i32,
         )))
     }
 }
+

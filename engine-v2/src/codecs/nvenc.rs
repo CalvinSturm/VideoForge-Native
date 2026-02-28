@@ -109,6 +109,40 @@ impl RegistrationCache {
     }
 }
 
+struct CudaContextGuard {
+    prev_ctx: CUcontext,
+    restore: bool,
+}
+
+impl CudaContextGuard {
+    fn make_current(target_ctx: CUcontext) -> Result<Self> {
+        let mut prev_ctx: CUcontext = ptr::null_mut();
+        unsafe {
+            check_cu_encode(cuCtxGetCurrent(&mut prev_ctx), "cuCtxGetCurrent (nvenc)")?;
+        }
+        if prev_ctx != target_ctx {
+            unsafe {
+                check_cu_encode(cuCtxSetCurrent(target_ctx), "cuCtxSetCurrent (nvenc)")?;
+            }
+        }
+        Ok(Self {
+            prev_ctx,
+            restore: prev_ctx != target_ctx,
+        })
+    }
+}
+
+impl Drop for CudaContextGuard {
+    fn drop(&mut self) {
+        if self.restore {
+            let rc = unsafe { cuCtxSetCurrent(self.prev_ctx) };
+            if rc != CUDA_SUCCESS {
+                warn!(rc, "cuCtxSetCurrent restore failed (nvenc)");
+            }
+        }
+    }
+}
+
 // ─── NvEncoder ───────────────────────────────────────────────────────────
 
 /// NVENC hardware encoder consuming GPU-resident NV12 `FrameEnvelope`s.
@@ -127,6 +161,18 @@ pub struct NvEncoder {
     reg_cache: RegistrationCache,
     /// Encoder configuration.
     config: NvEncConfig,
+    /// CUDA context handle used for all NVENC API calls.
+    cuda_context: CUcontext,
+    /// Runtime-negotiated NVENC API version used to build struct version fields.
+    nvenc_api_version: u32,
+    /// Legacy (cuMemAlloc) staging NV12 surface for NVENC compatibility fallback.
+    legacy_staging_ptr: CUdeviceptr,
+    /// Whether to force legacy staging for all frames.
+    use_legacy_staging: bool,
+    /// Whether to bypass register/map and use NVENC-owned input buffer copies.
+    use_owned_input_buffer: bool,
+    /// NVENC-owned input buffer handle used by fallback path.
+    owned_input_buffer: *mut c_void,
     /// Frame counter for encode ordering.
     frame_idx: u32,
 }
@@ -139,42 +185,86 @@ fn ptr_hex(ptr: *mut c_void) -> String {
     format!("{ptr:p}")
 }
 
+fn current_cuda_ctx_ptr() -> CUcontext {
+    let mut ctx: CUcontext = ptr::null_mut();
+    // Best-effort diagnostics only; keep callsites non-fallible.
+    let _ = unsafe { cuCtxGetCurrent(&mut ctx) };
+    ctx
+}
+
+fn guid_short(guid: GUID) -> String {
+    format!("{:08x}-{:04x}-{:04x}", guid.Data1, guid.Data2, guid.Data3)
+}
+
 #[derive(Clone, Copy)]
 struct PresetAttempt {
     preset: GUID,
     tuning: NV_ENC_TUNING_INFO,
 }
 
+#[derive(Clone, Copy)]
+struct CodecAttempt {
+    guid: GUID,
+    label: &'static str,
+}
+
+fn codec_attempts() -> [CodecAttempt; 2] {
+    [
+        CodecAttempt {
+            guid: NV_ENC_CODEC_HEVC_GUID,
+            label: "hevc",
+        },
+        CodecAttempt {
+            guid: NV_ENC_CODEC_H264_GUID,
+            label: "h264",
+        },
+    ]
+}
+
+fn guid_eq(a: GUID, b: GUID) -> bool {
+    a.Data1 == b.Data1 && a.Data2 == b.Data2 && a.Data3 == b.Data3 && a.Data4 == b.Data4
+}
+
 fn preset_attempts() -> [PresetAttempt; 6] {
     [
         PresetAttempt {
             preset: NV_ENC_PRESET_P7_GUID,
-            tuning: NV_ENC_TUNING_INFO::HIGH_QUALITY,
+            tuning: NV_ENC_TUNING_INFO_HIGH_QUALITY,
         },
         PresetAttempt {
             preset: NV_ENC_PRESET_P7_GUID,
-            tuning: NV_ENC_TUNING_INFO::LOW_LATENCY,
+            tuning: NV_ENC_TUNING_INFO_LOW_LATENCY,
         },
         PresetAttempt {
             preset: NV_ENC_PRESET_P7_GUID,
-            tuning: NV_ENC_TUNING_INFO::UNDEFINED,
+            tuning: NV_ENC_TUNING_INFO_UNDEFINED,
         },
         PresetAttempt {
             preset: NV_ENC_PRESET_P4_GUID,
-            tuning: NV_ENC_TUNING_INFO::HIGH_QUALITY,
+            tuning: NV_ENC_TUNING_INFO_HIGH_QUALITY,
         },
         PresetAttempt {
             preset: NV_ENC_PRESET_P4_GUID,
-            tuning: NV_ENC_TUNING_INFO::LOW_LATENCY,
+            tuning: NV_ENC_TUNING_INFO_LOW_LATENCY,
         },
         PresetAttempt {
             preset: NV_ENC_PRESET_P4_GUID,
-            tuning: NV_ENC_TUNING_INFO::UNDEFINED,
+            tuning: NV_ENC_TUNING_INFO_UNDEFINED,
         },
     ]
 }
 
 impl NvEncoder {
+    #[inline]
+    fn struct_version(&self, ver: u32) -> u32 {
+        nvenc_struct_version_with_api(self.nvenc_api_version, ver)
+    }
+
+    #[inline]
+    fn struct_version_ext(&self, ver: u32) -> u32 {
+        self.struct_version(ver) | (1 << 31)
+    }
+
     /// Create and initialize an NVENC encoder session.
     ///
     /// `cuda_context` is the raw CUcontext handle.  On cudarc, this can
@@ -184,9 +274,29 @@ impl NvEncoder {
         sink: Box<dyn BitstreamSink>,
         config: NvEncConfig,
     ) -> Result<Self> {
+        let target_cuda_ctx = cuda_context as CUcontext;
+        let mut api_version = NVENCAPI_VERSION;
+        let mut max_supported_version = 0u32;
+        unsafe {
+            check_nvenc(
+                NvEncodeAPIGetMaxSupportedVersion(&mut max_supported_version),
+                "NvEncodeAPIGetMaxSupportedVersion",
+            )?;
+        }
+        if api_version > max_supported_version {
+            info!(
+                requested_api_version = api_version,
+                max_supported_version,
+                "NVENC API version exceeds driver support; downgrading"
+            );
+            api_version = max_supported_version;
+        }
+
+        let struct_version = |ver: u32| nvenc_struct_version_with_api(api_version, ver);
+
         // ── Get function table ──
         let mut fns: NV_ENCODE_API_FUNCTION_LIST = unsafe { std::mem::zeroed() };
-        fns.version = nvenc_struct_version(2);
+        fns.version = struct_version(2);
 
         // SAFETY: fns is zeroed with version set.
         // NvEncodeAPICreateInstance fills the function pointers.
@@ -199,10 +309,10 @@ impl NvEncoder {
 
         // ── Open session ──
         let mut open_params: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS = unsafe { std::mem::zeroed() };
-        open_params.version = nvenc_struct_version(1);
-        open_params.deviceType = NV_ENC_DEVICE_TYPE::CUDA;
+        open_params.version = struct_version(1);
+        open_params.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
         open_params.device = cuda_context;
-        open_params.apiVersion = NVENCAPI_VERSION;
+        open_params.apiVersion = api_version;
 
         let mut encoder: *mut c_void = ptr::null_mut();
         let open_fn = fns
@@ -228,16 +338,18 @@ impl NvEncoder {
                 "No current CUDA context bound on this thread before nvEncOpenEncodeSessionEx"
             );
         }
+        let _ctx_guard = CudaContextGuard::make_current(target_cuda_ctx)?;
 
         // SAFETY: open_params is fully initialized.
         let open_status = unsafe { open_fn(&mut open_params, &mut encoder) };
         if open_status != NV_ENC_SUCCESS {
             warn!(
-                status = open_status,
+                status = open_status as i32,
                 "nvEncOpenEncodeSessionEx failed"
             );
             return Err(EngineError::Encode(format!(
-                "nvEncOpenEncodeSessionEx: NVENC error code {open_status} (current_ctx={}, target_ctx={})",
+                "nvEncOpenEncodeSessionEx: NVENC error code {} (current_ctx={}, target_ctx={})",
+                open_status as i32,
                 ptr_hex(current_ctx_ptr),
                 ptr_hex(cuda_context),
             )));
@@ -251,53 +363,215 @@ impl NvEncoder {
             "NVENC session opened"
         );
 
+        // ── Capability discovery (codecs / presets / input formats) ──
+        let get_encode_guid_count = fns
+            .nvEncGetEncodeGUIDCount
+            .ok_or_else(|| EngineError::Encode("nvEncGetEncodeGUIDCount not found".into()))?;
+        let get_encode_guids = fns
+            .nvEncGetEncodeGUIDs
+            .ok_or_else(|| EngineError::Encode("nvEncGetEncodeGUIDs not found".into()))?;
+        let get_input_format_count = fns
+            .nvEncGetInputFormatCount
+            .ok_or_else(|| EngineError::Encode("nvEncGetInputFormatCount not found".into()))?;
+        let get_input_formats = fns
+            .nvEncGetInputFormats
+            .ok_or_else(|| EngineError::Encode("nvEncGetInputFormats not found".into()))?;
+        let get_preset_guid_count = fns
+            .nvEncGetEncodePresetCount
+            .ok_or_else(|| EngineError::Encode("nvEncGetEncodePresetCount not found".into()))?;
+        let get_preset_guids = fns
+            .nvEncGetEncodePresetGUIDs
+            .ok_or_else(|| EngineError::Encode("nvEncGetEncodePresetGUIDs not found".into()))?;
+
+        let mut codec_guid_count: u32 = 0;
+        unsafe {
+            check_nvenc(
+                get_encode_guid_count(encoder, &mut codec_guid_count),
+                "nvEncGetEncodeGUIDCount",
+            )?;
+        }
+        let mut codec_guids = vec![
+            GUID {
+                Data1: 0,
+                Data2: 0,
+                Data3: 0,
+                Data4: [0; 8],
+            };
+            codec_guid_count as usize
+        ];
+        let mut returned_codec_guid_count: u32 = 0;
+        unsafe {
+            check_nvenc(
+                get_encode_guids(
+                    encoder,
+                    codec_guids.as_mut_ptr(),
+                    codec_guids.len() as u32,
+                    &mut returned_codec_guid_count,
+                ),
+                "nvEncGetEncodeGUIDs",
+            )?;
+        }
+        codec_guids.truncate(returned_codec_guid_count as usize);
+
+        let mut capability_codecs: Vec<(CodecAttempt, Vec<PresetAttempt>)> = Vec::new();
+        for codec in codec_attempts() {
+            if !codec_guids.iter().copied().any(|g| guid_eq(g, codec.guid)) {
+                info!(codec = codec.label, "Skipping unsupported NVENC codec");
+                continue;
+            }
+
+            let mut input_fmt_count: u32 = 0;
+            unsafe {
+                check_nvenc(
+                    get_input_format_count(encoder, codec.guid, &mut input_fmt_count),
+                    "nvEncGetInputFormatCount",
+                )?;
+            }
+            let mut input_fmts = vec![0i32; input_fmt_count as usize];
+            let mut returned_input_fmt_count: u32 = 0;
+            unsafe {
+                check_nvenc(
+                    get_input_formats(
+                        encoder,
+                        codec.guid,
+                        input_fmts.as_mut_ptr(),
+                        input_fmts.len() as u32,
+                        &mut returned_input_fmt_count,
+                    ),
+                    "nvEncGetInputFormats",
+                )?;
+            }
+            input_fmts.truncate(returned_input_fmt_count as usize);
+            if !input_fmts
+                .iter()
+                .copied()
+                .any(|fmt| fmt == NV_ENC_BUFFER_FORMAT_NV12)
+            {
+                info!(codec = codec.label, "Skipping codec without NV12 input format support");
+                continue;
+            }
+
+            let mut preset_guid_count: u32 = 0;
+            unsafe {
+                check_nvenc(
+                    get_preset_guid_count(encoder, codec.guid, &mut preset_guid_count),
+                    "nvEncGetEncodePresetCount",
+                )?;
+            }
+            let mut preset_guids = vec![
+                GUID {
+                    Data1: 0,
+                    Data2: 0,
+                    Data3: 0,
+                    Data4: [0; 8],
+                };
+                preset_guid_count as usize
+            ];
+            let mut returned_preset_guid_count: u32 = 0;
+            unsafe {
+                check_nvenc(
+                    get_preset_guids(
+                        encoder,
+                        codec.guid,
+                        preset_guids.as_mut_ptr(),
+                        preset_guids.len() as u32,
+                        &mut returned_preset_guid_count,
+                    ),
+                    "nvEncGetEncodePresetGUIDs",
+                )?;
+            }
+            preset_guids.truncate(returned_preset_guid_count as usize);
+            let runtime_preset_attempts: Vec<PresetAttempt> = preset_attempts()
+                .into_iter()
+                .filter(|attempt| preset_guids.iter().copied().any(|g| guid_eq(g, attempt.preset)))
+                .collect();
+
+            if runtime_preset_attempts.is_empty() {
+                info!(codec = codec.label, "Skipping codec with no supported P7/P4 presets");
+                continue;
+            }
+
+            info!(
+                codec = codec.label,
+                preset_count = runtime_preset_attempts.len(),
+                "NVENC capability-selected codec"
+            );
+            capability_codecs.push((codec, runtime_preset_attempts));
+        }
+        if capability_codecs.is_empty() {
+            return Err(EngineError::Encode(
+                "No NVENC codec supports required preset + NV12 input in this runtime".into(),
+            ));
+        }
+
         // ── Get preset config ──
         let get_preset_ex_fn = fns
             .nvEncGetEncodePresetConfigEx
             .ok_or_else(|| EngineError::Encode("nvEncGetEncodePresetConfigEx not found".into()))?;
 
         let mut preset_config: NV_ENC_PRESET_CONFIG = unsafe { std::mem::zeroed() };
-        let version_candidates = [8, 7, 6, 5, 4, 3, 2, 1];
+        let preset_version_candidates = [5, 4, 3, 2, 1];
         let mut got_preset = false;
+        let mut selected_codec = NV_ENC_CODEC_HEVC_GUID;
+        let mut selected_codec_name = "hevc";
         let mut selected_preset_guid = NV_ENC_PRESET_P7_GUID;
-        let mut selected_tuning = NV_ENC_TUNING_INFO::HIGH_QUALITY;
+        let mut selected_tuning = NV_ENC_TUNING_INFO_HIGH_QUALITY;
+        let mut last_preset_status: Option<NVENCSTATUS> = None;
 
-        'outer_preset: for attempt in preset_attempts() {
-            for ver in version_candidates {
-                preset_config = unsafe { std::mem::zeroed() };
-                preset_config.version = nvenc_struct_version(ver);
-                preset_config.presetCfg.version = nvenc_struct_version(ver);
-                let status = unsafe {
-                    get_preset_ex_fn(
-                        encoder,
-                        NV_ENC_CODEC_HEVC_GUID,
-                        attempt.preset,
-                        attempt.tuning,
-                        &mut preset_config,
-                    )
-                };
-                if status == NV_ENC_SUCCESS {
-                    got_preset = true;
-                    selected_preset_guid = attempt.preset;
-                    selected_tuning = attempt.tuning;
-                    info!(
-                        struct_version = format_args!("{:#010x}", preset_config.version),
-                        tuning = ?selected_tuning,
-                        "Loaded NVENC preset via nvEncGetEncodePresetConfigEx"
+        'outer_preset: for (codec, runtime_preset_attempts) in &capability_codecs {
+            for attempt in runtime_preset_attempts.iter().copied() {
+                for ver in preset_version_candidates {
+                    preset_config = unsafe { std::mem::zeroed() };
+                    preset_config.version = struct_version(ver) | (1 << 31);
+                    preset_config.presetCfg.version = struct_version(9) | (1 << 31);
+                    let status = unsafe {
+                        get_preset_ex_fn(
+                            encoder,
+                            codec.guid,
+                            attempt.preset,
+                            attempt.tuning,
+                            &mut preset_config,
+                        )
+                    };
+                    last_preset_status = Some(status);
+                    if status == NV_ENC_SUCCESS {
+                        got_preset = true;
+                        selected_codec = codec.guid;
+                        selected_codec_name = codec.label;
+                        selected_preset_guid = attempt.preset;
+                        selected_tuning = attempt.tuning;
+                        info!(
+                            codec = selected_codec_name,
+                            struct_version = format_args!("{:#010x}", preset_config.version),
+                            preset_guid = %guid_short(selected_preset_guid),
+                            tuning = ?selected_tuning,
+                            "Loaded NVENC preset via nvEncGetEncodePresetConfigEx"
+                        );
+                        break 'outer_preset;
+                    }
+                    if status == NV_ENC_ERR_INVALID_VERSION
+                        || status == NV_ENC_ERR_UNSUPPORTED_PARAM
+                        || status == NV_ENC_ERR_INVALID_PARAM
+                    {
+                        info!(
+                            status = status as i32,
+                            codec = codec.label,
+                            preset_guid = %guid_short(attempt.preset),
+                            tuning = ?attempt.tuning,
+                            preset_struct_version = format_args!("{:#010x}", preset_config.version),
+                            "nvEncGetEncodePresetConfigEx retryable status"
+                        );
+                        continue;
+                    }
+                    warn!(
+                        status = status as i32,
+                        codec = codec.label,
+                        preset_guid = %guid_short(attempt.preset),
+                        tuning = ?attempt.tuning,
+                        "nvEncGetEncodePresetConfigEx returned non-retryable status; trying fallback attempts"
                     );
-                    break 'outer_preset;
+                    break;
                 }
-                if status == NV_ENC_ERR_INVALID_VERSION
-                    || status == NV_ENC_ERR_UNSUPPORTED_PARAM
-                    || status == NV_ENC_ERR_INVALID_PARAM
-                {
-                    continue;
-                }
-                warn!(
-                    status,
-                    "nvEncGetEncodePresetConfigEx returned non-retryable status; trying fallback attempts"
-                );
-                break;
             }
         }
 
@@ -305,21 +579,30 @@ impl NvEncoder {
         let mut enc_config = if got_preset {
             preset_config.presetCfg
         } else {
-            warn!("Could not query NVENC preset config; using NVENC internal defaults (encodeConfig=null)");
+            warn!(
+                last_status = last_preset_status.map(|s| s as i32).unwrap_or(-1),
+                "Could not query NVENC preset config; using NVENC internal defaults (encodeConfig=null)"
+            );
             unsafe { std::mem::zeroed() }
         };
-        let use_custom_enc_config = got_preset;
+        let use_custom_enc_config = false;
         if use_custom_enc_config {
             if enc_config.version == 0 {
-                enc_config.version = nvenc_struct_version(8);
+                enc_config.version = struct_version(9) | (1 << 31);
             }
-            enc_config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
+            if selected_codec.Data1 == NV_ENC_CODEC_HEVC_GUID.Data1
+                && selected_codec.Data2 == NV_ENC_CODEC_HEVC_GUID.Data2
+                && selected_codec.Data3 == NV_ENC_CODEC_HEVC_GUID.Data3
+                && selected_codec.Data4 == NV_ENC_CODEC_HEVC_GUID.Data4
+            {
+                enc_config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
+            }
             enc_config.gopLength = config.gop_length;
             enc_config.frameIntervalP = (config.b_frames + 1) as i32;
 
             if config.bitrate > 0 {
                 // VBR mode.
-                enc_config.rcParams.rateControlMode = 2; // NV_ENC_PARAMS_RC_VBR
+                enc_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
                 enc_config.rcParams.averageBitRate = config.bitrate;
                 enc_config.rcParams.maxBitRate = if config.max_bitrate > 0 {
                     config.max_bitrate
@@ -331,8 +614,8 @@ impl NvEncoder {
         }
 
         let mut init_params: NV_ENC_INITIALIZE_PARAMS = unsafe { std::mem::zeroed() };
-        init_params.version = nvenc_struct_version(1);
-        init_params.encodeGUID = NV_ENC_CODEC_HEVC_GUID;
+        init_params.version = struct_version(7) | (1 << 31);
+        init_params.encodeGUID = selected_codec;
         init_params.presetGUID = selected_preset_guid;
         init_params.encodeWidth = config.width;
         init_params.encodeHeight = config.height;
@@ -355,40 +638,60 @@ impl NvEncoder {
             .ok_or_else(|| EngineError::Encode("nvEncInitializeEncoder not found".into()))?;
 
         let mut init_ok = false;
-        'outer_init: for attempt in preset_attempts() {
-            init_params.presetGUID = attempt.preset;
-            init_params.tuningInfo = attempt.tuning;
-            for ver in version_candidates {
-                init_params.version = nvenc_struct_version(ver);
-                let status = unsafe { init_fn(encoder, &mut init_params) };
-                if status == NV_ENC_SUCCESS {
-                    init_ok = true;
-                    selected_preset_guid = attempt.preset;
-                    selected_tuning = attempt.tuning;
-                    break 'outer_init;
+        let mut last_init_status: Option<NVENCSTATUS> = None;
+        let init_version_candidates = [7, 6, 5, 4, 3, 2, 1];
+        'outer_init: for (codec, runtime_preset_attempts) in &capability_codecs {
+            init_params.encodeGUID = codec.guid;
+            for attempt in runtime_preset_attempts.iter().copied() {
+                init_params.presetGUID = attempt.preset;
+                init_params.tuningInfo = attempt.tuning;
+                for ver in init_version_candidates {
+                    init_params.version = struct_version(ver) | (1 << 31);
+                    let status = unsafe { init_fn(encoder, &mut init_params) };
+                    last_init_status = Some(status);
+                    if status == NV_ENC_SUCCESS {
+                        init_ok = true;
+                        selected_codec_name = codec.label;
+                        selected_preset_guid = attempt.preset;
+                        selected_tuning = attempt.tuning;
+                        break 'outer_init;
+                    }
+                    if status == NV_ENC_ERR_INVALID_VERSION
+                        || status == NV_ENC_ERR_UNSUPPORTED_PARAM
+                        || status == NV_ENC_ERR_INVALID_PARAM
+                    {
+                        info!(
+                            status = status as i32,
+                            codec = codec.label,
+                            preset_guid = %guid_short(attempt.preset),
+                            tuning = ?attempt.tuning,
+                            init_version = format_args!("{:#010x}", init_params.version),
+                            "nvEncInitializeEncoder retryable status"
+                        );
+                        continue;
+                    }
+                    warn!(
+                        status = status as i32,
+                        codec = codec.label,
+                        preset_guid = %guid_short(attempt.preset),
+                        tuning = ?attempt.tuning,
+                        struct_version = format_args!("{:#010x}", init_params.version),
+                        "nvEncInitializeEncoder non-retryable status"
+                    );
+                    check_nvenc(status, "nvEncInitializeEncoder")?;
                 }
-                if status == NV_ENC_ERR_INVALID_VERSION
-                    || status == NV_ENC_ERR_UNSUPPORTED_PARAM
-                    || status == NV_ENC_ERR_INVALID_PARAM
-                {
-                    continue;
-                }
-                check_nvenc(status, "nvEncInitializeEncoder")?;
             }
         }
         if !init_ok {
-            return Err(EngineError::Encode(
-                "nvEncInitializeEncoder: all preset/tuning/version retries failed".into(),
-            ));
+            return Err(EngineError::Encode(format!(
+                "nvEncInitializeEncoder: all codec/preset/tuning/version retries failed (last_status={})",
+                last_init_status.map(|s| s as i32).unwrap_or(-1)
+            )));
         }
 
         info!(
-            preset_guid = format_args!(
-                "{:08x}-{:04x}-{:04x}",
-                selected_preset_guid.Data1,
-                selected_preset_guid.Data2,
-                selected_preset_guid.Data3
-            ),
+            codec = selected_codec_name,
+            preset_guid = %guid_short(selected_preset_guid),
             tuning = ?selected_tuning,
             "NVENC encoder initialized"
         );
@@ -399,15 +702,17 @@ impl NvEncoder {
             .ok_or_else(|| EngineError::Encode("nvEncCreateBitstreamBuffer not found".into()))?;
 
         let mut bs_params: NV_ENC_CREATE_BITSTREAM_BUFFER = unsafe { std::mem::zeroed() };
-        bs_params.version = nvenc_struct_version(1);
+        bs_params.version = struct_version(1);
 
         // SAFETY: bs_params is initialized. NVENC allocates the buffer.
+        info!("NVENC creating bitstream buffer");
         unsafe {
             check_nvenc(
                 create_bs_fn(encoder, &mut bs_params),
                 "nvEncCreateBitstreamBuffer",
             )?;
         }
+        info!("NVENC created bitstream buffer");
 
         let bitstream_buf = bs_params.bitstreamBuffer;
         debug!("NVENC bitstream buffer created");
@@ -419,30 +724,323 @@ impl NvEncoder {
             sink,
             reg_cache: RegistrationCache::new(),
             config,
+            cuda_context: target_cuda_ctx,
+            nvenc_api_version: api_version,
+            legacy_staging_ptr: 0,
+            use_legacy_staging: false,
+            use_owned_input_buffer: false,
+            owned_input_buffer: ptr::null_mut(),
             frame_idx: 0,
         })
     }
 
+    fn ensure_legacy_staging(&mut self) -> Result<u64> {
+        if self.legacy_staging_ptr != 0 {
+            return Ok(self.legacy_staging_ptr as u64);
+        }
+        let bytes = PixelFormat::Nv12.byte_size(
+            self.config.width,
+            self.config.height,
+            self.config.nv12_pitch as usize,
+        );
+        let mut ptr: CUdeviceptr = 0;
+        unsafe {
+            check_cu_encode(
+                cuMemAlloc_v2(&mut ptr as *mut CUdeviceptr, bytes),
+                "cuMemAlloc_v2 (nvenc legacy staging)",
+            )?;
+        }
+        self.legacy_staging_ptr = ptr;
+        info!(
+            ptr = %format_args!("{:#x}", ptr),
+            bytes,
+            pitch = self.config.nv12_pitch,
+            width = self.config.width,
+            height = self.config.height,
+            "NVENC legacy staging allocated"
+        );
+        Ok(ptr as u64)
+    }
+
+    fn copy_to_legacy_staging(
+        &mut self,
+        src_dev_ptr: u64,
+        src_pitch: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<u64> {
+        let dst_dev_ptr = self.ensure_legacy_staging()?;
+        let dst_pitch = self.config.nv12_pitch;
+        let y_bytes = width as usize;
+        let uv_height = (height / 2) as usize;
+        let y_height = height as usize;
+
+        let y_copy = CUDA_MEMCPY2D {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcMemoryType: CUmemorytype::Device,
+            srcHost: std::ptr::null(),
+            srcDevice: src_dev_ptr as CUdeviceptr,
+            srcArray: std::ptr::null_mut(),
+            srcPitch: src_pitch as usize,
+            dstXInBytes: 0,
+            dstY: 0,
+            dstMemoryType: CUmemorytype::Device,
+            dstHost: std::ptr::null_mut(),
+            dstDevice: dst_dev_ptr as CUdeviceptr,
+            dstArray: std::ptr::null_mut(),
+            dstPitch: dst_pitch as usize,
+            WidthInBytes: y_bytes,
+            Height: y_height,
+        };
+
+        let uv_copy = CUDA_MEMCPY2D {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcMemoryType: CUmemorytype::Device,
+            srcHost: std::ptr::null(),
+            srcDevice: (src_dev_ptr + (src_pitch as u64 * height as u64)) as CUdeviceptr,
+            srcArray: std::ptr::null_mut(),
+            srcPitch: src_pitch as usize,
+            dstXInBytes: 0,
+            dstY: 0,
+            dstMemoryType: CUmemorytype::Device,
+            dstHost: std::ptr::null_mut(),
+            dstDevice: (dst_dev_ptr + (dst_pitch as u64 * height as u64)) as CUdeviceptr,
+            dstArray: std::ptr::null_mut(),
+            dstPitch: dst_pitch as usize,
+            WidthInBytes: y_bytes,
+            Height: uv_height,
+        };
+
+        unsafe {
+            check_cu_encode(cuMemcpy2D_v2(&y_copy as *const _), "cuMemcpy2D_v2 Y (nvenc)")?;
+            check_cu_encode(cuMemcpy2D_v2(&uv_copy as *const _), "cuMemcpy2D_v2 UV (nvenc)")?;
+        }
+        Ok(dst_dev_ptr)
+    }
+
+    fn ensure_owned_input_buffer(&mut self) -> Result<*mut c_void> {
+        if !self.owned_input_buffer.is_null() {
+            return Ok(self.owned_input_buffer);
+        }
+        let create_input_fn = self
+            .fns
+            .nvEncCreateInputBuffer
+            .ok_or_else(|| EngineError::Encode("nvEncCreateInputBuffer not found".into()))?;
+
+        let mut create_input: NV_ENC_CREATE_INPUT_BUFFER = unsafe { std::mem::zeroed() };
+        create_input.version = self.struct_version(1);
+        create_input.width = self.config.width;
+        create_input.height = self.config.height;
+        create_input.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+        create_input.memoryHeap = 0;
+        create_input.inputBuffer = ptr::null_mut();
+
+        unsafe {
+            check_nvenc(
+                create_input_fn(self.encoder, &mut create_input),
+                "nvEncCreateInputBuffer",
+            )?;
+        }
+        self.owned_input_buffer = create_input.inputBuffer;
+        info!(
+            input_buffer = %ptr_hex(self.owned_input_buffer),
+            width = self.config.width,
+            height = self.config.height,
+            "NVENC owned input buffer created"
+        );
+        Ok(self.owned_input_buffer)
+    }
+
+    fn copy_to_owned_input_buffer(
+        &mut self,
+        src_dev_ptr: u64,
+        src_pitch: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(*mut c_void, u32)> {
+        let input_buffer = self.ensure_owned_input_buffer()?;
+        let lock_input_fn = self
+            .fns
+            .nvEncLockInputBuffer
+            .ok_or_else(|| EngineError::Encode("nvEncLockInputBuffer not found".into()))?;
+        let unlock_input_fn = self
+            .fns
+            .nvEncUnlockInputBuffer
+            .ok_or_else(|| EngineError::Encode("nvEncUnlockInputBuffer not found".into()))?;
+
+        let mut lock_input: NV_ENC_LOCK_INPUT_BUFFER = unsafe { std::mem::zeroed() };
+        lock_input.version = self.struct_version(1);
+        lock_input.inputBuffer = input_buffer;
+
+        unsafe {
+            check_nvenc(
+                lock_input_fn(self.encoder, &mut lock_input),
+                "nvEncLockInputBuffer",
+            )?;
+        }
+
+        let dst_pitch = lock_input.pitch;
+        let dst_ptr = lock_input.bufferDataPtr as *mut u8;
+
+        let y_copy = CUDA_MEMCPY2D {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcMemoryType: CUmemorytype::Device,
+            srcHost: ptr::null(),
+            srcDevice: src_dev_ptr as CUdeviceptr,
+            srcArray: ptr::null_mut(),
+            srcPitch: src_pitch as usize,
+            dstXInBytes: 0,
+            dstY: 0,
+            dstMemoryType: CUmemorytype::Host,
+            dstHost: dst_ptr as *mut c_void,
+            dstDevice: 0,
+            dstArray: ptr::null_mut(),
+            dstPitch: dst_pitch as usize,
+            WidthInBytes: width as usize,
+            Height: height as usize,
+        };
+
+        let uv_src = (src_dev_ptr + (src_pitch as u64 * height as u64)) as CUdeviceptr;
+        let uv_dst = unsafe { dst_ptr.add((dst_pitch * height) as usize) };
+        let uv_copy = CUDA_MEMCPY2D {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcMemoryType: CUmemorytype::Device,
+            srcHost: ptr::null(),
+            srcDevice: uv_src,
+            srcArray: ptr::null_mut(),
+            srcPitch: src_pitch as usize,
+            dstXInBytes: 0,
+            dstY: 0,
+            dstMemoryType: CUmemorytype::Host,
+            dstHost: uv_dst as *mut c_void,
+            dstDevice: 0,
+            dstArray: ptr::null_mut(),
+            dstPitch: dst_pitch as usize,
+            WidthInBytes: width as usize,
+            Height: (height / 2) as usize,
+        };
+
+        let copy_res = unsafe {
+            check_cu_encode(
+                cuMemcpy2D_v2(&y_copy as *const _),
+                "cuMemcpy2D_v2 Y (nvenc owned input)",
+            )?;
+            check_cu_encode(
+                cuMemcpy2D_v2(&uv_copy as *const _),
+                "cuMemcpy2D_v2 UV (nvenc owned input)",
+            )
+        };
+
+        let unlock_res = unsafe {
+            check_nvenc(
+                unlock_input_fn(self.encoder, input_buffer),
+                "nvEncUnlockInputBuffer",
+            )
+        };
+
+        copy_res?;
+        unlock_res?;
+        Ok((input_buffer, dst_pitch))
+    }
+
     /// Register a CUDA device pointer as an NVENC input resource.
-    fn register_resource(&mut self, dev_ptr: u64, pitch: u32) -> Result<*mut c_void> {
+    fn register_resource(
+        &mut self,
+        dev_ptr: u64,
+        pitch: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<*mut c_void> {
+        let _ctx_guard = CudaContextGuard::make_current(self.cuda_context)?;
+        if width == 0 || height == 0 {
+            return Err(EngineError::Encode(format!(
+                "nvEncRegisterResource preflight failed: invalid dimensions {}x{}",
+                width, height
+            )));
+        }
+        if pitch < width {
+            return Err(EngineError::Encode(format!(
+                "nvEncRegisterResource preflight failed: pitch {} < width {}",
+                pitch, width
+            )));
+        }
+        if pitch != self.config.nv12_pitch {
+            warn!(
+                configured_pitch = self.config.nv12_pitch,
+                actual_pitch = pitch,
+                "NVENC register resource pitch differs from encoder config"
+            );
+        }
+
         let reg_fn = self
             .fns
             .nvEncRegisterResource
             .ok_or_else(|| EngineError::Encode("nvEncRegisterResource not found".into()))?;
 
         let mut reg: NV_ENC_REGISTER_RESOURCE = unsafe { std::mem::zeroed() };
-        reg.version = nvenc_struct_version(1);
-        reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE::CUDADEVICEPTR;
-        reg.width = self.config.width;
-        reg.height = self.config.height;
+        reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
+        reg.width = width;
+        reg.height = height;
         reg.pitch = pitch;
         reg.resourceToRegister = dev_ptr as *mut c_void;
-        reg.bufferFormat = NV_ENC_BUFFER_FORMAT::NV12;
+        reg.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
 
         // SAFETY: reg is fully initialized. NVENC validates the device pointer.
-        unsafe {
-            check_nvenc(reg_fn(self.encoder, &mut reg), "nvEncRegisterResource")?;
+        let thread_id = std::thread::current().id();
+        let current_ctx = current_cuda_ctx_ptr();
+        let version_probe = [1u32, 5, 4, 3, 2];
+        let mut last_status = NV_ENC_ERR_INVALID_PARAM;
+        let mut used_ver = 1u32;
+        let mut ok = false;
+        for ver in version_probe {
+            reg.version = self.struct_version(ver);
+            info!(
+                phase = "enter",
+                ?thread_id,
+                reg_version = format_args!("{:#010x}", reg.version),
+                reg_struct_ver = ver,
+                current_cuda_ctx = %ptr_hex(current_ctx as *mut c_void),
+                target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
+                dev_ptr = %format_args!("{:#x}", dev_ptr),
+                pitch,
+                width,
+                height,
+                "NVENC register resource boundary"
+            );
+            let status = unsafe { reg_fn(self.encoder, &mut reg) };
+            if status == NV_ENC_SUCCESS {
+                used_ver = ver;
+                ok = true;
+                break;
+            }
+            last_status = status;
+            warn!(
+                reg_struct_ver = ver,
+                reg_version = format_args!("{:#010x}", reg.version),
+                status = status as i32,
+                "NVENC register resource version probe failed"
+            );
         }
+        if !ok {
+            return Err(EngineError::Encode(format!(
+                "nvEncRegisterResource: all probed struct versions failed (last status {})",
+                last_status as i32
+            )));
+        }
+        info!(
+            phase = "exit",
+            ?thread_id,
+            reg_struct_ver = used_ver,
+            current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
+            target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
+            dev_ptr = %format_args!("{:#x}", dev_ptr),
+            handle = %ptr_hex(reg.registeredResource),
+            "NVENC register resource boundary"
+        );
 
         let handle = reg.registeredResource;
         self.reg_cache.insert(dev_ptr, handle);
@@ -452,34 +1050,113 @@ impl NvEncoder {
 
     /// Encode a single frame from a registered CUDA resource.
     fn encode_frame(&mut self, frame: &FrameEnvelope) -> Result<()> {
-        let dev_ptr = frame.texture.device_ptr();
-        let pitch = frame.texture.pitch as u32;
+        let _ctx_guard = CudaContextGuard::make_current(self.cuda_context)?;
+        let input_dev_ptr = frame.texture.device_ptr();
+        let input_pitch = frame.texture.pitch as u32;
+        let width = frame.texture.width;
+        let height = frame.texture.height;
 
-        // Get or create registration.
-        let reg_handle = match self.reg_cache.get(dev_ptr) {
-            Some(h) => h,
-            None => self.register_resource(dev_ptr, pitch)?,
-        };
+        let mut dev_ptr = input_dev_ptr;
+        let mut pitch = input_pitch;
+        let mut mapped_resource: *mut c_void = ptr::null_mut();
+        let mut used_registered_mapping = false;
+        let encode_input_buffer: *mut c_void;
 
-        // Map input resource.
-        let map_fn = self
-            .fns
-            .nvEncMapInputResource
-            .ok_or_else(|| EngineError::Encode("nvEncMapInputResource not found".into()))?;
+        if self.use_owned_input_buffer {
+            let (input_buffer, input_buffer_pitch) =
+                self.copy_to_owned_input_buffer(input_dev_ptr, input_pitch, width, height)?;
+            encode_input_buffer = input_buffer;
+            pitch = input_buffer_pitch;
+        } else {
+            // Get or create registration. If direct registration is rejected, fallback
+            // to NVENC-owned input buffer path that bypasses register/map.
+            let reg_handle = if self.use_legacy_staging {
+                dev_ptr = self.copy_to_legacy_staging(input_dev_ptr, input_pitch, width, height)?;
+                pitch = self.config.nv12_pitch;
+                match self.reg_cache.get(dev_ptr) {
+                    Some(h) => h,
+                    None => self.register_resource(dev_ptr, pitch, width, height)?,
+                }
+            } else {
+                match self.reg_cache.get(dev_ptr) {
+                    Some(h) => h,
+                    None => match self.register_resource(dev_ptr, pitch, width, height) {
+                        Ok(h) => h,
+                        Err(EngineError::Encode(msg))
+                            if msg.contains("NV_ENC_ERR_INVALID_PARAM")
+                                || msg.contains("last status 8")
+                                || msg.contains("all probed struct versions failed") =>
+                        {
+                            warn!(
+                                dev_ptr = %format_args!("{:#x}", dev_ptr),
+                                pitch,
+                                width,
+                                height,
+                                err = %msg,
+                                "NVENC direct resource registration rejected; enabling owned-input-buffer fallback"
+                            );
+                            self.use_owned_input_buffer = true;
+                            // Sentinel; mapping branch is skipped after mode switch.
+                            ptr::null_mut()
+                        }
+                        Err(e) => return Err(e),
+                    },
+                }
+            };
 
-        let mut map_params: NV_ENC_MAP_INPUT_RESOURCE = unsafe { std::mem::zeroed() };
-        map_params.version = nvenc_struct_version(1);
-        map_params.registeredResource = reg_handle;
+            if !self.use_owned_input_buffer {
+                // Map input resource.
+                let map_fn = self
+                    .fns
+                    .nvEncMapInputResource
+                    .ok_or_else(|| EngineError::Encode("nvEncMapInputResource not found".into()))?;
 
-        // SAFETY: reg_handle is valid (from nvEncRegisterResource).
-        unsafe {
-            check_nvenc(
-                map_fn(self.encoder, &mut map_params),
-                "nvEncMapInputResource",
-            )?;
+                let mut map_params: NV_ENC_MAP_INPUT_RESOURCE = unsafe { std::mem::zeroed() };
+                map_params.version = self.struct_version(1);
+                map_params.registeredResource = reg_handle;
+
+                // SAFETY: reg_handle is valid (from nvEncRegisterResource).
+                let thread_id = std::thread::current().id();
+                info!(
+                    phase = "enter",
+                    ?thread_id,
+                    map_version = format_args!("{:#010x}", map_params.version),
+                    current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
+                    target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
+                    reg_handle = %ptr_hex(reg_handle),
+                    dev_ptr = %format_args!("{:#x}", dev_ptr),
+                    pitch,
+                    width,
+                    height,
+                    "NVENC map input resource boundary"
+                );
+                unsafe {
+                    check_nvenc(
+                        map_fn(self.encoder, &mut map_params),
+                        "nvEncMapInputResource",
+                    )?;
+                }
+                info!(
+                    phase = "exit",
+                    ?thread_id,
+                    current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
+                    target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
+                    reg_handle = %ptr_hex(reg_handle),
+                    mapped_resource = %ptr_hex(map_params.mappedResource),
+                    dev_ptr = %format_args!("{:#x}", dev_ptr),
+                    "NVENC map input resource boundary"
+                );
+                mapped_resource = map_params.mappedResource;
+                encode_input_buffer = mapped_resource;
+                used_registered_mapping = true;
+            } else {
+                // Registration failure switched us into owned-input mode in this same frame.
+                let (input_buffer, input_buffer_pitch) =
+                    self.copy_to_owned_input_buffer(input_dev_ptr, input_pitch, width, height)?;
+                encode_input_buffer = input_buffer;
+                pitch = input_buffer_pitch;
+            }
         }
-
-        let mapped_resource = map_params.mappedResource;
 
         // Encode.
         let encode_fn = self
@@ -488,14 +1165,14 @@ impl NvEncoder {
             .ok_or_else(|| EngineError::Encode("nvEncEncodePicture not found".into()))?;
 
         let mut pic_params: NV_ENC_PIC_PARAMS = unsafe { std::mem::zeroed() };
-        pic_params.version = nvenc_struct_version(1);
+        pic_params.version = self.struct_version_ext(7);
         pic_params.inputWidth = self.config.width;
         pic_params.inputHeight = self.config.height;
         pic_params.inputPitch = pitch;
-        pic_params.inputBuffer = mapped_resource;
+        pic_params.inputBuffer = encode_input_buffer;
         pic_params.outputBitstream = self.bitstream_buf;
-        pic_params.bufferFmt = NV_ENC_BUFFER_FORMAT::NV12;
-        pic_params.pictureStruct = NV_ENC_PIC_STRUCT::FRAME;
+        pic_params.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+        pic_params.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
         pic_params.frameIdx = self.frame_idx;
         pic_params.inputTimeStamp = frame.pts as u64;
 
@@ -505,14 +1182,54 @@ impl NvEncoder {
         }
 
         // SAFETY: All pointers are valid NVENC-owned handles.
-        unsafe {
-            check_nvenc(
-                encode_fn(self.encoder, &mut pic_params),
-                "nvEncEncodePicture",
-            )?;
+        let thread_id = std::thread::current().id();
+        info!(
+            phase = "enter",
+            ?thread_id,
+            current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
+            target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
+            dev_ptr = %format_args!("{:#x}", dev_ptr),
+            pitch,
+            width,
+            height,
+            frame_idx = self.frame_idx,
+            "NVENC encode picture boundary"
+        );
+        let encode_status = unsafe { encode_fn(self.encoder, &mut pic_params) };
+        if encode_status != NV_ENC_SUCCESS && encode_status != NV_ENC_ERR_NEED_MORE_INPUT {
+            check_nvenc(encode_status, "nvEncEncodePicture")?;
         }
+        info!(
+            phase = "exit",
+            ?thread_id,
+            current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
+            target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
+            dev_ptr = %format_args!("{:#x}", dev_ptr),
+            frame_idx = self.frame_idx,
+            "NVENC encode picture boundary"
+        );
 
         self.frame_idx += 1;
+
+        if encode_status == NV_ENC_ERR_NEED_MORE_INPUT {
+            info!(
+                frame_idx = self.frame_idx,
+                "NVENC encode returned NEED_MORE_INPUT; waiting for additional frames"
+            );
+            if used_registered_mapping {
+                let unmap_fn = self
+                    .fns
+                    .nvEncUnmapInputResource
+                    .ok_or_else(|| EngineError::Encode("nvEncUnmapInputResource not found".into()))?;
+                unsafe {
+                    check_nvenc(
+                        unmap_fn(self.encoder, mapped_resource),
+                        "nvEncUnmapInputResource",
+                    )?;
+                }
+            }
+            return Ok(());
+        }
 
         // Lock bitstream output.
         let lock_fn = self
@@ -525,19 +1242,36 @@ impl NvEncoder {
             .ok_or_else(|| EngineError::Encode("nvEncUnlockBitstream not found".into()))?;
 
         let mut lock_params: NV_ENC_LOCK_BITSTREAM = unsafe { std::mem::zeroed() };
-        lock_params.version = nvenc_struct_version(1);
+        lock_params.version = self.struct_version_ext(2);
         lock_params.outputBitstream = self.bitstream_buf;
 
         // SAFETY: bitstream_buf is valid (from nvEncCreateBitstreamBuffer).
+        let thread_id = std::thread::current().id();
+        info!(
+            phase = "enter",
+            ?thread_id,
+            current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
+            target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
+            bitstream_buf = %ptr_hex(self.bitstream_buf),
+            "NVENC lock bitstream boundary"
+        );
         unsafe {
             check_nvenc(
                 lock_fn(self.encoder, &mut lock_params),
                 "nvEncLockBitstream",
             )?;
         }
+        info!(
+            phase = "exit",
+            ?thread_id,
+            current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
+            target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
+            bytes = lock_params.bitstreamSizeInBytes,
+            "NVENC lock bitstream boundary"
+        );
 
         // Copy encoded data to sink.
-        let is_idr = matches!(lock_params.pictureType, NV_ENC_PIC_TYPE::IDR);
+        let is_idr = lock_params.pictureType == NV_ENC_PIC_TYPE_IDR;
         let data = unsafe {
             // SAFETY: bitstreamBufferPtr is valid for bitstreamSizeInBytes.
             std::slice::from_raw_parts(
@@ -550,25 +1284,31 @@ impl NvEncoder {
 
         // Unlock regardless of sink result.
         // SAFETY: bitstream_buf was locked above.
+        info!("NVENC unlock bitstream");
         unsafe {
             check_nvenc(
                 unlock_fn(self.encoder, self.bitstream_buf),
                 "nvEncUnlockBitstream",
             )?;
         }
+        info!("NVENC unlock bitstream ok");
 
         // Unmap input resource.
-        let unmap_fn = self
-            .fns
-            .nvEncUnmapInputResource
-            .ok_or_else(|| EngineError::Encode("nvEncUnmapInputResource not found".into()))?;
+        if used_registered_mapping {
+            let unmap_fn = self
+                .fns
+                .nvEncUnmapInputResource
+                .ok_or_else(|| EngineError::Encode("nvEncUnmapInputResource not found".into()))?;
 
-        // SAFETY: mapped_resource is valid (from nvEncMapInputResource).
-        unsafe {
-            check_nvenc(
-                unmap_fn(self.encoder, mapped_resource),
-                "nvEncUnmapInputResource",
-            )?;
+            // SAFETY: mapped_resource is valid (from nvEncMapInputResource).
+            info!("NVENC unmap input resource");
+            unsafe {
+                check_nvenc(
+                    unmap_fn(self.encoder, mapped_resource),
+                    "nvEncUnmapInputResource",
+                )?;
+            }
+            info!("NVENC unmap input resource ok");
         }
 
         sink_result
@@ -576,13 +1316,14 @@ impl NvEncoder {
 
     /// Send EOS to flush the encoder.
     fn send_eos(&mut self) -> Result<()> {
+        let _ctx_guard = CudaContextGuard::make_current(self.cuda_context)?;
         let encode_fn = self
             .fns
             .nvEncEncodePicture
             .ok_or_else(|| EngineError::Encode("nvEncEncodePicture not found".into()))?;
 
         let mut eos_params: NV_ENC_PIC_PARAMS = unsafe { std::mem::zeroed() };
-        eos_params.version = nvenc_struct_version(1);
+        eos_params.version = self.struct_version_ext(7);
         eos_params.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
 
         // SAFETY: EOS params with no input buffer — signals end of encode.
@@ -599,6 +1340,7 @@ impl NvEncoder {
 
 impl FrameEncoder for NvEncoder {
     fn encode(&mut self, frame: FrameEnvelope) -> Result<()> {
+        info!(pts = frame.pts, "NVENC encode() called");
         if frame.texture.format != PixelFormat::Nv12 {
             return Err(EngineError::FormatMismatch {
                 expected: PixelFormat::Nv12,
@@ -618,10 +1360,13 @@ impl FrameEncoder for NvEncoder {
 
 impl Drop for NvEncoder {
     fn drop(&mut self) {
+        let _ctx_guard = CudaContextGuard::make_current(self.cuda_context).ok();
+        info!("NVENC drop: begin");
         // Unregister all cached resources.
         if let Some(unreg_fn) = self.fns.nvEncUnregisterResource {
             for handle in self.reg_cache.handles().collect::<Vec<_>>() {
                 // SAFETY: handle was registered via nvEncRegisterResource.
+                info!("NVENC drop: unregister resource");
                 unsafe {
                     unreg_fn(self.encoder, handle);
                 }
@@ -632,22 +1377,48 @@ impl Drop for NvEncoder {
         if !self.bitstream_buf.is_null() {
             if let Some(destroy_fn) = self.fns.nvEncDestroyBitstreamBuffer {
                 // SAFETY: bitstream_buf was created via nvEncCreateBitstreamBuffer.
+                info!("NVENC drop: destroy bitstream buffer");
                 unsafe {
                     destroy_fn(self.encoder, self.bitstream_buf);
                 }
             }
         }
 
+        if self.legacy_staging_ptr != 0 {
+            info!(
+                ptr = %format_args!("{:#x}", self.legacy_staging_ptr),
+                "NVENC drop: free legacy staging"
+            );
+            unsafe {
+                let _ = cuMemFree_v2(self.legacy_staging_ptr);
+            }
+            self.legacy_staging_ptr = 0;
+        }
+
+        if !self.owned_input_buffer.is_null() {
+            if let Some(destroy_input_fn) = self.fns.nvEncDestroyInputBuffer {
+                info!(
+                    input_buffer = %ptr_hex(self.owned_input_buffer),
+                    "NVENC drop: destroy owned input buffer"
+                );
+                unsafe {
+                    destroy_input_fn(self.encoder, self.owned_input_buffer);
+                }
+            }
+            self.owned_input_buffer = ptr::null_mut();
+        }
+
         // Destroy encoder session.
         if !self.encoder.is_null() {
             if let Some(destroy_fn) = self.fns.nvEncDestroyEncoder {
                 // SAFETY: encoder was opened via nvEncOpenEncodeSessionEx.
+                info!("NVENC drop: destroy encoder");
                 unsafe {
                     destroy_fn(self.encoder);
                 }
             }
         }
 
-        debug!("NVENC encoder destroyed");
+        info!("NVENC drop: complete");
     }
 }
