@@ -986,8 +986,18 @@ impl NvEncoder {
         reg.width = width;
         reg.height = height;
         reg.pitch = pitch;
+        reg.subResourceIndex = 0;
         reg.resourceToRegister = dev_ptr as *mut c_void;
         reg.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
+        reg.bufferUsage = NV_ENC_INPUT_IMAGE;
+        // Newer SDK layouts expose explicit chroma offsets; provide NV12 UV
+        // plane byte offset from the luma base to avoid INVALID_PARAM on
+        // drivers that validate these fields for external resources.
+        let uv_offset = pitch.saturating_mul(height);
+        reg.chromaOffset[0] = uv_offset;
+        reg.chromaOffset[1] = 0;
+        reg.chromaOffsetIn[0] = uv_offset;
+        reg.chromaOffsetIn[1] = 0;
 
         // SAFETY: reg is fully initialized. NVENC validates the device pointer.
         let thread_id = std::thread::current().id();
@@ -1113,6 +1123,10 @@ impl NvEncoder {
 
                 let mut map_params: NV_ENC_MAP_INPUT_RESOURCE = unsafe { std::mem::zeroed() };
                 map_params.version = self.struct_version(1);
+                map_params.subResourceIndex = 0;
+                // Populate both legacy and current handles for compatibility
+                // across NVENC header versions.
+                map_params.inputResource = reg_handle;
                 map_params.registeredResource = reg_handle;
 
                 // SAFETY: reg_handle is valid (from nvEncRegisterResource).
