@@ -76,6 +76,33 @@ The script will print `[PASS]` / `[FAIL]` / `[SKIP]` for each step.
 
 ---
 
+## A1) Native Perf Regression Gate (repeatable)
+
+Use this to catch native-engine performance regressions early with a hard
+median-FPS threshold.
+
+```powershell
+# From repo root
+$in = (Resolve-Path .\test_input.mp4).Path
+$onnx = 'C:\Users\Calvin\Desktop\rave\tests\assets\models\resize2x_rgb.onnx'
+
+.\tools\ci\check_native_smoke_perf.ps1 `
+  -Input $in `
+  -Onnx $onnx `
+  -Scale 2 `
+  -Precision fp32 `
+  -Runs 3 `
+  -MinMedianFps 40 `
+  -OutJson .\artifacts\native_perf_report.json
+```
+
+Behavior:
+- Runs `smoke.exe --e2e-native` repeatedly.
+- Computes FPS from input frame count and wall-clock time.
+- Fails (non-zero exit) when `median_fps < MinMedianFps`.
+
+---
+
 ## B) Python Pipeline (default path)
 
 ### Step 1 — Build and run the Rust smoke binary

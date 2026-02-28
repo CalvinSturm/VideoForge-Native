@@ -401,43 +401,40 @@ impl NvDecoder {
             Height: (height / 2) as usize,
         };
 
-        // Use the default stream for NVDEC copy path to avoid relying on
-        // cudarc internal stream layout for raw-handle extraction.
-        let decode_stream_raw: CUstream = ptr::null_mut();
-
-        // SAFETY: src_ptr is a valid mapped NVDEC surface.
-        // dst_ptr is our allocated buffer.  Both are device memory.
-        // The copy is async on decode_stream.
+        // Use synchronous D2D copies here for correctness.
+        // This avoids surface lifetime races between async copy and
+        // cuvidUnmapVideoFrame64 that can manifest as black/corrupted frames.
         unsafe {
             debug!(
                 thread = ?std::thread::current().id(),
-                "NVDEC map_and_copy enter cuMemcpy2DAsync_v2 Y"
+                "NVDEC map_and_copy enter cuMemcpy2D_v2 Y"
             );
             check_cu(
-                cuMemcpy2DAsync_v2(&y_copy, decode_stream_raw),
-                "cuMemcpy2DAsync_v2 (Y plane)",
+                cuMemcpy2D_v2(&y_copy),
+                "cuMemcpy2D_v2 (Y plane)",
             )?;
             debug!(
                 thread = ?std::thread::current().id(),
-                "NVDEC map_and_copy exit cuMemcpy2DAsync_v2 Y"
+                "NVDEC map_and_copy exit cuMemcpy2D_v2 Y"
             );
             debug!(
                 thread = ?std::thread::current().id(),
-                "NVDEC map_and_copy enter cuMemcpy2DAsync_v2 UV"
+                "NVDEC map_and_copy enter cuMemcpy2D_v2 UV"
             );
             check_cu(
-                cuMemcpy2DAsync_v2(&uv_copy, decode_stream_raw),
-                "cuMemcpy2DAsync_v2 (UV plane)",
+                cuMemcpy2D_v2(&uv_copy),
+                "cuMemcpy2D_v2 (UV plane)",
             )?;
             debug!(
                 thread = ?std::thread::current().id(),
-                "NVDEC map_and_copy exit cuMemcpy2DAsync_v2 UV"
+                "NVDEC map_and_copy exit cuMemcpy2D_v2 UV"
             );
         }
 
-        // Record event AFTER the D2D copy completes on decode_stream.
+        // Record event after synchronous copies; downstream waits remain valid.
         let event = self.events.acquire()?;
-        // SAFETY: event is valid, decode_stream_raw is valid.
+        let decode_stream_raw: CUstream = get_raw_stream(&self.ctx.decode_stream);
+        // SAFETY: event and stream handles are valid.
         unsafe {
             check_cu(
                 cuEventRecord(event, decode_stream_raw),
@@ -445,9 +442,7 @@ impl NvDecoder {
             )?;
         }
 
-        // Unmap the NVDEC surface — it is safe to do so because the D2D copy
-        // is enqueued on decode_stream before this call.  The GPU will
-        // complete the copy before reusing the surface for a new decode.
+        // Unmap the NVDEC surface after synchronous D2D copies complete.
         // SAFETY: src_ptr was obtained from cuvidMapVideoFrame64.
         unsafe {
             check_cu(
@@ -509,7 +504,9 @@ impl FrameDecoder for NvDecoder {
             // Check if we have a pending decoded frame.
             if let Some(disp) = self.cb_state.pending_display.pop_front() {
                 let decoded = self.map_and_copy(&disp)?;
-                self.last_decode_event = Some(decoded.decode_event);
+                if let Some(prev) = self.last_decode_event.replace(decoded.decode_event) {
+                    self.events.release(prev);
+                }
                 return Ok(Some(decoded.envelope));
             }
 
