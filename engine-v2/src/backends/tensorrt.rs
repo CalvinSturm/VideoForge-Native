@@ -7,9 +7,8 @@
 //!
 //! # Execution provider policy
 //!
-//! **Only TensorRT EP is permitted.**  CPU EP is explicitly disabled.
-//! After session creation, the provider list is validated.  If ORT falls
-//! back to CPU for any graph node, `initialize()` returns an error.
+//! TensorRT EP is preferred, CUDA EP is allowed as a fallback, and CPU EP
+//! is explicitly excluded from the session builder.
 //!
 //! # CUDA stream ordering
 //!
@@ -40,11 +39,14 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use ort::execution_providers::TensorRTExecutionProvider as TrtEP;
-use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
+use ort::execution_providers::{
+    CUDAExecutionProvider as CudaEP, TensorRTExecutionProvider as TrtEP,
+};
+use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::Session;
+use ort::sys as ort_sys;
 use ort::tensor::TensorElementType;
-use ort::value::DynTensor;
+use ort::value::{DynValueTypeMarker, Value as OrtValue};
 
 use cudarc::driver::DevicePtr;
 
@@ -52,6 +54,66 @@ use crate::core::backend::{ModelMetadata, UpscaleBackend};
 use crate::core::context::GpuContext;
 use crate::core::types::{GpuTexture, PixelFormat};
 use crate::error::{EngineError, Result};
+
+// Create an ORT tensor wrapper over an existing CUDA device buffer.
+unsafe fn create_tensor_from_device_memory(
+    ptr: *mut std::ffi::c_void,
+    bytes: usize,
+    shape: &[i64],
+    elem_type: TensorElementType,
+    device_id: i32,
+) -> Result<OrtValue<DynValueTypeMarker>> {
+    let api = ort::api();
+
+    let mut mem_info_ptr: *mut ort_sys::OrtMemoryInfo = std::ptr::null_mut();
+    let name = std::ffi::CString::new("Cuda")
+        .map_err(|e| EngineError::ModelMetadata(format!("CreateMemoryInfo name: {e}")))?;
+    let status = unsafe {
+        (api.CreateMemoryInfo)(
+            name.as_ptr(),
+            ort_sys::OrtAllocatorType::OrtArenaAllocator,
+            device_id,
+            ort_sys::OrtMemType::OrtMemTypeDefault,
+            &mut mem_info_ptr,
+        )
+    };
+    if !status.0.is_null() {
+        unsafe { (api.ReleaseStatus)(status.0) };
+        return Err(EngineError::ModelMetadata(
+            "CreateMemoryInfo(CUDA) failed".into(),
+        ));
+    }
+
+    let mut ort_value_ptr: *mut ort_sys::OrtValue = std::ptr::null_mut();
+    let status = unsafe {
+        (api.CreateTensorWithDataAsOrtValue)(
+            mem_info_ptr,
+            ptr,
+            bytes as _,
+            shape.as_ptr(),
+            shape.len() as _,
+            elem_type.into(),
+            &mut ort_value_ptr,
+        )
+    };
+
+    unsafe { (api.ReleaseMemoryInfo)(mem_info_ptr) };
+
+    if !status.0.is_null() {
+        unsafe { (api.ReleaseStatus)(status.0) };
+        return Err(EngineError::ModelMetadata(
+            "CreateTensorWithDataAsOrtValue failed".into(),
+        ));
+    }
+
+    Ok(unsafe {
+        OrtValue::<DynValueTypeMarker>::from_ptr(
+            std::ptr::NonNull::new(ort_value_ptr)
+                .ok_or_else(|| EngineError::ModelMetadata("Null OrtValue pointer".into()))?,
+            None,
+        )
+    })
+}
 
 // ─── Precision policy ───────────────────────────────────────────────────────
 
@@ -494,8 +556,8 @@ impl TensorRtBackend {
         let scale = match (input_dims[2], input_dims[3], output_dims[2], output_dims[3]) {
             (Some(ih), _, Some(oh), _) if ih > 0 && oh > 0 => (oh / ih) as u32,
             _ => {
-                warn!("Dynamic spatial axes — defaulting to scale=4");
-                4
+                warn!("Dynamic spatial axes — defaulting to scale=2");
+                2
             }
         };
 
@@ -525,27 +587,14 @@ impl TensorRtBackend {
         })
     }
 
-    /// Validate that no CPU execution provider is active.
+    /// Validate the execution-provider policy.
     ///
-    /// ORT may silently fall back to CPU EP if a graph node is unsupported
-    /// by TensorRT.  This check makes that failure explicit.
+    /// This backend allows TensorRT and CUDA, and excludes CPU fallback.
     fn validate_providers(_session: &Session) -> Result<()> {
-        // Session was created with ONLY TensorRT EP — no CUDA EP, no CPU EP.
-        // If TensorRT cannot handle a node and no fallback is available, ORT
-        // returns an error during session creation.
-        //
-        // Therefore: successful session creation = all nodes on TensorRT.
-        //
-        // Additional runtime guard: if future ort crate versions expose
-        // `session.execution_providers()`, we validate the list here.
-        // For now, the structural guarantee is logged.
-        info!("EP validation: session created with TensorRT EP only (no CPU fallback)");
-
-        // Belt-and-suspenders: verify the session was NOT created with
-        // implicit CPU fallback by checking that no CPU EP was registered.
-        // NOTE: The ort crate does not expose an EP list API.
-        // This validation relies on the session builder configuration above.
-        info!("EP integrity: CPUExecutionProvider explicitly excluded from session builder");
+        // The ort crate does not expose a provider list API. Validation is
+        // structural via session builder configuration.
+        info!("EP validation: TensorRT preferred, CUDA fallback allowed");
+        info!("EP integrity: CPUExecutionProvider explicitly excluded");
         Ok(())
     }
 
@@ -588,7 +637,8 @@ impl TensorRtBackend {
         output_ptr: u64,
         output_bytes: usize,
         _ctx: &GpuContext,
-        cuda_mem_info: &MemoryInfo,
+        _cuda_mem_info: &MemoryInfo,
+        device_id: i32,
     ) -> Result<()> {
         let in_w = input.width as i64;
         let in_h = input.height as i64;
@@ -613,32 +663,28 @@ impl TensorRtBackend {
         let input_bytes = (input_shape.iter().product::<i64>() as usize) * elem_bytes;
         let input_src_ptr = input.device_ptr();
 
-        // Create per-inference CUDA allocator and ORT-managed tensors.
-        // ORT allocates device memory via the CUDA EP allocator.
-        // We then D2D-copy our ring-buffer data into these tensors.
-        let cuda_alloc = Allocator::new(session, cuda_mem_info.clone())
-            .map_err(|e| EngineError::ModelMetadata(format!("CUDA allocator: {e}")))?;
-
-        let input_tensor = DynTensor::new(&cuda_alloc, elem_type, input_shape.as_slice())
-            .map_err(|e| EngineError::ModelMetadata(format!("Input tensor alloc: {e}")))?;
-        let output_tensor = DynTensor::new(&cuda_alloc, elem_type, output_shape.as_slice())
-            .map_err(|e| EngineError::ModelMetadata(format!("Output tensor alloc: {e}")))?;
-
-        // Get raw device pointers from ORT-managed tensors for D2D copies.
-        // data_ptr() returns *const c_void directly (infallible in ort rc.11).
-        let ort_in_ptr = input_tensor.data_ptr() as u64;
-        let ort_out_ptr = output_tensor.data_ptr() as u64;
-
-        // D2D copy: our GpuTexture → ORT input tensor (both on same CUDA device).
-        // SAFETY: both pointers are valid CUDA device pointers on the same device.
-        unsafe {
-            cudarc::driver::result::memcpy_dtod_sync(ort_in_ptr, input_src_ptr, input_bytes)
-                .map_err(EngineError::Cuda)?;
-        }
+        // Wrap pre-existing CUDA buffers as ORT tensors (zero-copy).
+        let input_tensor = unsafe {
+            create_tensor_from_device_memory(
+                input_src_ptr as *mut std::ffi::c_void,
+                input_bytes,
+                input_shape.as_slice(),
+                elem_type,
+                device_id,
+            )?
+        };
+        let output_tensor = unsafe {
+            create_tensor_from_device_memory(
+                output_ptr as *mut std::ffi::c_void,
+                output_bytes,
+                output_shape.as_slice(),
+                elem_type,
+                device_id,
+            )?
+        };
 
         // Phase 7: Pointer identity audit — log the ORT vs ring-slot pointers.
-        // (Not a strict identity check since we now use ORT-managed intermediate buffers.)
-        Self::verify_pointer_identity(ort_in_ptr, ort_out_ptr, input, output_ptr);
+        Self::verify_pointer_identity(input_src_ptr, output_ptr, input, output_ptr);
 
         let mut binding = session
             .create_binding()
@@ -656,13 +702,6 @@ impl TensorRtBackend {
         session
             .run_binding(&binding)
             .map_err(|e| EngineError::ModelMetadata(format!("run_binding: {e}")))?;
-
-        // D2D copy: ORT output tensor → our ring slot.
-        // SAFETY: both pointers are valid CUDA device pointers on the same device.
-        unsafe {
-            cudarc::driver::result::memcpy_dtod_sync(output_ptr, ort_out_ptr, expected)
-                .map_err(EngineError::Cuda)?;
-        }
 
         Ok(())
     }
@@ -683,20 +722,46 @@ impl UpscaleBackend for TensorRtBackend {
             return Err(EngineError::ModelMetadata("Already initialized".into()));
         }
 
-        info!(path = %self.model_path.display(), "Loading ONNX model — TensorRT EP ONLY");
+        info!(
+            path = %self.model_path.display(),
+            "Loading ONNX model — TensorRT preferred, CUDA fallback enabled"
+        );
 
         // Build session with TensorRT EP exclusively.
         let mut trt_ep = TrtEP::default()
             .with_device_id(self.device_id)
-            .with_engine_cache(true)
-            .with_engine_cache_path(
-                self.model_path
-                    .parent()
-                    .unwrap_or(&self.model_path)
-                    .join("trt_cache")
-                    .to_string_lossy()
-                    .to_string(),
-            );
+            .with_engine_cache(false);
+        let enable_cache = std::env::var("VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false);
+        if enable_cache {
+            let cache_root = std::env::var_os("VIDEOFORGE_TRT_CACHE_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::temp_dir().join("videoforge").join("trt_cache"));
+            let model_tag = self
+                .model_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model");
+            let cache_dir = cache_root.join(model_tag);
+            match std::fs::create_dir_all(&cache_dir) {
+                Ok(_) => {
+                    trt_ep = trt_ep
+                        .with_engine_cache(true)
+                        .with_engine_cache_path(cache_dir.to_string_lossy().to_string());
+                    info!(cache = %cache_dir.display(), "TensorRT engine cache enabled");
+                }
+                Err(e) => {
+                    warn!(
+                        cache = %cache_dir.display(),
+                        %e,
+                        "TensorRT cache directory unavailable; keeping engine cache disabled"
+                    );
+                }
+            }
+        } else {
+            info!("TensorRT engine cache disabled (set VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE=1 to enable)");
+        }
 
         // Phase 8: Apply precision policy.
         match &self.precision_policy {
@@ -720,13 +785,20 @@ impl UpscaleBackend for TensorRtBackend {
                 );
             }
         }
+        if self.batch_config.max_batch > 1 {
+            warn!(
+                max_batch = self.batch_config.max_batch,
+                "Configured max_batch > 1; current backend process() path remains single-frame"
+            );
+        }
 
+        let cuda_ep = CudaEP::default().with_device_id(self.device_id);
         let session = Session::builder()?
-            .with_execution_providers([trt_ep.build()])?
+            .with_execution_providers([trt_ep.build(), cuda_ep.build()])?
             .with_intra_threads(1)?
             .commit_from_file(&self.model_path)?;
 
-        // If we reach here, all graph nodes are on TensorRT EP.
+        // If we reach here, session creation respected provider policy.
         Self::validate_providers(&session)?;
 
         let metadata = Self::extract_metadata(&session)?;
@@ -739,7 +811,7 @@ impl UpscaleBackend for TensorRtBackend {
             min_ring_slots = self.min_ring_slots,
             precision = ?self.precision_policy,
             max_batch = self.batch_config.max_batch,
-            "Model loaded — zero CPU fallback"
+            "Model loaded — CPU fallback excluded"
         );
 
         let _ = self.meta.set(metadata);
@@ -819,6 +891,7 @@ impl UpscaleBackend for TensorRtBackend {
             output_bytes,
             &self.ctx,
             mem_info,
+            self.device_id,
         )?;
 
         let elapsed_us = t_start.elapsed().as_micros() as u64;
@@ -845,6 +918,16 @@ impl UpscaleBackend for TensorRtBackend {
             pitch: (out_w as usize) * elem_bytes,
             format: input.format, // Preserve F32 or F16
         })
+    }
+
+    async fn process_batch(&self, inputs: Vec<GpuTexture>) -> Result<Vec<GpuTexture>> {
+        // Current TensorRT path is single-frame IO binding; micro-batching is
+        // orchestrated at the pipeline layer and executed sequentially here.
+        let mut outputs = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            outputs.push(self.process(input).await?);
+        }
+        Ok(outputs)
     }
 
     async fn shutdown(&self) -> Result<()> {

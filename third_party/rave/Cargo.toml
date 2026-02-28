@@ -45,3 +45,6 @@ serde_json = "1"
 
 [workspace.lints.rust]
 unsafe_code = "allow"
+
+[patch.crates-io]
+ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next" }

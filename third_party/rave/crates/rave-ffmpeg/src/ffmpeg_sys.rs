@@ -46,6 +46,24 @@ unsafe extern "C" {
     pub fn av_bsf_free(ctx: *mut *mut AVBSFContext);
 }
 
+// ── AVFormatContext accessors for opaque-bindings compatibility ─────────────
+//
+// Some ffmpeg-sys-next bindgen combinations expose AVFormatContext as opaque.
+// These C helpers read the fields we need from C where the full type is known.
+unsafe extern "C" {
+    pub fn rave_avformat_stream(
+        ctx: *mut ffmpeg_sys_next::AVFormatContext,
+        index: std::ffi::c_int,
+    ) -> *mut ffmpeg_sys_next::AVStream;
+    pub fn rave_avformat_duration(ctx: *const ffmpeg_sys_next::AVFormatContext) -> i64;
+    pub fn rave_avformat_oformat(
+        ctx: *const ffmpeg_sys_next::AVFormatContext,
+    ) -> *const ffmpeg_sys_next::AVOutputFormat;
+    pub fn rave_avformat_pb(
+        ctx: *mut ffmpeg_sys_next::AVFormatContext,
+    ) -> *mut *mut ffmpeg_sys_next::AVIOContext;
+}
+
 /// Structured FFmpeg error details for module-specific wrapping.
 #[derive(Debug, Clone)]
 pub struct FfmpegErrorDetail {

@@ -21,6 +21,7 @@ use crate::ffmpeg_sys::{
     av_bsf_receive_packet,
     av_bsf_send_packet,
     check_ffmpeg,
+    rave_avformat_stream,
     to_cstring,
 };
 use rave_core::codec_traits::{BitstreamPacket, BitstreamSource};
@@ -230,7 +231,14 @@ impl FfmpegDemuxer {
             ));
         }
 
-        let stream = unsafe { &*(*(*fmt_ctx).streams.add(stream_index as usize)) };
+        let stream_ptr = unsafe { rave_avformat_stream(fmt_ctx, stream_index) };
+        if stream_ptr.is_null() {
+            unsafe { avformat_close_input(&mut fmt_ctx) };
+            return Err(EngineError::Demux(format!(
+                "Failed to resolve stream index {stream_index}"
+            )));
+        }
+        let stream = unsafe { &*stream_ptr };
         let time_base = stream.time_base;
 
         // ── Initialize bitstream filter (MP4 → Annex B) ──

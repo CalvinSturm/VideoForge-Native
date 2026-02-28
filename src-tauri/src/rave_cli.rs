@@ -1,4 +1,6 @@
 use serde_json::Value;
+use std::collections::HashSet;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
@@ -6,6 +8,7 @@ use tokio::process::Command;
 #[derive(Debug, Clone)]
 pub struct RaveCliConfig {
     pub bin_path: PathBuf,
+    pub candidate_paths: Vec<PathBuf>,
     pub workspace_root: PathBuf,
 }
 
@@ -13,31 +16,99 @@ impl RaveCliConfig {
     pub fn from_workspace_root(workspace_root: impl AsRef<Path>) -> Self {
         let workspace_root = workspace_root.as_ref().to_path_buf();
         let bin_name = if cfg!(windows) { "rave.exe" } else { "rave" };
-        let workspace_target_bin = workspace_root
-            .join("third_party")
-            .join("rave")
-            .join("target")
-            .join("release")
-            .join(bin_name);
-        let legacy_crate_target_bin = workspace_root
-            .join("third_party")
-            .join("rave")
-            .join("rave-cli")
-            .join("target")
-            .join("release")
-            .join(bin_name);
+        let candidate_paths = vec![
+            workspace_root
+                .join("third_party")
+                .join("rave")
+                .join("target")
+                .join("release")
+                .join(bin_name),
+            workspace_root
+                .join("third_party")
+                .join("rave")
+                .join("rave-cli")
+                .join("target")
+                .join("release")
+                .join(bin_name),
+            workspace_root
+                .join("third_party")
+                .join("rave-main")
+                .join("target")
+                .join("release")
+                .join(bin_name),
+            workspace_root
+                .join("third_party")
+                .join("rave-main")
+                .join("rave-cli")
+                .join("target")
+                .join("release")
+                .join(bin_name),
+        ];
 
-        let resolved_bin = if workspace_target_bin.exists() {
-            workspace_target_bin
-        } else {
-            // Compatibility fallback for non-workspace builds.
-            legacy_crate_target_bin
-        };
+        let resolved_bin = candidate_paths
+            .iter()
+            .find(|p| p.exists())
+            .cloned()
+            .unwrap_or_else(|| candidate_paths[0].clone());
         Self {
             bin_path: resolved_bin,
+            candidate_paths,
             workspace_root,
         }
     }
+}
+
+fn prepend_runtime_path(cmd: &mut Command, workspace_root: &Path, bin_path: &Path) {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
+    let mut push_dir = |p: PathBuf| {
+        if p.exists() && seen.insert(p.clone()) {
+            dirs.push(p);
+        }
+    };
+
+    push_dir(workspace_root.join("third_party").join("tensorrt"));
+    push_dir(
+        workspace_root
+            .join("third_party")
+            .join("ffmpeg")
+            .join("bin"),
+    );
+    push_dir(workspace_root.join("third_party").join("ffmpeg"));
+
+    if let Ok(vcpkg_root) = env::var("VCPKG_ROOT") {
+        push_dir(
+            PathBuf::from(vcpkg_root)
+                .join("installed")
+                .join("x64-windows")
+                .join("bin"),
+        );
+    }
+    push_dir(PathBuf::from(r"C:\tools\vcpkg\installed\x64-windows\bin"));
+
+    if let Some(parent) = bin_path.parent() {
+        push_dir(parent.to_path_buf());
+    }
+
+    if dirs.is_empty() {
+        return;
+    }
+
+    let mut merged = String::new();
+    for d in &dirs {
+        if !merged.is_empty() {
+            merged.push(';');
+        }
+        merged.push_str(&d.to_string_lossy());
+    }
+    if let Ok(existing) = env::var("PATH") {
+        if !existing.is_empty() {
+            merged.push(';');
+            merged.push_str(&existing);
+        }
+    }
+    cmd.env("PATH", merged);
 }
 
 #[derive(Debug, Clone)]
@@ -51,9 +122,9 @@ pub enum RaveCliError {
     #[error("rave-cli invocation failed: {0}")]
     Spawn(String),
     #[error(
-        "rave-cli prebuilt binary not found at {expected_path}. Fallback compile is disabled; use upscale_request_native (native engine) or prebuild rave-cli."
+        "rave-cli prebuilt binary not found. Searched paths: {searched_paths:?}. Fallback compile is disabled; use upscale_request_native (native engine) or prebuild rave-cli."
     )]
-    MissingPrebuiltBinary { expected_path: PathBuf },
+    MissingPrebuiltBinary { searched_paths: Vec<PathBuf> },
     #[error("rave-cli exited with status {status}: {stderr}")]
     Exit { status: i32, stderr: String },
     #[error("rave-cli --json contract violated: {0}")]
@@ -118,7 +189,7 @@ async fn run_cli(
 ) -> Result<RaveResult, RaveCliError> {
     if !config.bin_path.exists() {
         return Err(RaveCliError::MissingPrebuiltBinary {
-            expected_path: config.bin_path.clone(),
+            searched_paths: config.candidate_paths.clone(),
         });
     }
 
@@ -128,6 +199,7 @@ async fn run_cli(
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    prepend_runtime_path(&mut cmd, &config.workspace_root, &config.bin_path);
 
     if strict_audit {
         cmd.env("RAVE_STRICT_AUDIT_REQUIRED", "1");

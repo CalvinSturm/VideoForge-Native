@@ -8,7 +8,7 @@ use std::ptr;
 
 use ffmpeg_sys_next::*;
 
-use crate::ffmpeg_sys::{check_ffmpeg, to_cstring};
+use crate::ffmpeg_sys::{check_ffmpeg, rave_avformat_duration, rave_avformat_stream, to_cstring};
 use rave_core::error::{EngineError, Result};
 use rave_core::ffi_types::cudaVideoCodec;
 
@@ -88,10 +88,13 @@ pub fn probe_container(path: &std::path::Path) -> Result<ContainerMetadata> {
     }
 
     // Extract stream parameters.
-    let stream = unsafe {
-        let streams = (*guard.ctx).streams;
-        &*(*streams.add(stream_index as usize))
-    };
+    let stream_ptr = unsafe { rave_avformat_stream(guard.ctx, stream_index) };
+    if stream_ptr.is_null() {
+        return Err(EngineError::Probe(format!(
+            "Failed to resolve stream index {stream_index}"
+        )));
+    }
+    let stream = unsafe { &*stream_ptr };
     let codecpar = unsafe { &*stream.codecpar };
 
     let codec = match codecpar.codec_id {
@@ -116,13 +119,7 @@ pub fn probe_container(path: &std::path::Path) -> Result<ContainerMetadata> {
     let fps_den = if fps.den > 0 { fps.den as u32 } else { 1 };
 
     // Duration: container duration is in AV_TIME_BASE (microseconds).
-    let duration_us = unsafe {
-        if (*guard.ctx).duration > 0 {
-            (*guard.ctx).duration
-        } else {
-            0
-        }
-    };
+    let duration_us = unsafe { rave_avformat_duration(guard.ctx) }.max(0);
 
     tracing::info!(
         path = %path.display(),

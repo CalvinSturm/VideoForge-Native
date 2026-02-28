@@ -29,3 +29,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 rave-core = { workspace = true }
 ffmpeg-sys-next = { workspace = true, optional = true }
 tracing = { workspace = true }
+
+[build-dependencies]
+cc = "1"

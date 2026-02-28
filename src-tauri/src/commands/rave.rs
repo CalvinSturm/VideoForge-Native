@@ -164,10 +164,14 @@ fn map_rave_error(error: RaveCliError) -> String {
             Some(&msg),
             Some("Build `rave-cli` release binary and verify runtime dependencies are installed."),
         ),
-        RaveCliError::MissingPrebuiltBinary { expected_path } => {
-            let detail = expected_path.to_string_lossy().to_string();
+        RaveCliError::MissingPrebuiltBinary { searched_paths } => {
+            let detail = searched_paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
             let next_action = format!(
-                "Use `upscale_request_native` (native engine) directly, or prebuild this exact binary: `{}`.",
+                "Use `upscale_request_native` (native engine) directly, or prebuild one of these binaries: `{}`.",
                 detail
             );
             encode_rave_error(

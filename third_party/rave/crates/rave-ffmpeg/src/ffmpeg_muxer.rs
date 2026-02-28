@@ -7,7 +7,9 @@ use std::ptr;
 
 use ffmpeg_sys_next::*;
 
-use crate::ffmpeg_sys::{check_ffmpeg, to_cstring};
+use crate::ffmpeg_sys::{
+    check_ffmpeg, rave_avformat_oformat, rave_avformat_pb, to_cstring,
+};
 use rave_core::codec_traits::BitstreamSink;
 use rave_core::error::{EngineError, Result};
 
@@ -78,10 +80,23 @@ impl FfmpegMuxer {
         }
 
         // ── Open avio ──
-        let oformat = unsafe { (*fmt_ctx).oformat };
+        let oformat = unsafe { rave_avformat_oformat(fmt_ctx) };
+        if oformat.is_null() {
+            unsafe { avformat_free_context(fmt_ctx) };
+            return Err(EngineError::Mux(
+                "Output format context missing AVOutputFormat".into(),
+            ));
+        }
         let needs_file = unsafe { (*oformat).flags & AVFMT_NOFILE == 0 };
         if needs_file {
-            let ret = unsafe { avio_open(&mut (*fmt_ctx).pb, c_path.as_ptr(), AVIO_FLAG_WRITE) };
+            let pb = unsafe { rave_avformat_pb(fmt_ctx) };
+            if pb.is_null() {
+                unsafe { avformat_free_context(fmt_ctx) };
+                return Err(EngineError::Mux(
+                    "Output format context missing AVIOContext pointer".into(),
+                ));
+            }
+            let ret = unsafe { avio_open(pb, c_path.as_ptr(), AVIO_FLAG_WRITE) };
             if ret < 0 {
                 unsafe { avformat_free_context(fmt_ctx) };
                 check_ffmpeg(ret, "avio_open").map_err(|e| EngineError::Mux(e.to_string()))?;
@@ -93,7 +108,9 @@ impl FfmpegMuxer {
         if pkt.is_null() {
             unsafe {
                 if needs_file {
-                    avio_closep(&mut (*fmt_ctx).pb);
+                    if let Some(pb) = rave_avformat_pb(fmt_ctx).as_mut() {
+                        avio_closep(pb);
+                    }
                 }
                 avformat_free_context(fmt_ctx);
             }
@@ -209,9 +226,10 @@ impl Drop for FfmpegMuxer {
         unsafe {
             av_packet_free(&mut self.pkt);
 
-            let oformat = (*self.fmt_ctx).oformat;
-            if (*oformat).flags & AVFMT_NOFILE == 0 && !(*self.fmt_ctx).pb.is_null() {
-                avio_closep(&mut (*self.fmt_ctx).pb);
+            let oformat = rave_avformat_oformat(self.fmt_ctx);
+            let pb = rave_avformat_pb(self.fmt_ctx);
+            if !oformat.is_null() && !pb.is_null() && (*oformat).flags & AVFMT_NOFILE == 0 {
+                avio_closep(pb);
             }
 
             avformat_free_context(self.fmt_ctx);
