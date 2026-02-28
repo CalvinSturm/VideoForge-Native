@@ -13,8 +13,10 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/calvin/videoforge"
+homepage = "https://github.com/calvin/videoforge"
 authors = ["VideoForge Team"]
 
 [workspace.dependencies]
@@ -24,6 +26,7 @@ rave-tensorrt = { path = "crates/rave-tensorrt", version = "0.1.0" }
 rave-nvcodec = { path = "crates/rave-nvcodec", version = "0.1.0" }
 rave-ffmpeg = { path = "crates/rave-ffmpeg", version = "0.1.0" }
 rave-pipeline = { path = "crates/rave-pipeline", version = "0.1.0" }
+rave-runtime-nvidia = { path = "crates/rave-runtime-nvidia", version = "0.1.0" }
 
 cudarc = { version = "0.12", features = ["driver", "nvrtc", "cuda-12060"] }
 ort = { version = "=2.0.0-rc.11", features = ["cuda", "tensorrt"] }
@@ -37,6 +40,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
-[patch.crates-io]
-ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next" }
+[workspace.lints.rust]
+unsafe_code = "allow"
