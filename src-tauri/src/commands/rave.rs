@@ -164,6 +164,17 @@ fn map_rave_error(error: RaveCliError) -> String {
             Some(&msg),
             Some("Build `rave-cli` release binary and verify runtime dependencies are installed."),
         ),
+        RaveCliError::MissingPrebuiltBinary { expected_path } => {
+            let detail = expected_path.to_string_lossy().to_string();
+            encode_rave_error(
+                "runtime_dependency_missing",
+                "rave-cli prebuilt binary not found; fallback compile is disabled.",
+                Some(&detail),
+                Some(
+                    "Use `upscale_request_native` (native engine) directly, or prebuild `third_party/rave/target/release/rave(.exe)`.",
+                ),
+            )
+        }
         RaveCliError::Exit { status, stderr } => {
             let category = classify_exit_stderr(&stderr);
             let next_action = match category {

@@ -50,6 +50,10 @@ pub struct RaveResult {
 pub enum RaveCliError {
     #[error("rave-cli invocation failed: {0}")]
     Spawn(String),
+    #[error(
+        "rave-cli prebuilt binary not found at {expected_path}. Fallback compile is disabled; use upscale_request_native (native engine) or prebuild rave-cli."
+    )]
+    MissingPrebuiltBinary { expected_path: PathBuf },
     #[error("rave-cli exited with status {status}: {stderr}")]
     Exit { status: i32, stderr: String },
     #[error("rave-cli --json contract violated: {0}")]
@@ -112,22 +116,13 @@ async fn run_cli(
     strict_audit: bool,
     mock_run: bool,
 ) -> Result<RaveResult, RaveCliError> {
-    let mut cmd = if config.bin_path.exists() {
-        Command::new(&config.bin_path)
-    } else {
-        // Fallback for environments that have not prebuilt rave binary.
-        let mut cargo = Command::new("cargo");
-        cargo
-            .arg("run")
-            .arg("--manifest-path")
-            .arg(config.workspace_root.join("third_party/rave/Cargo.toml"))
-            .arg("-p")
-            .arg("rave-cli")
-            .arg("--bin")
-            .arg("rave")
-            .arg("--");
-        cargo
-    };
+    if !config.bin_path.exists() {
+        return Err(RaveCliError::MissingPrebuiltBinary {
+            expected_path: config.bin_path.clone(),
+        });
+    }
+
+    let mut cmd = Command::new(&config.bin_path);
 
     cmd.current_dir(&config.workspace_root)
         .args(args)
