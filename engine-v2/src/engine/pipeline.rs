@@ -168,6 +168,10 @@ pub struct PipelineConfig {
     pub model_precision: ModelPrecision,
     /// Enable GPU profiler hooks in pipeline stages.
     pub enable_profiler: bool,
+    /// Inference micro-batch size (1 = disabled).
+    pub inference_max_batch: usize,
+    /// Max wait to accumulate a micro-batch, in microseconds.
+    pub inference_batch_wait_us: u64,
 }
 
 impl Default for PipelineConfig {
@@ -179,6 +183,8 @@ impl Default for PipelineConfig {
             encoder_nv12_pitch: 0,
             model_precision: ModelPrecision::F32,
             enable_profiler: true,
+            inference_max_batch: 1,
+            inference_batch_wait_us: 2_000,
         }
     }
 }
@@ -249,6 +255,8 @@ impl UpscalePipeline {
         let precision = self.config.model_precision;
         let metrics = self.metrics.clone();
         let enable_profiler = self.config.enable_profiler;
+        let inference_max_batch = self.config.inference_max_batch;
+        let inference_batch_wait_us = self.config.inference_batch_wait_us;
 
         let mut tasks = JoinSet::new();
 
@@ -258,6 +266,10 @@ impl UpscalePipeline {
             let metrics = metrics.clone();
             let ctx_decode = ctx.clone();
             tasks.spawn_blocking(move || -> Result<()> {
+                info!(
+                    thread = ?std::thread::current().id(),
+                    "PIPELINE-BND: entered decode spawn_blocking"
+                );
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     decode_stage(
                         &mut decoder,
@@ -289,6 +301,10 @@ impl UpscalePipeline {
                 None
             };
             tasks.spawn(async move {
+                info!(
+                    thread = ?std::thread::current().id(),
+                    "PIPELINE-BND: entered preprocess task"
+                );
                 preprocess_stage(
                     rx_decoded,
                     &tx_preprocessed,
@@ -316,6 +332,10 @@ impl UpscalePipeline {
                 None
             };
             tasks.spawn(async move {
+                info!(
+                    thread = ?std::thread::current().id(),
+                    "PIPELINE-BND: entered inference task"
+                );
                 inference_stage(
                     rx_preprocessed,
                     &tx_upscaled,
@@ -324,6 +344,8 @@ impl UpscalePipeline {
                     &ctx_c,
                     encoder_pitch,
                     precision,
+                    inference_max_batch,
+                    inference_batch_wait_us,
                     &cancel,
                     &metrics,
                     profiler_ctx.as_deref(),
@@ -343,7 +365,15 @@ impl UpscalePipeline {
             } else {
                 None
             };
+            info!(
+                thread = ?std::thread::current().id(),
+                "PIPELINE-BND: scheduling encode spawn_blocking"
+            );
             tasks.spawn_blocking(move || -> Result<()> {
+                info!(
+                    thread = ?std::thread::current().id(),
+                    "PIPELINE-BND: entered encode spawn_blocking"
+                );
                 encode_stage(
                     rx_upscaled,
                     &mut encoder,
@@ -850,13 +880,24 @@ fn decode_stage<D: FrameDecoder>(
     metrics: &PipelineMetrics,
     queue: &crate::core::context::QueueDepthTracker,
 ) -> Result<()> {
+    info!(
+        thread = ?std::thread::current().id(),
+        "PIPELINE-BND: decode_stage start"
+    );
     loop {
         if cancel.is_cancelled() {
             debug!("Decode stage cancelled");
             return Ok(());
         }
+        debug!("PIPELINE-BND: decode_stage calling decode_next");
         match decoder.decode_next()? {
             Some(frame) => {
+                info!(
+                    thread = ?std::thread::current().id(),
+                    frame_index = frame.frame_index,
+                    pts = frame.pts,
+                    "PIPELINE-BND: decode_stage got frame"
+                );
                 debug_assert_eq!(frame.texture.format, PixelFormat::Nv12);
                 queue.decode.fetch_add(1, Ordering::Relaxed);
                 if tx.blocking_send(frame).is_err() {
@@ -895,6 +936,10 @@ async fn preprocess_stage(
     profiler_ctx: Option<&GpuContext>,
 ) -> Result<()> {
     let mut preprocess = PreprocessPipeline::new(kernels.clone(), precision);
+    info!(
+        thread = ?std::thread::current().id(),
+        "PIPELINE-BND: preprocess_stage start"
+    );
 
     loop {
         let frame = tokio::select! {
@@ -989,11 +1034,21 @@ async fn inference_stage<B: UpscaleBackend>(
     ctx: &GpuContext,
     encoder_pitch: usize,
     precision: ModelPrecision,
+    inference_max_batch: usize,
+    inference_batch_wait_us: u64,
     cancel: &CancellationToken,
     metrics: &PipelineMetrics,
     profiler_ctx: Option<&GpuContext>,
 ) -> Result<()> {
     let preprocess = PreprocessPipeline::new(kernels.clone(), precision);
+    let max_batch = inference_max_batch.max(1);
+    let batch_wait = Duration::from_micros(inference_batch_wait_us);
+    info!(
+        thread = ?std::thread::current().id(),
+        max_batch,
+        batch_wait_us = inference_batch_wait_us,
+        "PIPELINE-BND: inference_stage start"
+    );
 
     loop {
         if cancel.is_cancelled() {
@@ -1001,7 +1056,7 @@ async fn inference_stage<B: UpscaleBackend>(
             break;
         }
 
-        let frame = tokio::select! {
+        let first = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 debug!("Inference cancelled during recv");
@@ -1016,12 +1071,26 @@ async fn inference_stage<B: UpscaleBackend>(
             }
         };
 
-        ctx.queue_depth.preprocess.fetch_sub(1, Ordering::Relaxed);
-        ctx.queue_depth.inference.fetch_add(1, Ordering::Relaxed);
+        let mut batch = vec![first];
+        let mut upstream_closed = false;
 
-        if cancel.is_cancelled() {
-            ctx.queue_depth.inference.fetch_sub(1, Ordering::Relaxed);
-            break;
+        // Opportunistic micro-batch accumulation with latency bound.
+        if max_batch > 1 {
+            let t_batch = Instant::now();
+            while batch.len() < max_batch && !cancel.is_cancelled() {
+                let remaining = batch_wait.saturating_sub(t_batch.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, rx.recv()).await {
+                    Ok(Some(frame)) => batch.push(frame),
+                    Ok(None) => {
+                        upstream_closed = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
         }
 
         // Validate input format matches expected model precision.
@@ -1029,11 +1098,29 @@ async fn inference_stage<B: UpscaleBackend>(
             ModelPrecision::F32 => PixelFormat::RgbPlanarF32,
             ModelPrecision::F16 => PixelFormat::RgbPlanarF16,
         };
-        debug_assert_eq!(frame.texture.format, expected_format);
+        for frame in &batch {
+            debug_assert_eq!(frame.texture.format, expected_format);
+            ctx.queue_depth.preprocess.fetch_sub(1, Ordering::Relaxed);
+            ctx.queue_depth.inference.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if cancel.is_cancelled() {
+            ctx.queue_depth
+                .inference
+                .fetch_sub(batch.len(), Ordering::Relaxed);
+            break;
+        }
+
+        let mut metas = Vec::with_capacity(batch.len());
+        let mut inputs = Vec::with_capacity(batch.len());
+        for frame in batch {
+            metas.push((frame.frame_index, frame.pts, frame.is_keyframe));
+            inputs.push(frame.texture);
+        }
 
         // ── Inference ──
         let t_infer = Instant::now();
-        let upscaled_rgb = backend.process(frame.texture.clone()).await?;
+        let upscaled_rgbs = backend.process_batch(inputs.clone()).await?;
         let infer_us = t_infer.elapsed().as_micros() as u64;
         metrics
             .inference_total_us
@@ -1045,14 +1132,38 @@ async fn inference_stage<B: UpscaleBackend>(
         }
 
         // Recycle the consumed RGB input buffer.
-        if let Ok(slice) = Arc::try_unwrap(frame.texture.data) {
-            ctx.recycle(slice);
+        for input in inputs {
+            if let Ok(slice) = Arc::try_unwrap(input.data) {
+                ctx.recycle(slice);
+            }
+        }
+
+        if upscaled_rgbs.len() != metas.len() {
+            ctx.queue_depth
+                .inference
+                .fetch_sub(metas.len(), Ordering::Relaxed);
+            return Err(EngineError::DimensionMismatch(format!(
+                "Batch output mismatch: got {} outputs for {} inputs",
+                upscaled_rgbs.len(),
+                metas.len()
+            )));
         }
 
         // ── Postprocess: RGB → NV12 ──
         let t_post = Instant::now();
-        let upscaled_nv12 =
-            preprocess.postprocess(upscaled_rgb, encoder_pitch, ctx, &ctx.inference_stream)?;
+        let mut envelopes = Vec::with_capacity(metas.len());
+        for (upscaled_rgb, (frame_index, pts, is_keyframe)) in
+            upscaled_rgbs.into_iter().zip(metas.iter().copied())
+        {
+            let upscaled_nv12 =
+                preprocess.postprocess(upscaled_rgb, encoder_pitch, ctx, &ctx.inference_stream)?;
+            envelopes.push(FrameEnvelope {
+                texture: upscaled_nv12,
+                frame_index,
+                pts,
+                is_keyframe,
+            });
+        }
 
         GpuContext::sync_stream(&ctx.inference_stream)?;
         let post_us = t_post.elapsed().as_micros() as u64;
@@ -1067,20 +1178,22 @@ async fn inference_stage<B: UpscaleBackend>(
             pctx.profiler.record_frame_latency(infer_us + post_us);
         }
 
-        let envelope = FrameEnvelope {
-            texture: upscaled_nv12,
-            frame_index: frame.frame_index,
-            pts: frame.pts,
-            is_keyframe: frame.is_keyframe,
-        };
-
-        if tx.send(envelope).await.is_err() {
-            debug!("Inference: downstream closed");
+        let mut pending = envelopes.len();
+        for envelope in envelopes {
+            if tx.send(envelope).await.is_err() {
+                debug!("Inference: downstream closed");
+                ctx.queue_depth.inference.fetch_sub(pending, Ordering::Relaxed);
+                return Err(EngineError::ChannelClosed);
+            }
+            pending -= 1;
+            metrics.frames_inferred.fetch_add(1, Ordering::Release);
             ctx.queue_depth.inference.fetch_sub(1, Ordering::Relaxed);
-            return Err(EngineError::ChannelClosed);
         }
-        metrics.frames_inferred.fetch_add(1, Ordering::Release);
-        ctx.queue_depth.inference.fetch_sub(1, Ordering::Relaxed);
+
+        if upstream_closed && rx.is_empty() {
+            info!("Inference: upstream drained");
+            break;
+        }
     }
     Ok(())
 }
@@ -1097,15 +1210,26 @@ fn encode_stage<E: FrameEncoder>(
     metrics: &PipelineMetrics,
     profiler_ctx: Option<&GpuContext>,
 ) -> Result<()> {
+    info!(
+        thread = ?std::thread::current().id(),
+        "PIPELINE-BND: encode_stage start"
+    );
     loop {
         if cancel.is_cancelled() {
             debug!("Encode cancelled — flushing");
             encoder.flush()?;
             return Ok(());
         }
+        debug!("PIPELINE-BND: encode_stage waiting for frame");
         match rx.blocking_recv() {
             Some(frame) => {
                 debug_assert_eq!(frame.texture.format, PixelFormat::Nv12);
+                info!(
+                    thread = ?std::thread::current().id(),
+                    frame_index = frame.frame_index,
+                    pts = frame.pts,
+                    "PIPELINE-BND: encode_stage got frame; calling encoder.encode"
+                );
                 let t_enc = Instant::now();
                 encoder.encode(frame)?;
                 let enc_us = t_enc.elapsed().as_micros() as u64;

@@ -28,6 +28,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 rave-core = { workspace = true }
 rave-cuda = { workspace = true }
-rave-tensorrt = { version = "0.4.0", path = "../rave-tensorrt", default-features = false }
+rave-tensorrt = { workspace = true }
 rave-nvcodec = { workspace = true }
-rave-ffmpeg = { version = "0.4.0", path = "../rave-ffmpeg", default-features = false }
+rave-ffmpeg = { workspace = true }

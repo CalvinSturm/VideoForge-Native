@@ -43,6 +43,165 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[cfg(all(feature = "native_engine", windows))]
+unsafe extern "system" {
+    fn LoadLibraryW(lpLibFileName: *const u16) -> *mut std::ffi::c_void;
+}
+
+#[cfg(all(feature = "native_engine", windows))]
+fn preload_windows_dll(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: Calling system loader with a null-terminated UTF-16 path.
+    let _ = unsafe { LoadLibraryW(wide.as_ptr()) };
+}
+
+#[cfg(feature = "native_engine")]
+fn workspace_root() -> Option<PathBuf> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .canonicalize()
+        .ok()
+}
+
+#[cfg(feature = "native_engine")]
+fn prepend_path_dirs(dirs: &[PathBuf]) {
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths: Vec<PathBuf> = std::env::split_paths(&current).collect();
+    for dir in dirs.iter().filter(|d| d.is_dir()) {
+        if !paths.iter().any(|p| p == dir) {
+            paths.insert(0, dir.clone());
+        }
+    }
+    if let Ok(joined) = std::env::join_paths(paths) {
+        // SAFETY: process-local env mutation before worker/process launches.
+        unsafe { std::env::set_var("PATH", joined) };
+    }
+}
+
+#[cfg(feature = "native_engine")]
+fn find_file_under(root: &Path, file_name: &str, max_depth: usize) -> Option<PathBuf> {
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > max_depth {
+            continue;
+        }
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.file_name().and_then(|n| n.to_str()) == Some(file_name) {
+                return Some(path);
+            }
+            if path.is_dir() {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "native_engine")]
+fn configure_native_runtime_env() -> String {
+    let ffmpeg_exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let ffprobe_exe = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+
+    let mut ffmpeg_bin: Option<PathBuf> = None;
+    let mut tensorrt_bin: Option<PathBuf> = None;
+
+    if let Some(root) = workspace_root() {
+        let known_ffmpeg = [
+            root.join("third_party").join("ffmpeg").join("bin"),
+            root.join("third_party").join("ffmpeg"),
+        ];
+        for dir in &known_ffmpeg {
+            if dir.join(ffmpeg_exe).exists() && dir.join(ffprobe_exe).exists() {
+                ffmpeg_bin = Some(dir.clone());
+                break;
+            }
+        }
+
+        if ffmpeg_bin.is_none() {
+            for scan_root in [root.join("artifacts"), root.join("third_party")] {
+                if !scan_root.exists() {
+                    continue;
+                }
+                if let Some(ffmpeg_path) = find_file_under(&scan_root, ffmpeg_exe, 5) {
+                    let bin_dir = ffmpeg_path.parent().map(|p| p.to_path_buf());
+                    if let Some(bin_dir) = bin_dir {
+                        if bin_dir.join(ffprobe_exe).exists() {
+                            ffmpeg_bin = Some(bin_dir);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let known_trt = root.join("third_party").join("tensorrt");
+        if known_trt.join("nvinfer_10.dll").exists() {
+            tensorrt_bin = Some(known_trt);
+        } else if let Some(nvinfer) = find_file_under(&root.join("third_party"), "nvinfer_10.dll", 4)
+        {
+            tensorrt_bin = nvinfer.parent().map(|p| p.to_path_buf());
+        }
+    }
+
+    let mut path_additions = Vec::new();
+    if let Some(dir) = &ffmpeg_bin {
+        path_additions.push(dir.clone());
+    }
+    if let Some(dir) = &tensorrt_bin {
+        path_additions.push(dir.clone());
+
+        #[cfg(windows)]
+        {
+            // Preload core TensorRT DLLs from absolute paths so ORT provider
+            // registration does not depend on PATH search behavior.
+            for dll in [
+                "nvinfer_10.dll",
+                "nvinfer_plugin_10.dll",
+                "nvinfer_dispatch_10.dll",
+                "nvonnxparser_10.dll",
+                "cudnn64_9.dll",
+            ] {
+                let p = dir.join(dll);
+                if p.exists() {
+                    preload_windows_dll(&p);
+                }
+            }
+        }
+
+        // Stage TensorRT runtime DLLs next to the executable as a robust loader path.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let src = entry.path();
+                        let is_dll = src
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("dll"));
+                        if !is_dll {
+                            continue;
+                        }
+                        let Some(name) = src.file_name() else { continue };
+                        let dst = exe_dir.join(name);
+                        if !dst.exists() {
+                            let _ = std::fs::copy(&src, &dst);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    prepend_path_dirs(&path_additions);
+
+    if let Some(bin) = ffmpeg_bin {
+        return bin.join(ffmpeg_exe).to_string_lossy().to_string();
+    }
+    "ffmpeg".to_string()
+}
+
 /// Structured response returned by `upscale_request_native`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NativeUpscaleResult {
@@ -92,6 +251,7 @@ pub async fn upscale_request_native(
     scale: u32,
     precision: Option<String>,
     audio: Option<bool>,
+    max_batch: Option<u32>,
 ) -> Result<NativeUpscaleResult, String> {
     // Validate inputs regardless of feature flag.
     if !Path::new(&input_path).exists() {
@@ -122,6 +282,7 @@ pub async fn upscale_request_native(
             scale,
             precision.unwrap_or_else(|| "fp32".to_string()),
             audio.unwrap_or(true),
+            max_batch.unwrap_or(1),
         )
         .await
     }
@@ -139,6 +300,7 @@ async fn run_native_pipeline(
     scale: u32,
     precision: String,
     preserve_audio: bool,
+    max_batch: u32,
 ) -> Result<NativeUpscaleResult, String> {
     use std::process::Stdio;
     use tokio::process::Command;
@@ -147,6 +309,14 @@ async fn run_native_pipeline(
 
     let make_err =
         |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
+    let ffmpeg_cmd = configure_native_runtime_env();
+
+    if !(1..=8).contains(&max_batch) {
+        return Err(make_err(
+            "INVALID_BATCH",
+            &format!("Invalid max_batch value '{max_batch}'. Must be in range 1-8."),
+        ));
+    }
 
     // Validate model path.
     if !Path::new(&model_path).exists() {
@@ -180,6 +350,7 @@ async fn run_native_pipeline(
         model = %model_path,
         scale,
         precision = %precision,
+        max_batch,
         "Native engine pipeline starting"
     );
 
@@ -197,7 +368,7 @@ async fn run_native_pipeline(
         "Extracting H.264 elementary stream with FFmpeg"
     );
 
-    let demux_status = Command::new("ffmpeg")
+    let demux_status = Command::new(&ffmpeg_cmd)
         .args([
             "-y",
             "-hide_banner",
@@ -221,7 +392,7 @@ async fn run_native_pipeline(
     if !demux_status.success() {
         // Attempt HEVC fallback
         let hevc_path = tmp_dir.join(format!("vf_native_input_{}.hevc", ts));
-        let hevc_status = Command::new("ffmpeg")
+        let hevc_status = Command::new(&ffmpeg_cmd)
             .args([
                 "-y",
                 "-hide_banner",
@@ -253,6 +424,8 @@ async fn run_native_pipeline(
                 scale,
                 precision,
                 preserve_audio,
+                max_batch,
+                ffmpeg_cmd.clone(),
                 CudaCodec::HEVC,
             )
             .await;
@@ -274,6 +447,8 @@ async fn run_native_pipeline(
         scale,
         precision,
         preserve_audio,
+        max_batch,
+        ffmpeg_cmd,
         CudaCodec::H264,
     )
     .await
@@ -290,6 +465,8 @@ async fn run_engine_pipeline(
     scale: u32,
     precision: String,
     preserve_audio: bool,
+    max_batch: u32,
+    ffmpeg_cmd: String,
     codec: videoforge_engine::codecs::sys::cudaVideoCodec,
 ) -> Result<NativeUpscaleResult, String> {
     use std::process::Stdio;
@@ -299,6 +476,7 @@ async fn run_engine_pipeline(
     use videoforge_engine::backends::tensorrt::{BatchConfig, PrecisionPolicy, TensorRtBackend};
     use videoforge_engine::codecs::nvdec::NvDecoder;
     use videoforge_engine::codecs::nvenc::NvEncConfig;
+    use videoforge_engine::core::backend::UpscaleBackend;
     use videoforge_engine::core::context::GpuContext;
     use videoforge_engine::core::kernels::{ModelPrecision, PreprocessKernels};
     use videoforge_engine::engine::pipeline::{PipelineConfig, UpscalePipeline};
@@ -350,9 +528,16 @@ async fn run_engine_pipeline(
         8, // ring_size (≥ downstream_capacity + 2)
         4, // downstream_capacity
         precision_policy,
-        BatchConfig::default(),
+        BatchConfig {
+            max_batch: max_batch as usize,
+            ..BatchConfig::default()
+        },
     );
     let backend = Arc::new(backend);
+    backend
+        .initialize()
+        .await
+        .map_err(|e| make_err("BACKEND_INIT", &format!("TensorRT backend init failed: {}", e)))?;
 
     // ── Step 4: Compile kernels ───────────────────────────────────────────────
     let kernels = PreprocessKernels::compile(ctx.device())
@@ -412,6 +597,7 @@ async fn run_engine_pipeline(
     let config = PipelineConfig {
         model_precision: model_prec,
         encoder_nv12_pitch,
+        inference_max_batch: max_batch as usize,
         ..PipelineConfig::default()
     };
     let pipeline = UpscalePipeline::new(ctx.clone(), kernels, config);
@@ -473,7 +659,7 @@ async fn run_engine_pipeline(
         final_output.clone(),
     ]);
 
-    let mux_status = Command::new("ffmpeg")
+    let mux_status = Command::new(&ffmpeg_cmd)
         .args(&mux_args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

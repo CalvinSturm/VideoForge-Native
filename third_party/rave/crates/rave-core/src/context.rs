@@ -12,6 +12,8 @@
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, c_char, c_void};
+#[cfg(target_os = "windows")]
+use std::ffi::c_void;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -29,6 +31,12 @@ unsafe extern "C" {
     fn cuDriverGetVersion(driver_version: *mut i32) -> CUresult;
     fn cuDeviceGetCount(count: *mut i32) -> CUresult;
     fn cuStreamSynchronize(hStream: CUstream) -> CUresult;
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" {
+    fn GetModuleHandleW(lpModuleName: *const u16) -> *mut c_void;
+    fn GetModuleFileNameW(hModule: *mut c_void, lpFilename: *mut u16, nSize: u32) -> u32;
 }
 
 #[cfg(target_os = "linux")]
@@ -298,6 +306,45 @@ Ensure NVIDIA driver libraries are installed and visible via LD_LIBRARY_PATH \
         false
     }
 
+    #[cfg(target_os = "windows")]
+    fn loaded_module_path(module_name: &str) -> Option<String> {
+        let wide_name: Vec<u16> = module_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `wide_name` is NUL-terminated UTF-16.
+        let handle = unsafe { GetModuleHandleW(wide_name.as_ptr()) };
+        if handle.is_null() {
+            return None;
+        }
+
+        let mut buf = vec![0u16; 260];
+        loop {
+            // SAFETY: `buf` is valid writable memory for UTF-16 output.
+            let len = unsafe { GetModuleFileNameW(handle, buf.as_mut_ptr(), buf.len() as u32) };
+            if len == 0 {
+                return None;
+            }
+            if (len as usize) < (buf.len() - 1) {
+                return Some(String::from_utf16_lossy(&buf[..len as usize]));
+            }
+            if buf.len() >= 32768 {
+                return None;
+            }
+            buf.resize(buf.len() * 2, 0);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn loaded_nvcuda_path() -> Option<String> {
+        Self::loaded_module_path("nvcuda.dll")
+    }
+
+    #[cfg(target_os = "windows")]
+    fn loaded_nvencodeapi_path() -> Option<String> {
+        Self::loaded_module_path("nvEncodeAPI64.dll")
+    }
+
     #[cfg(target_os = "linux")]
     fn loaded_shared_object_path(needle: &str) -> Option<String> {
         let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
@@ -529,17 +576,27 @@ This is typically a WSL/Windows NVIDIA driver issue. Run scripts/wsl_gpu_healthc
             let libcuda_dladdr_path = Self::libcuda_path_from_dladdr();
             #[cfg(target_os = "linux")]
             let libnvidia_encode_path = Self::loaded_libnvidia_encode_path();
+            #[cfg(target_os = "windows")]
+            let nvcuda_module_path = Self::loaded_nvcuda_path();
+            #[cfg(target_os = "windows")]
+            let nvencodeapi_module_path = Self::loaded_nvencodeapi_path();
             #[cfg(not(target_os = "linux"))]
             let libcuda_path: Option<String> = None;
             #[cfg(not(target_os = "linux"))]
             let libcuda_dladdr_path: Option<String> = None;
             #[cfg(not(target_os = "linux"))]
             let libnvidia_encode_path: Option<String> = None;
+            #[cfg(not(target_os = "windows"))]
+            let nvcuda_module_path: Option<String> = None;
+            #[cfg(not(target_os = "windows"))]
+            let nvencodeapi_module_path: Option<String> = None;
 
             info!(
                 libcuda = ?libcuda_path,
                 libcuda_from_dladdr = ?libcuda_dladdr_path,
                 libnvidia_encode = ?libnvidia_encode_path,
+                nvcuda_module = ?nvcuda_module_path,
+                nvencodeapi_module = ?nvencodeapi_module_path,
                 cu_init_rc = rc_init,
                 cu_init_status = cuda_error_name(rc_init),
                 cu_driver_get_version_rc = rc_driver,

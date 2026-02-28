@@ -169,6 +169,46 @@ pub struct NvDecoder {
 }
 
 impl NvDecoder {
+    fn init_parser_if_needed(&mut self) -> Result<()> {
+        if !self.parser.is_null() {
+            return Ok(());
+        }
+        let cb_state_ptr: *mut CallbackState = &mut *self.cb_state;
+        let codec = self.cb_state.codec;
+
+        let mut parser_params: CUVIDPARSERPARAMS = unsafe { std::mem::zeroed() };
+        parser_params.CodecType = codec;
+        parser_params.ulMaxNumDecodeSurfaces = 8;
+        parser_params.ulMaxDisplayDelay = 4;
+        // nvcuvid.h bitfield: bAnnexb=bit0, bMemoryOptimize=bit1.
+        // bAnnexb only applies to AV1 Annex-B streams.
+        parser_params.ulParserFlags = if matches!(codec, cudaVideoCodec::AV1) {
+            0x1
+        } else {
+            0
+        };
+        parser_params.pUserData = cb_state_ptr as *mut c_void;
+        parser_params.pfnSequenceCallback = Some(sequence_callback);
+        parser_params.pfnDecodePicture = Some(decode_callback);
+        parser_params.pfnDisplayPicture = Some(display_callback);
+
+        let mut parser: CUvideoparser = ptr::null_mut();
+        unsafe {
+            check_cu(
+                cuvidCreateVideoParser(&mut parser, &mut parser_params),
+                "cuvidCreateVideoParser",
+            )?;
+        }
+        self.parser = parser;
+        info!(
+            ?codec,
+            thread = ?std::thread::current().id(),
+            parser = format_args!("{:p}", parser),
+            "NVDEC parser created"
+        );
+        Ok(())
+    }
+
     /// Create a new hardware decoder.
     ///
     /// The parser is created immediately.  The actual hardware decoder is
@@ -179,7 +219,7 @@ impl NvDecoder {
         source: Box<dyn BitstreamSource>,
         codec: cudaVideoCodec,
     ) -> Result<Self> {
-        let mut cb_state = Box::new(CallbackState {
+        let cb_state = Box::new(CallbackState {
             decoder: ptr::null_mut(),
             format: None,
             pending_display: VecDeque::new(),
@@ -188,33 +228,8 @@ impl NvDecoder {
             codec,
         });
 
-        let cb_state_ptr: *mut CallbackState = &mut *cb_state;
-
-        let mut parser_params: CUVIDPARSERPARAMS = unsafe { std::mem::zeroed() };
-        parser_params.CodecType = codec;
-        parser_params.ulMaxNumDecodeSurfaces = 8;
-        parser_params.ulMaxDisplayDelay = 4; // Allow 4-frame reorder for B-frames.
-        parser_params.bAnnexb = 1; // Expect Annex B format.
-        parser_params.pUserData = cb_state_ptr as *mut c_void;
-        parser_params.pfnSequenceCallback = Some(sequence_callback);
-        parser_params.pfnDecodePicture = Some(decode_callback);
-        parser_params.pfnDisplayPicture = Some(display_callback);
-
-        let mut parser: CUvideoparser = ptr::null_mut();
-
-        // SAFETY: parser_params is fully initialized above.
-        // pUserData points to heap-allocated cb_state which outlives the parser.
-        unsafe {
-            check_cu(
-                cuvidCreateVideoParser(&mut parser, &mut parser_params),
-                "cuvidCreateVideoParser",
-            )?;
-        }
-
-        info!(?codec, "NVDEC parser created");
-
         Ok(Self {
-            parser,
+            parser: ptr::null_mut(),
             ctx,
             source,
             cb_state,
@@ -236,12 +251,24 @@ impl NvDecoder {
 
         // SAFETY: pkt.payload points to valid host memory (packet.data).
         // Parser copies the data internally before returning.
+        debug!(
+            thread = ?std::thread::current().id(),
+            parser = format_args!("{:p}", self.parser),
+            payload_size = packet.data.len(),
+            pts = packet.pts,
+            "NVDEC feed_packet enter cuvidParseVideoData"
+        );
         unsafe {
             check_cu(
                 cuvidParseVideoData(self.parser, &mut pkt),
                 "cuvidParseVideoData",
             )?;
         }
+        debug!(
+            thread = ?std::thread::current().id(),
+            parser = format_args!("{:p}", self.parser),
+            "NVDEC feed_packet exit cuvidParseVideoData"
+        );
         Ok(())
     }
 
@@ -271,6 +298,13 @@ impl NvDecoder {
         if decoder.is_null() {
             return Err(EngineError::Decode("Decoder not created yet".into()));
         }
+        debug!(
+            thread = ?std::thread::current().id(),
+            decoder = format_args!("{:p}", decoder),
+            pic_idx = disp.picture_index,
+            pts = disp.timestamp,
+            "NVDEC map_and_copy enter"
+        );
 
         let format = self
             .cb_state
@@ -292,6 +326,12 @@ impl NvDecoder {
         // SAFETY: decoder is valid (created in sequence_callback).
         // src_ptr and src_pitch are outputs.
         unsafe {
+            debug!(
+                thread = ?std::thread::current().id(),
+                decoder = format_args!("{:p}", decoder),
+                pic_idx = disp.picture_index,
+                "NVDEC map_and_copy enter cuvidMapVideoFrame64"
+            );
             check_cu(
                 cuvidMapVideoFrame64(
                     decoder,
@@ -302,6 +342,12 @@ impl NvDecoder {
                 ),
                 "cuvidMapVideoFrame64",
             )?;
+            debug!(
+                thread = ?std::thread::current().id(),
+                src_ptr = format_args!("0x{:x}", src_ptr),
+                src_pitch = src_pitch,
+                "NVDEC map_and_copy exit cuvidMapVideoFrame64"
+            );
         }
 
         let src_pitch_usize = src_pitch as usize;
@@ -355,27 +401,38 @@ impl NvDecoder {
             Height: (height / 2) as usize,
         };
 
-        // Get the raw CUstream handle for decode_stream.
-        // SAFETY: We pass the stream handle obtained from cudarc's internal
-        // representation.  cudarc::CudaStream wraps a CUstream but does not
-        // expose it publicly.  We use transmute to extract it.
-        //
-        // This is fragile but necessary because cudarc 0.12 does not provide
-        // a public `raw()` or `as_raw()` method on CudaStream.
-        let decode_stream_raw = get_raw_stream(&self.ctx.decode_stream);
+        // Use the default stream for NVDEC copy path to avoid relying on
+        // cudarc internal stream layout for raw-handle extraction.
+        let decode_stream_raw: CUstream = ptr::null_mut();
 
         // SAFETY: src_ptr is a valid mapped NVDEC surface.
         // dst_ptr is our allocated buffer.  Both are device memory.
         // The copy is async on decode_stream.
         unsafe {
+            debug!(
+                thread = ?std::thread::current().id(),
+                "NVDEC map_and_copy enter cuMemcpy2DAsync_v2 Y"
+            );
             check_cu(
                 cuMemcpy2DAsync_v2(&y_copy, decode_stream_raw),
                 "cuMemcpy2DAsync_v2 (Y plane)",
             )?;
+            debug!(
+                thread = ?std::thread::current().id(),
+                "NVDEC map_and_copy exit cuMemcpy2DAsync_v2 Y"
+            );
+            debug!(
+                thread = ?std::thread::current().id(),
+                "NVDEC map_and_copy enter cuMemcpy2DAsync_v2 UV"
+            );
             check_cu(
                 cuMemcpy2DAsync_v2(&uv_copy, decode_stream_raw),
                 "cuMemcpy2DAsync_v2 (UV plane)",
             )?;
+            debug!(
+                thread = ?std::thread::current().id(),
+                "NVDEC map_and_copy exit cuMemcpy2DAsync_v2 UV"
+            );
         }
 
         // Record event AFTER the D2D copy completes on decode_stream.
@@ -438,6 +495,16 @@ impl FrameDecoder for NvDecoder {
     ///
     /// Returns `None` at EOS.
     fn decode_next(&mut self) -> Result<Option<FrameEnvelope>> {
+        self.ctx
+            .device()
+            .bind_to_thread()
+            .map_err(|e| EngineError::Decode(format!("bind_to_thread (nvdec): {:?}", e)))?;
+        self.init_parser_if_needed()?;
+        debug!(
+            thread = ?std::thread::current().id(),
+            parser = format_args!("{:p}", self.parser),
+            "NVDEC decode_next enter"
+        );
         loop {
             // Check if we have a pending decoded frame.
             if let Some(disp) = self.cb_state.pending_display.pop_front() {
@@ -453,6 +520,13 @@ impl FrameDecoder for NvDecoder {
 
             match self.source.read_packet()? {
                 Some(packet) => {
+                    debug!(
+                        thread = ?std::thread::current().id(),
+                        bytes = packet.data.len(),
+                        pts = packet.pts,
+                        key = packet.is_keyframe,
+                        "NVDEC decode_next read packet"
+                    );
                     self.feed_packet(&packet)?;
                 }
                 None => {
@@ -498,7 +572,7 @@ impl Drop for NvDecoder {
 // They must not block and must not call Rust allocator-heavy operations.
 
 /// Called when a sequence header is parsed — creates/recreates the decoder.
-unsafe extern "C" fn sequence_callback(
+unsafe extern "system" fn sequence_callback(
     user_data: *mut c_void,
     format: *mut CUVIDEOFORMAT,
 ) -> c_int {
@@ -557,7 +631,7 @@ unsafe extern "C" fn sequence_callback(
 }
 
 /// Called when a picture has been decoded — enqueue for GPU processing.
-unsafe extern "C" fn decode_callback(
+unsafe extern "system" fn decode_callback(
     user_data: *mut c_void,
     pic_params: *mut CUVIDPICPARAMS,
 ) -> c_int {
@@ -578,7 +652,7 @@ unsafe extern "C" fn decode_callback(
 }
 
 /// Called when a decoded picture is ready for display (reordered).
-unsafe extern "C" fn display_callback(
+unsafe extern "system" fn display_callback(
     user_data: *mut c_void,
     disp_info: *mut CUVIDPARSERDISPINFO,
 ) -> c_int {
