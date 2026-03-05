@@ -1587,6 +1587,60 @@ mod tests {
     }
 }
 
+impl TensorRtBackend {
+    /// Probe the ONNX model for dynamic spatial axes (indicates transformer architecture).
+    ///
+    /// Builds a lightweight CPU-only session (no TRT/CUDA EP) to inspect
+    /// input and output tensor shapes.  If any spatial dimension (H or W,
+    /// indices 2/3 in NCHW layout) is dynamic (≤ 0), the model is likely a
+    /// transformer that TRT EP cannot reliably handle.
+    ///
+    /// Returns `false` on any probe error — the caller will proceed with
+    /// the default EP selection, which is safe even if suboptimal.
+    fn probe_has_dynamic_spatial(&self) -> bool {
+        let session = match ort::session::Session::builder()
+            .and_then(|b| b.commit_from_file(&self.model_path))
+        {
+            Ok(s) => s,
+            Err(e) => {
+                debug!(error = %e, "EP probe: could not open model for shape inspection");
+                return false;
+            }
+        };
+
+        let check_dynamic = |shapes: &[i64]| -> bool {
+            shapes.len() == 4 && (shapes[2] <= 0 || shapes[3] <= 0)
+        };
+
+        let inputs = session.inputs();
+        let outputs = session.outputs();
+
+        if inputs.is_empty() || outputs.is_empty() {
+            return false;
+        }
+
+        let input_dynamic = match inputs[0].dtype() {
+            ort::value::ValueType::Tensor { shape, .. } => check_dynamic(&shape),
+            _ => false,
+        };
+        let output_dynamic = match outputs[0].dtype() {
+            ort::value::ValueType::Tensor { shape, .. } => check_dynamic(&shape),
+            _ => false,
+        };
+
+        if input_dynamic || output_dynamic {
+            info!(
+                model = %self.model_path.display(),
+                input_dynamic,
+                output_dynamic,
+                "EP probe: model has dynamic spatial axes (transformer architecture)"
+            );
+        }
+
+        input_dynamic || output_dynamic
+    }
+}
+
 #[async_trait]
 impl UpscaleBackend for TensorRtBackend {
     async fn initialize(&self) -> Result<()> {
@@ -1597,8 +1651,25 @@ impl UpscaleBackend for TensorRtBackend {
 
         validate_batch_config(&self.batch_config)?;
 
-        let ep_mode = Self::ort_ep_mode();
+        let mut ep_mode = Self::ort_ep_mode();
         let on_wsl = Self::is_wsl2();
+
+        // Auto-detect transformer models: probe for dynamic spatial axes
+        // before building the session. TRT EP cannot reliably handle
+        // transformer ops (attention, layer-norm, etc.) — the IO binding
+        // with pre-allocated GPU output buffers breaks when ORT partitions
+        // the graph and falls back to CPU for unsupported nodes.
+        // CUDA EP handles all ops natively on the GPU.
+        if ep_mode == OrtEpMode::Auto && self.probe_has_dynamic_spatial() {
+            info!(
+                path = %self.model_path.display(),
+                "Dynamic spatial axes detected (transformer model) — \
+                 forcing CUDAExecutionProvider (TRT EP incompatible \
+                 with partitioned transformer graphs)"
+            );
+            ep_mode = OrtEpMode::CudaOnly;
+        }
+
         info!(
             path = %self.model_path.display(),
             ?ep_mode,
