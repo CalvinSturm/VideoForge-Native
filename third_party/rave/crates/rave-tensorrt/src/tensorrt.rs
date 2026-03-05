@@ -37,7 +37,6 @@ use std::collections::HashSet;
 use std::env;
 #[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, c_char, c_void};
-#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -636,7 +635,7 @@ impl TensorRtBackend {
         None
     }
 
-    fn extract_metadata(session: &Session) -> Result<ModelMetadata> {
+    fn extract_metadata(session: &Session, model_path: &Path) -> Result<ModelMetadata> {
         let inputs = session.inputs();
         let outputs = session.outputs();
 
@@ -705,15 +704,27 @@ impl TensorRtBackend {
             warn!(
                 model_name = %name,
                 inferred_scale = inferred,
-                "Dynamic spatial axes — inferring upscale scale from model name"
+                "Dynamic spatial axes — inferring upscale scale from model graph name"
+            );
+            inferred
+        } else if let Some(inferred) = model_path
+            .file_stem()
+            .and_then(|s: &std::ffi::OsStr| s.to_str())
+            .and_then(|s| Self::infer_scale_from_name(s))
+        {
+            warn!(
+                model_path = %model_path.display(),
+                inferred_scale = inferred,
+                "Dynamic spatial axes — inferring upscale scale from model filename"
             );
             inferred
         } else {
             warn!(
                 model_name = %name,
-                "Dynamic spatial axes — unable to infer scale from metadata; defaulting to scale=2"
+                model_path = %model_path.display(),
+                "Dynamic spatial axes — unable to infer scale from metadata or filename; defaulting to scale=4"
             );
-            2
+            4
         };
 
         let min_input_hw = (
@@ -1618,7 +1629,7 @@ impl UpscaleBackend for TensorRtBackend {
             "ORT execution provider selected"
         );
 
-        let metadata = Self::extract_metadata(&session)?;
+        let metadata = Self::extract_metadata(&session, &self.model_path)?;
         info!(
             name = %metadata.name,
             scale = metadata.scale,
