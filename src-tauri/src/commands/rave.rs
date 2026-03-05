@@ -38,6 +38,16 @@ fn resolve_profile() -> Result<String, String> {
     Ok(env_profile_override()?.unwrap_or_else(|| default_profile().to_string()))
 }
 
+fn native_engine_runtime_enabled() -> bool {
+    match std::env::var("VIDEOFORGE_ENABLE_NATIVE_ENGINE") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
 fn ensure_profile_arg(mut args: Vec<String>, profile: &str) -> Vec<String> {
     let has_profile = args
         .windows(1)
@@ -116,6 +126,19 @@ fn encode_rave_error(
     payload.to_string()
 }
 
+fn classify_exit_code(code: i32) -> Option<&'static str> {
+    match code {
+        100 | 101 => Some("runtime_dependency_missing"), // CUDA/NVRTC
+        200..=202 => Some("inference_error"),            // Inference/ModelMetadata/NotInitialized
+        300..=305 => Some("codec_error"),                // Decode/Encode/Demux/Mux/Probe
+        400..=402 => Some("pipeline_error"),             // Pipeline/ChannelClosed/Shutdown
+        500..=502 => Some("input_contract_error"), // FormatMismatch/DimensionMismatch/BufferTooSmall
+        600 => Some("policy_violation"),           // InvariantViolation
+        700..=703 => Some("runtime_error"), // PanicRecovered/VramLimit/Backpressure/DropOrder
+        _ => None,
+    }
+}
+
 fn classify_exit_stderr(stderr: &str) -> &'static str {
     let lower = stderr.to_ascii_lowercase();
 
@@ -128,6 +151,10 @@ fn classify_exit_stderr(stderr: &str) -> &'static str {
         || lower.contains("production_strict")
     {
         return "policy_violation";
+    }
+
+    if lower.contains("inference") || lower.contains("model load") || lower.contains("ort error") {
+        return "inference_error";
     }
 
     if (lower.contains("cuda")
@@ -182,7 +209,10 @@ fn map_rave_error(error: RaveCliError) -> String {
             )
         }
         RaveCliError::Exit { status, stderr } => {
-            let category = classify_exit_stderr(&stderr);
+            // Prefer exit-code classification (well-defined in rave-core error codes),
+            // fall back to stderr text heuristics for unknown exit codes.
+            let category = classify_exit_code(status)
+                .unwrap_or_else(|| classify_exit_stderr(&stderr));
             let next_action = match category {
                 "policy_violation" => {
                     Some("Enable required strict-profile capabilities (for example audit-no-host-copies) or switch to dev profile.")
@@ -195,6 +225,15 @@ fn map_rave_error(error: RaveCliError) -> String {
                 }
                 "input_contract_error" => {
                     Some("Fix input/CLI arguments to satisfy contract requirements (for example keep max_batch at 1).")
+                }
+                "inference_error" => {
+                    Some("The model failed during inference. Check stderr for ORT/TensorRT details — the model may use unsupported ops or exceed VRAM. Try a smaller model or fp16 precision.")
+                }
+                "codec_error" => {
+                    Some("A codec error occurred during decode/encode. Verify the input format is supported and FFmpeg/NVENC/NVDEC are available.")
+                }
+                "pipeline_error" => {
+                    Some("The processing pipeline failed. Check stderr for details and retry with a simpler configuration.")
                 }
                 _ => Some("Inspect stderr details and rerun with corrected runtime/input configuration."),
             };
@@ -247,7 +286,19 @@ pub async fn rave_upscale(
     args: Vec<String>,
     strict_audit: Option<bool>,
     mock_run: Option<bool>,
+    ui_opt_in: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    if !ui_opt_in.unwrap_or(false) && !native_engine_runtime_enabled() {
+        return Err(encode_rave_error(
+            "native_engine_disabled",
+            "Native engine path is disabled by default for stability.",
+            None,
+            Some(
+                "Set VIDEOFORGE_ENABLE_NATIVE_ENGINE=1 to opt in explicitly, or switch the header toggle to Python.",
+            ),
+        ));
+    }
+
     validate_max_batch_arg(&args)?;
     let profile = resolve_profile()?;
     let root = workspace_root()?;
@@ -338,7 +389,19 @@ pub async fn rave_benchmark(
     args: Vec<String>,
     strict_audit: Option<bool>,
     mock_run: Option<bool>,
+    ui_opt_in: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    if !ui_opt_in.unwrap_or(false) && !native_engine_runtime_enabled() {
+        return Err(encode_rave_error(
+            "native_engine_disabled",
+            "Native engine path is disabled by default for stability.",
+            None,
+            Some(
+                "Set VIDEOFORGE_ENABLE_NATIVE_ENGINE=1 to opt in explicitly, or switch the header toggle to Python.",
+            ),
+        ));
+    }
+
     let profile = resolve_profile()?;
     let root = workspace_root()?;
     let config = RaveCliConfig::from_workspace_root(root);

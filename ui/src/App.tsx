@@ -382,6 +382,12 @@ const App: React.FC = () => {
         return "Install missing runtime dependency and rerun.";
       case "input_contract_error":
         return "Fix input/CLI contract values (for example keep max_batch at 1).";
+      case "inference_error":
+        return "Model failed during inference. May use unsupported ops or exceed VRAM. Try a smaller model or fp16 precision.";
+      case "codec_error":
+        return "Codec error during decode/encode. Verify input format is supported and FFmpeg/NVENC/NVDEC are available.";
+      case "pipeline_error":
+        return "Processing pipeline failed. Check activity log for details.";
       default:
         return undefined;
     }
@@ -515,7 +521,8 @@ const App: React.FC = () => {
                   modelPath: info.path
                 }),
                 strictAudit: true,
-                mockRun: false
+                mockRun: false,
+                uiOptIn: true
               });
               setLogs(prev => [
                 ...prev,
@@ -533,7 +540,8 @@ const App: React.FC = () => {
               modelPath: info.path
             }),
             strictAudit: true,
-            mockRun: false
+            mockRun: false,
+            uiOptIn: true
           });
           if (!raveResult.output || typeof raveResult.output !== "string") {
             throw new Error("rave_upscale did not return a valid output path");

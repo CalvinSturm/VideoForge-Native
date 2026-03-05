@@ -41,7 +41,9 @@
 //! See `docs/NATIVE_ENGINE_MVP.md` for full instructions.
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "native_engine")]
+use std::path::PathBuf;
 
 #[cfg(all(feature = "native_engine", windows))]
 unsafe extern "system" {
@@ -102,8 +104,16 @@ fn find_file_under(root: &Path, file_name: &str, max_depth: usize) -> Option<Pat
 
 #[cfg(feature = "native_engine")]
 fn configure_native_runtime_env() -> String {
-    let ffmpeg_exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-    let ffprobe_exe = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+    let ffmpeg_exe = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+    let ffprobe_exe = if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    };
 
     let mut ffmpeg_bin: Option<PathBuf> = None;
     let mut tensorrt_bin: Option<PathBuf> = None;
@@ -140,7 +150,8 @@ fn configure_native_runtime_env() -> String {
         let known_trt = root.join("third_party").join("tensorrt");
         if known_trt.join("nvinfer_10.dll").exists() {
             tensorrt_bin = Some(known_trt);
-        } else if let Some(nvinfer) = find_file_under(&root.join("third_party"), "nvinfer_10.dll", 4)
+        } else if let Some(nvinfer) =
+            find_file_under(&root.join("third_party"), "nvinfer_10.dll", 4)
         {
             tensorrt_bin = nvinfer.parent().map(|p| p.to_path_buf());
         }
@@ -184,7 +195,9 @@ fn configure_native_runtime_env() -> String {
                         if !is_dll {
                             continue;
                         }
-                        let Some(name) = src.file_name() else { continue };
+                        let Some(name) = src.file_name() else {
+                            continue;
+                        };
                         let dst = exe_dir.join(name);
                         if !dst.exists() {
                             let _ = std::fs::copy(&src, &dst);
@@ -227,6 +240,96 @@ impl NativeUpscaleError {
     }
 }
 
+#[cfg(feature = "native_engine")]
+fn native_engine_runtime_enabled() -> bool {
+    match std::env::var("VIDEOFORGE_ENABLE_NATIVE_ENGINE") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+#[cfg(feature = "native_engine")]
+async fn run_native_via_rave_cli(
+    input_path: String,
+    output_path: String,
+    model_path: String,
+    _scale: u32,
+    precision: String,
+    _preserve_audio: bool,
+    max_batch: u32,
+) -> Result<NativeUpscaleResult, String> {
+    let make_err =
+        |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
+
+    if !(1..=8).contains(&max_batch) {
+        return Err(make_err(
+            "INVALID_BATCH",
+            &format!("Invalid max_batch value '{max_batch}'. Must be in range 1-8."),
+        ));
+    }
+
+    let resolved_output = if output_path.trim().is_empty() {
+        let p = Path::new(&input_path);
+        let stem = p
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let ext = p
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if ext.is_empty() {
+            format!("{stem}_rave_upscaled.mp4")
+        } else {
+            input_path.replace(&format!(".{ext}"), "_rave_upscaled.mp4")
+        }
+    } else {
+        output_path
+    };
+
+    let mut args = vec![
+        "-i".to_string(),
+        input_path,
+        "-m".to_string(),
+        model_path,
+        "-o".to_string(),
+        resolved_output.clone(),
+        "--precision".to_string(),
+        precision,
+        "--progress".to_string(),
+        "jsonl".to_string(),
+    ];
+    if max_batch > 1 {
+        args.push("--max-batch".to_string());
+        args.push(max_batch.to_string());
+    }
+
+    let res =
+        crate::commands::rave::rave_upscale(args, Some(true), Some(false), Some(true)).await?;
+    let output = res
+        .get("output")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            make_err(
+                "RAVE_CONTRACT",
+                "rave_upscale did not return a valid output path",
+            )
+        })?
+        .to_string();
+
+    Ok(NativeUpscaleResult {
+        output_path: output,
+        engine: "native_via_rave_cli".to_string(),
+        frames_processed: 0,
+        audio_preserved: true,
+    })
+}
+
 // =============================================================================
 // Command (always present — returns FEATURE_DISABLED when feature is off)
 // =============================================================================
@@ -264,6 +367,14 @@ pub async fn upscale_request_native(
 
     #[cfg(not(feature = "native_engine"))]
     {
+        let _ = (
+            &output_path,
+            &model_path,
+            scale,
+            &precision,
+            &audio,
+            &max_batch,
+        );
         return Err(serde_json::to_string(&NativeUpscaleError::new(
             "FEATURE_DISABLED",
             "The native_engine feature is not compiled in. \
@@ -275,7 +386,16 @@ pub async fn upscale_request_native(
 
     #[cfg(feature = "native_engine")]
     {
-        run_native_pipeline(
+        if !native_engine_runtime_enabled() {
+            return Err(serde_json::to_string(&NativeUpscaleError::new(
+                "NATIVE_ENGINE_DISABLED",
+                "Native engine is disabled by default for stability. \
+                 Set VIDEOFORGE_ENABLE_NATIVE_ENGINE=1 to opt in explicitly.",
+            ))
+            .unwrap());
+        }
+
+        run_native_via_rave_cli(
             input_path,
             output_path,
             model_path,
@@ -534,10 +654,12 @@ async fn run_engine_pipeline(
         },
     );
     let backend = Arc::new(backend);
-    backend
-        .initialize()
-        .await
-        .map_err(|e| make_err("BACKEND_INIT", &format!("TensorRT backend init failed: {}", e)))?;
+    backend.initialize().await.map_err(|e| {
+        make_err(
+            "BACKEND_INIT",
+            &format!("TensorRT backend init failed: {}", e),
+        )
+    })?;
 
     // ── Step 4: Compile kernels ───────────────────────────────────────────────
     let kernels = PreprocessKernels::compile(ctx.device())

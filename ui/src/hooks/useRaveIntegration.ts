@@ -15,6 +15,8 @@ export function useRaveIntegration({ addToast, setLogs }: UseRaveIntegrationOpti
 
     const hintForCategory = (category: string): string | undefined => {
         switch (category) {
+            case "native_engine_disabled":
+                return "Switch AI Upscale engine mode to Python, or explicitly set VIDEOFORGE_ENABLE_NATIVE_ENGINE=1.";
             case "policy_violation":
                 return "Enable strict-profile requirements (audit/no-host-copies) or switch profile.";
             case "provider_loader_error":
@@ -23,6 +25,12 @@ export function useRaveIntegration({ addToast, setLogs }: UseRaveIntegrationOpti
                 return "Install missing runtime dependency and rerun.";
             case "input_contract_error":
                 return "Fix input/CLI contract values (max_batch must be 1-8).";
+            case "inference_error":
+                return "Model failed during inference. May use unsupported ops or exceed VRAM. Try a smaller model or fp16 precision.";
+            case "codec_error":
+                return "Codec error during decode/encode. Verify input format is supported.";
+            case "pipeline_error":
+                return "Processing pipeline failed. Check activity log for details.";
             default:
                 return undefined;
         }
