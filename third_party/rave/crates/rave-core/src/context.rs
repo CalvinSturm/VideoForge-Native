@@ -716,6 +716,10 @@ Use WSL NVIDIA driver libcuda instead: export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$
             bucket_size,
         )?;
         let buf = self.device.alloc_zeros::<u8>(bucket_size)?;
+        // CRITICAL: alloc_zeros uses cuMemAllocAsync on the device default
+        // stream. Kernels on other streams race against this -- sync to ensure
+        // the allocation is fully committed before the buffer is used.
+        self.device.synchronize()?;
         self.vram.on_alloc(bucket_size);
 
         if self.alloc_policy.is_steady_state() {

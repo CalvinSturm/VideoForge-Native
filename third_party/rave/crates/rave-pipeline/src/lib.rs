@@ -10,13 +10,13 @@ pub mod pipeline;
 pub mod stage_graph;
 
 pub use pipeline::{
-    DeterminismObserved, DeterminismPolicy, DeterminismSkipReason, PipelineConfig, PipelineMetrics,
-    UpscalePipeline, enforce_determinism_policy,
+    enforce_determinism_policy, DeterminismObserved, DeterminismPolicy, DeterminismSkipReason,
+    PipelineConfig, PipelineMetrics, TileConfig, UpscalePipeline,
 };
 pub use stage_graph::{
-    AuditItem, AuditLevel, BatchConfig, EnhanceConfig, GRAPH_SCHEMA_VERSION, PipelineReport,
+    validate_batch_config, AuditItem, AuditLevel, BatchConfig, EnhanceConfig, PipelineReport,
     PrecisionPolicyConfig, ProfilePreset, RunContract, StageConfig, StageGraph, StageId, StageKind,
-    StageTimingReport, validate_batch_config,
+    StageTimingReport, GRAPH_SCHEMA_VERSION,
 };
 
 #[cfg(test)]

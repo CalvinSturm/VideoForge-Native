@@ -70,6 +70,7 @@ use rave_core::error::{EngineError, Result};
 use rave_core::ffi_types::cudaVideoCodec;
 use rave_core::host_copy_audit::{audit_device_texture, require_host_copy_audit_if_strict};
 use rave_core::types::{FrameEnvelope, GpuTexture, PixelFormat};
+use cudarc::driver::DevicePtr;
 use rave_cuda::kernels::{ModelPrecision, PreprocessKernels};
 #[cfg(feature = "nvidia-run-graph")]
 use rave_ffmpeg::ffmpeg_demuxer::FfmpegDemuxer;
@@ -286,6 +287,29 @@ pub fn enforce_determinism_policy(
     }
 }
 
+// ─── Tile config ────────────────────────────────────────────────────────────
+
+/// Configuration for tiled inference — splits large images into overlapping
+/// tiles to reduce attention cost for transformer models.
+///
+/// When `tile_size == 0`, tiling is disabled (full-frame inference).
+#[derive(Clone, Copy, Debug)]
+pub struct TileConfig {
+    /// Tile size in pixels (square tiles). `0` = disabled.
+    pub tile_size: u32,
+    /// Overlap padding in pixels for each edge (seamless tile boundaries).
+    pub tile_pad: u32,
+}
+
+impl Default for TileConfig {
+    fn default() -> Self {
+        Self {
+            tile_size: 0,
+            tile_pad: 32,
+        }
+    }
+}
+
 // ─── Pipeline config ────────────────────────────────────────────────────────
 
 /// Runtime configuration for an [`UpscalePipeline`] instance.
@@ -324,6 +348,12 @@ pub struct PipelineConfig {
     /// Larger values fill batches more completely at the cost of added latency.
     /// Defaults to `8_000` µs (8 ms). Ignored when `max_batch == 1`.
     pub batch_latency_deadline_us: u64,
+    /// Tile configuration for transformer models.
+    ///
+    /// When `tile_size > 0`, the inference stage splits each input frame into
+    /// overlapping tiles, runs inference per-tile, and merges the results.
+    /// This reduces attention cost from O(n²) to O(tile²) per tile.
+    pub tile_config: TileConfig,
 }
 
 impl Default for PipelineConfig {
@@ -339,6 +369,7 @@ impl Default for PipelineConfig {
             strict_invariants: false,
             max_batch: 1,
             batch_latency_deadline_us: 8_000,
+            tile_config: TileConfig::default(),
         }
     }
 }
@@ -486,6 +517,7 @@ impl UpscalePipeline {
             };
             let max_batch = self.config.max_batch;
             let batch_latency_deadline_us = self.config.batch_latency_deadline_us;
+            let tile_config = self.config.tile_config;
             tasks.spawn(async move {
                 inference_stage(
                     rx_preprocessed,
@@ -501,6 +533,7 @@ impl UpscalePipeline {
                     strict_no_host_copies,
                     max_batch,
                     batch_latency_deadline_us,
+                    tile_config,
                 )
                 .await
             });
@@ -1696,6 +1729,114 @@ async fn preprocess_stage(
     Ok(())
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TILED INFERENCE — split → infer → merge
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Run tiled inference on a single `RgbPlanarF32` texture.
+///
+/// 1. Compute a grid of overlapping tiles that covers the input dimensions.
+/// 2. For each tile: crop with padding → `backend.process()` → place into output.
+/// 3. Return a single `RgbPlanarF32` texture at `scale×` the input resolution.
+///
+/// Tile placement strips the overlap padding from each tile output, so the
+/// final image has no visible seams.
+async fn tiled_inference<B: UpscaleBackend>(
+    input: &GpuTexture,
+    backend: &B,
+    kernels: &PreprocessKernels,
+    ctx: &GpuContext,
+    tile_config: TileConfig,
+) -> Result<GpuTexture> {
+    let meta = backend.metadata()?;
+    let scale = meta.scale;
+    let tile_size = tile_config.tile_size;
+    let tile_pad = tile_config.tile_pad;
+
+    let in_w = input.width;
+    let in_h = input.height;
+    let out_w = in_w * scale;
+    let out_h = in_h * scale;
+
+    let tiles_x = (in_w + tile_size - 1) / tile_size;
+    let tiles_y = (in_h + tile_size - 1) / tile_size;
+
+    // Allocate + zero the full output buffer upfront.
+    let out_bytes = 3 * (out_w as usize) * (out_h as usize) * std::mem::size_of::<f32>();
+    let output_buf = ctx.alloc(out_bytes)?;
+    unsafe {
+        cudarc::driver::result::memset_d8_sync(
+            *output_buf.device_ptr(), 0u8, out_bytes,
+        ).map_err(|e| EngineError::DimensionMismatch(format!("memset failed: {e:?}")))?;
+    }
+    let output_ptr = *output_buf.device_ptr();
+
+    // Process one tile at a time: crop → infer → place → drop.
+    // Serialized to avoid OutputRing contention (total tiles may exceed ring_size).
+    for ty in 0..tiles_y {
+        for tx in 0..tiles_x {
+            let x0 = (tx * tile_size) as i32;
+            let y0 = (ty * tile_size) as i32;
+            let crop_x = x0 - tile_pad as i32;
+            let crop_y = y0 - tile_pad as i32;
+            let crop_w = tile_size + 2 * tile_pad;
+            let crop_h = tile_size + 2 * tile_pad;
+
+            // ── Crop ──
+            let tile_input = kernels.crop_tile(
+                input, crop_x, crop_y, crop_w, crop_h, ctx, &ctx.inference_stream,
+            )?;
+            ctx.device().synchronize()?;
+
+            // Keep tile input alive across inference — ORT's TensorRT EP may
+            // still read from the buffer after process() returns.
+            let _input_keepalive = tile_input.data.clone();
+
+            // ── Infer ──
+            let tile_output = backend.process(tile_input).await?;
+            ctx.device().synchronize()?;
+
+            // ── Place ──
+            let scaled_pad = tile_pad * scale;
+            let valid_w = (tile_size * scale).min(out_w - tx * tile_size * scale);
+            let valid_h = (tile_size * scale).min(out_h - ty * tile_size * scale);
+            let dst_x = tx * tile_size * scale;
+            let dst_y = ty * tile_size * scale;
+
+            kernels.place_tile(
+                &tile_output,
+                output_ptr,
+                out_w,
+                out_h,
+                dst_x,
+                dst_y,
+                scaled_pad,
+                valid_w,
+                valid_h,
+                &ctx.inference_stream,
+            )?;
+            // Sync before tile_output drops — cuMemFreeAsync on the default
+            // stream would free the buffer while place on inference_stream
+            // is still reading it.
+            ctx.device().synchronize()?;
+
+            // tile_output and _input_keepalive drop here → ring slot freed.
+        }
+    }
+
+    // Final sync: ensure all place kernels completed before downstream use.
+    ctx.device().synchronize()?;
+
+    Ok(GpuTexture {
+        data: Arc::new(output_buf),
+        width: out_w,
+        height: out_h,
+        pitch: (out_w as usize) * std::mem::size_of::<f32>(),
+        format: PixelFormat::RgbPlanarF32,
+    })
+}
+
+
 /// Stage 3 — Inference + Postprocess.
 ///
 /// 1. Accumulate up to `max_batch` frames (or flush on channel close).
@@ -1719,6 +1860,7 @@ async fn inference_stage<B: UpscaleBackend>(
     strict_no_host_copies: bool,
     max_batch: usize,
     batch_latency_deadline_us: u64,
+    tile_config: TileConfig,
 ) -> Result<()> {
     let effective_batch = max_batch.max(1).min(8);
 
@@ -1780,10 +1922,24 @@ async fn inference_stage<B: UpscaleBackend>(
         let batch_size = batch_frames.len();
         let _ = precision; // precision drives TRT engine config, not input format
 
-        // ── Batched Inference ──
+        // ── Inference (full-frame or tiled) ──
         let textures: Vec<_> = batch_frames.iter().map(|f| f.texture.clone()).collect();
         let t_infer = Instant::now();
-        let upscaled_batch = backend.process_batch(textures).await?;
+
+        let upscaled_batch = if tile_config.tile_size > 0 {
+            // Tiled inference: process each frame independently with tiling.
+            let mut results = Vec::with_capacity(textures.len());
+            for tex in textures {
+                let tiled_output = tiled_inference(
+                    &tex, backend, kernels, ctx, tile_config,
+                ).await?;
+                results.push(tiled_output);
+            }
+            results
+        } else {
+            // Full-frame batched inference.
+            backend.process_batch(textures).await?
+        };
         let infer_us = t_infer.elapsed().as_micros() as u64;
         metrics
             .inference_total_us

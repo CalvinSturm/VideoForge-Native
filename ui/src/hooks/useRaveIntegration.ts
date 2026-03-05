@@ -83,6 +83,7 @@ export function useRaveIntegration({ addToast, setLogs }: UseRaveIntegrationOpti
 
     const buildRaveUpscaleArgs = (params: {
         input: string; output: string; modelPath: string; maxBatch?: number;
+        architectureClass?: string; tileSize?: number; tilePad?: number;
     }): string[] => {
         const args = [
             "-i", params.input,
@@ -94,11 +95,20 @@ export function useRaveIntegration({ addToast, setLogs }: UseRaveIntegrationOpti
         if (params.maxBatch && params.maxBatch > 1) {
             args.push("--max-batch", String(params.maxBatch));
         }
+        // Auto-inject tiling for transformer models (DAT2, SwinIR, HAT)
+        const effectiveTileSize = params.tileSize ?? (params.architectureClass === "Transformer" ? 256 : 0);
+        if (effectiveTileSize > 0) {
+            args.push("--tile-size", String(effectiveTileSize));
+            if (params.tilePad !== undefined) {
+                args.push("--tile-pad", String(params.tilePad));
+            }
+        }
         return args;
     };
 
     const buildRaveBenchmarkArgs = (params: {
         input: string; modelPath: string; maxBatch?: number;
+        architectureClass?: string; tileSize?: number; tilePad?: number;
     }): string[] => {
         const args = [
             "-i", params.input,
@@ -109,6 +119,14 @@ export function useRaveIntegration({ addToast, setLogs }: UseRaveIntegrationOpti
         ];
         if (params.maxBatch && params.maxBatch > 1) {
             args.push("--max-batch", String(params.maxBatch));
+        }
+        // Auto-inject tiling for transformer models
+        const effectiveTileSize = params.tileSize ?? (params.architectureClass === "Transformer" ? 256 : 0);
+        if (effectiveTileSize > 0) {
+            args.push("--tile-size", String(effectiveTileSize));
+            if (params.tilePad !== undefined) {
+                args.push("--tile-pad", String(params.tilePad));
+            }
         }
         return args;
     };

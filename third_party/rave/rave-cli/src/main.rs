@@ -29,7 +29,7 @@ use rave_core::host_copy_audit::{
     HostCopyAuditStatus, host_copy_audit_status, require_host_copy_audit_if_strict,
 };
 use rave_core::types::{FrameEnvelope, GpuTexture, PixelFormat};
-use rave_pipeline::pipeline::{PipelineConfig, PipelineMetrics, UpscalePipeline};
+use rave_pipeline::pipeline::{PipelineConfig, PipelineMetrics, TileConfig, UpscalePipeline};
 use rave_pipeline::{
     AuditLevel, BatchConfig as GraphBatchConfig, DeterminismObserved, DeterminismPolicy,
     DeterminismSkipReason, EnhanceConfig, GRAPH_SCHEMA_VERSION, PipelineReport,
@@ -155,6 +155,17 @@ struct SharedVideoArgs {
     /// microseconds (default 8000 = 8 ms). Ignored when --max-batch=1.
     #[arg(long = "batch-latency-us")]
     batch_latency_us: Option<u64>,
+
+    /// Tile size in pixels for tiled inference (0 = disabled, default 0).
+    /// Use 256 for transformer models (DAT2, SwinIR, HAT) to reduce
+    /// attention cost from O(n²) to O(tile²) per tile.
+    #[arg(long = "tile-size", default_value_t = 0)]
+    tile_size: u32,
+
+    /// Overlap padding in pixels for tile boundaries (default 32).
+    /// Tiles overlap by this many pixels on each edge to avoid seam artifacts.
+    #[arg(long = "tile-pad", default_value_t = 32)]
+    tile_pad: u32,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1439,6 +1450,10 @@ async fn run_upscale(args: UpscaleArgs) -> Result<()> {
             strict_invariants,
             max_batch: args.shared.max_batch,
             batch_latency_deadline_us: args.shared.batch_latency_us.unwrap_or(8_000),
+            tile_config: TileConfig {
+                tile_size: args.shared.tile_size,
+                tile_pad: args.shared.tile_pad,
+            },
         }
     });
     let progress_mode = resolve_progress_mode(args.progress, args.jsonl);
@@ -1609,6 +1624,10 @@ async fn run_upscale_with_graph(
             strict_invariants,
             max_batch: args.shared.max_batch,
             batch_latency_deadline_us: args.shared.batch_latency_us.unwrap_or(8_000),
+            tile_config: TileConfig {
+                tile_size: args.shared.tile_size,
+                tile_pad: args.shared.tile_pad,
+            },
         }
     });
 
@@ -2311,6 +2330,7 @@ async fn run_validate(args: ValidateArgs) -> Result<()> {
             strict_invariants,
             max_batch: 1,
             batch_latency_deadline_us: 8_000,
+            tile_config: TileConfig::default(),
         }
     });
 
@@ -2592,6 +2612,10 @@ Run with: LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/cuda-12/targets/x86_64-lin
             strict_invariants,
             max_batch: args.shared.max_batch,
             batch_latency_deadline_us: args.shared.batch_latency_us.unwrap_or(8_000),
+            tile_config: TileConfig {
+                tile_size: args.shared.tile_size,
+                tile_pad: args.shared.tile_pad,
+            },
         }
     });
     let metrics = pipeline.metrics();

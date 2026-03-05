@@ -236,6 +236,83 @@ extern "C" __global__ void rgb_planar_f32_to_nv12(
         uv_plane[uv_idx + 1] = (unsigned char)fminf(fmaxf(v_avg * 255.0f + 128.0f + 0.5f, 0.0f), 255.0f);
     }
 }
+
+// ============================================================================
+// Tile crop — extract a tile from RGB Planar F32 (NCHW)
+// ============================================================================
+// Copies a (tile_w × tile_h) region starting at (tile_x, tile_y) from the
+// source image into a dense output buffer.  Source coordinates that fall
+// outside [0, src_w) × [0, src_h) are clamped (reflect/mirror handled by
+// the caller via negative tile_x/tile_y with clamping here).
+extern "C" __global__ void crop_tile_planar_f32(
+    const float* __restrict__ src,
+    float*       __restrict__ dst,
+    int src_w,
+    int src_h,
+    int src_channel_stride,
+    int tile_x,
+    int tile_y,
+    int tile_w,
+    int tile_h)
+{
+    int tx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ty = blockIdx.y * blockDim.y + threadIdx.y;
+    if (tx >= tile_w || ty >= tile_h) return;
+
+    // Source coordinates with clamping for edge tiles
+    int sx = tile_x + tx;
+    int sy = tile_y + ty;
+    sx = max(0, min(sx, src_w - 1));
+    sy = max(0, min(sy, src_h - 1));
+
+    int src_idx = sy * src_w + sx;
+    int dst_idx = ty * tile_w + tx;
+    int dst_ch_stride = tile_w * tile_h;
+
+    // Copy R, G, B planes
+    dst[0 * dst_ch_stride + dst_idx] = src[0 * src_channel_stride + src_idx];
+    dst[1 * dst_ch_stride + dst_idx] = src[1 * src_channel_stride + src_idx];
+    dst[2 * dst_ch_stride + dst_idx] = src[2 * src_channel_stride + src_idx];
+}
+
+// ============================================================================
+// Tile place — write upscaled tile into destination, stripping overlap padding
+// ============================================================================
+// Copies the valid (non-padded) region of an upscaled tile into the output
+// image.  The valid region starts at (pad, pad) in the tile and has size
+// (valid_w × valid_h).  It is placed at (dst_x, dst_y) in the output.
+extern "C" __global__ void place_tile_planar_f32(
+    const float* __restrict__ src,
+    float*       __restrict__ dst,
+    int src_tile_w,
+    int src_tile_h,
+    int dst_w,
+    int dst_h,
+    int dst_x,
+    int dst_y,
+    int pad,
+    int valid_w,
+    int valid_h)
+{
+    int vx = blockIdx.x * blockDim.x + threadIdx.x;
+    int vy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (vx >= valid_w || vy >= valid_h) return;
+
+    int ox = dst_x + vx;
+    int oy = dst_y + vy;
+    if (ox >= dst_w || oy >= dst_h) return;
+
+    int src_ch_stride = src_tile_w * src_tile_h;
+    int dst_ch_stride = dst_w * dst_h;
+
+    // Source: offset by padding
+    int src_idx = (vy + pad) * src_tile_w + (vx + pad);
+    int dst_idx = oy * dst_w + ox;
+
+    dst[0 * dst_ch_stride + dst_idx] = src[0 * src_ch_stride + src_idx];
+    dst[1 * dst_ch_stride + dst_idx] = src[1 * src_ch_stride + src_idx];
+    dst[2 * dst_ch_stride + dst_idx] = src[2 * src_ch_stride + src_idx];
+}
 "#;
 
 const MODULE_NAME: &str = "rave_preprocess";
@@ -247,6 +324,8 @@ const KERNEL_NAMES: &[&str] = &[
     "f32_to_f16",
     "f16_to_f32",
     "rgb_planar_f32_to_nv12",
+    "crop_tile_planar_f32",
+    "place_tile_planar_f32",
 ];
 
 // ─── Compiled kernel handles ─────────────────────────────────────────────────
@@ -262,6 +341,8 @@ pub struct PreprocessKernels {
     f32_to_f16: CudaFunction,
     f16_to_f32: CudaFunction,
     rgb_f32_to_nv12: CudaFunction,
+    crop_tile_f32: CudaFunction,
+    place_tile_f32: CudaFunction,
 }
 
 impl PreprocessKernels {
@@ -328,6 +409,8 @@ impl PreprocessKernels {
             f32_to_f16: get_fn("f32_to_f16")?,
             f16_to_f32: get_fn("f16_to_f32")?,
             rgb_f32_to_nv12: get_fn("rgb_planar_f32_to_nv12")?,
+            crop_tile_f32: get_fn("crop_tile_planar_f32")?,
+            place_tile_f32: get_fn("place_tile_planar_f32")?,
         };
 
         info!(
@@ -622,6 +705,137 @@ impl PreprocessKernels {
             pitch: nv12_pitch,
             format: PixelFormat::Nv12,
         })
+    }
+
+    // ── Tile crop ────────────────────────────────────────────────────────
+
+    /// Crop a tile from an `RgbPlanarF32` texture.
+    ///
+    /// Extracts a `(tile_w × tile_h)` region starting at `(tile_x, tile_y)`.
+    /// Source coordinates outside the image are clamped (edge-repeat), which
+    /// provides seamless boundary handling for overlap padding.
+    ///
+    /// The tile coordinates may be negative (for padding at the top-left edge);
+    /// the kernel clamps them to valid source bounds.
+    pub fn crop_tile(
+        &self,
+        input: &GpuTexture,
+        tile_x: i32,
+        tile_y: i32,
+        tile_w: u32,
+        tile_h: u32,
+        ctx: &GpuContext,
+        stream: &CudaStream,
+    ) -> Result<GpuTexture> {
+        if input.format != PixelFormat::RgbPlanarF32 {
+            return Err(EngineError::FormatMismatch {
+                expected: PixelFormat::RgbPlanarF32,
+                actual: input.format,
+            });
+        }
+
+        let out_elems = 3 * (tile_w as usize) * (tile_h as usize);
+        let out_bytes = out_elems * std::mem::size_of::<f32>();
+        // Use the pool — GpuContext::alloc() syncs after fresh alloc_zeros,
+        // and cached buffers skip the sync entirely (fast path).
+        let output_buf = ctx.alloc(out_bytes)?;
+
+        let src_w = input.width as i32;
+        let src_h = input.height as i32;
+        let src_channel_stride = (input.width as usize) * (input.height as usize);
+
+        let (config, _) = launch_config_2d(tile_w, tile_h);
+
+        // SAFETY:
+        // - `input.data` has capacity for 3 × src_w × src_h × f32.
+        // - `output_buf` has capacity for 3 × tile_w × tile_h × f32.
+        // - Kernel clamps source reads to valid bounds.
+        unsafe {
+            self.crop_tile_f32.clone().launch_on_stream(
+                stream,
+                config,
+                (
+                    input.device_ptr(),
+                    *output_buf.device_ptr(),
+                    src_w,
+                    src_h,
+                    src_channel_stride as i32,
+                    tile_x,
+                    tile_y,
+                    tile_w as i32,
+                    tile_h as i32,
+                ),
+            )?;
+        }
+
+        Ok(GpuTexture {
+            data: Arc::new(output_buf),
+            width: tile_w,
+            height: tile_h,
+            pitch: (tile_w as usize) * std::mem::size_of::<f32>(),
+            format: PixelFormat::RgbPlanarF32,
+        })
+    }
+
+    // ── Tile place ───────────────────────────────────────────────────────
+
+    /// Place an upscaled tile into a destination `RgbPlanarF32` texture.
+    ///
+    /// Strips `pad` pixels from each edge of the source tile, then writes
+    /// the valid `(valid_w × valid_h)` region at `(dst_x, dst_y)` in the
+    /// destination.
+    ///
+    /// The destination buffer must already be allocated at the correct size.
+    /// This method writes directly into the destination — concurrent tile
+    /// placements must not overlap in the destination.
+    pub fn place_tile(
+        &self,
+        tile_output: &GpuTexture,
+        dst_ptr: u64,
+        dst_w: u32,
+        dst_h: u32,
+        dst_x: u32,
+        dst_y: u32,
+        pad: u32,
+        valid_w: u32,
+        valid_h: u32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if tile_output.format != PixelFormat::RgbPlanarF32 {
+            return Err(EngineError::FormatMismatch {
+                expected: PixelFormat::RgbPlanarF32,
+                actual: tile_output.format,
+            });
+        }
+
+        let (config, _) = launch_config_2d(valid_w, valid_h);
+
+        // SAFETY:
+        // - `tile_output.data` has capacity for tile_w × tile_h × 3 × f32.
+        // - `dst_ptr` points to a buffer with capacity dst_w × dst_h × 3 × f32.
+        // - Valid region (dst_x..dst_x+valid_w, dst_y..dst_y+valid_h) fits
+        //   within the destination (kernel checks bounds).
+        unsafe {
+            self.place_tile_f32.clone().launch_on_stream(
+                stream,
+                config,
+                (
+                    tile_output.device_ptr(),
+                    dst_ptr,
+                    tile_output.width as i32,
+                    tile_output.height as i32,
+                    dst_w as i32,
+                    dst_h as i32,
+                    dst_x as i32,
+                    dst_y as i32,
+                    pad as i32,
+                    valid_w as i32,
+                    valid_h as i32,
+                ),
+            )?;
+        }
+
+        Ok(())
     }
 }
 

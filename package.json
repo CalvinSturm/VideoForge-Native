@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "tauri dev",
-    "build": "tauri build",
+    "dev": "npx --prefix ui tauri dev",
+    "build": "npx --prefix ui tauri build",
     "ui-install": "npm install --prefix ui",
-    "tauri": "tauri"
+    "tauri": "npx --prefix ui tauri"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.1.0"

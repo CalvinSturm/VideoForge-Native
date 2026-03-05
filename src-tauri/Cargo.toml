@@ -25,7 +25,7 @@ tauri-build = { version = "2.0.0", features = [] }
 #
 # Requires CUDA toolkit, TensorRT, and ONNX Runtime with TensorRT EP.
 # ort pinned to =2.0.0-rc.11 (latest rc on crates.io as of 2026-02).
-default = ["native_engine"]
+default = []
 native_engine = ["dep:videoforge-engine"]
 
 [dependencies]

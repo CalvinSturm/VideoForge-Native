@@ -98,7 +98,7 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
                     if (showTechSpecs) {
                         try {
                             const benchmark = await invoke<RaveCommandJson>("rave_benchmark", {
-                                args: rave.buildRaveBenchmarkArgs({ input: video.inputPath, modelPath: info.path, maxBatch: upscaleConfig.maxBatch }),
+                                args: rave.buildRaveBenchmarkArgs({ input: video.inputPath, modelPath: info.path, maxBatch: upscaleConfig.maxBatch, architectureClass: upscaleConfig.architectureClass }),
                                 strictAudit: true, mockRun: false, uiOptIn: true
                             });
                             setLogs(prev => [...prev, `[RAVE] benchmark dry-run fps=${String((benchmark as any).fps ?? "n/a")} policy=${JSON.stringify(benchmark.policy ?? {})}`]);
@@ -108,7 +108,7 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
                     }
 
                     const raveResult = await invoke<RaveCommandJson>("rave_upscale", {
-                        args: rave.buildRaveUpscaleArgs({ input: video.inputPath, output: resolvedOutputPath, modelPath: info.path, maxBatch: upscaleConfig.maxBatch }),
+                        args: rave.buildRaveUpscaleArgs({ input: video.inputPath, output: resolvedOutputPath, modelPath: info.path, maxBatch: upscaleConfig.maxBatch, architectureClass: upscaleConfig.architectureClass }),
                         strictAudit: true, mockRun: false, uiOptIn: true
                     });
                     if (!raveResult.output || typeof raveResult.output !== "string") throw new Error("rave_upscale did not return a valid output path");

@@ -810,6 +810,10 @@ async fn check_e2e_native(
 
     // B) Run pipeline
     println!("  Running native pipeline (this may take time)...");
+    // Native engine is runtime-gated; smoke native E2E opts in explicitly.
+    unsafe {
+        std::env::set_var("VIDEOFORGE_ENABLE_NATIVE_ENGINE", "1");
+    }
     let result = upscale_request_native(
         input_path.to_string(),
         out,

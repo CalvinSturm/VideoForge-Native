@@ -440,6 +440,7 @@ const App: React.FC = () => {
     input: string;
     output: string;
     modelPath: string;
+    architectureClass?: string;
   }): string[] => {
     const args = [
       "-i", params.input,
@@ -448,20 +449,29 @@ const App: React.FC = () => {
       "--precision", "fp16",
       "--progress", "jsonl"
     ];
+    // Auto-inject tiling for transformer models (DAT2, SwinIR, HAT)
+    if (params.architectureClass === "Transformer") {
+      args.push("--tile-size", "256");
+    }
     return args;
   };
 
   const buildRaveBenchmarkArgs = (params: {
     input: string;
     modelPath: string;
+    architectureClass?: string;
   }): string[] => {
-    return [
+    const args = [
       "-i", params.input,
       "-m", params.modelPath,
       "--skip-encode",
       "--dry-run",
       "--progress", "jsonl"
     ];
+    if (params.architectureClass === "Transformer") {
+      args.push("--tile-size", "256");
+    }
+    return args;
   };
 
   const startUpscale = async () => {
@@ -518,7 +528,8 @@ const App: React.FC = () => {
               const benchmark = await invoke<RaveCommandJson>("rave_benchmark", {
                 args: buildRaveBenchmarkArgs({
                   input: inputPath,
-                  modelPath: info.path
+                  modelPath: info.path,
+                  architectureClass: upscaleConfig.architectureClass
                 }),
                 strictAudit: true,
                 mockRun: false,
@@ -537,7 +548,8 @@ const App: React.FC = () => {
             args: buildRaveUpscaleArgs({
               input: inputPath,
               output: resolvedOutputPath,
-              modelPath: info.path
+              modelPath: info.path,
+              architectureClass: upscaleConfig.architectureClass
             }),
             strictAudit: true,
             mockRun: false,
