@@ -36,9 +36,7 @@ pub struct InferencePipeline {
     preprocess: PreprocessPipeline,
     backend: Arc<TensorRtBackend>,
     ctx: Arc<GpuContext>,
-    /// NV12 output pitch (row stride for encoder).
-    /// Set from the decode stage's pitch on first frame.
-    nv12_output_pitch: Option<usize>,
+
     /// Latency metrics for the NV12 → tensor preprocess stage.
     pub metrics_preprocess: StageMetrics,
     /// Latency metrics for the TensorRT inference stage.
@@ -64,7 +62,7 @@ impl InferencePipeline {
             preprocess,
             backend,
             ctx,
-            nv12_output_pitch: None,
+
             metrics_preprocess: StageMetrics::default(),
             metrics_inference: StageMetrics::default(),
             metrics_postprocess: StageMetrics::default(),
@@ -98,10 +96,7 @@ impl InferencePipeline {
             });
         }
 
-        // Remember NV12 pitch for the postprocess stage.
-        if self.nv12_output_pitch.is_none() {
-            self.nv12_output_pitch = Some(input.pitch);
-        }
+
 
         // ── Stage 1: Preprocess (NV12 → model tensor) ──
         let model_input = self.preprocess.prepare(input, &self.ctx, stream)?;
@@ -125,9 +120,9 @@ impl InferencePipeline {
         );
 
         // ── Stage 3: Postprocess (RGB → NV12) ──
-        let nv12_pitch = self.nv12_output_pitch.unwrap_or(
-            (inference_output.width as usize + 255) & !255, // 256-byte aligned
-        );
+        // Pitch must match the upscaled output width, NOT the decoded input width.
+        // 256-byte alignment for NVENC compatibility.
+        let nv12_pitch = (inference_output.width as usize + 255) & !255;
 
         let nv12_output =
             self.preprocess
