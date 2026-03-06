@@ -105,6 +105,8 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
             let encoderDetail: string | null | undefined;
             let framesProcessed: number | undefined;
             let audioPreserved: boolean | undefined;
+            let trtCacheEnabled: boolean | undefined;
+            let trtCacheDir: string | null | undefined;
             const canUseNative = upscaleConfig.useNativeEngine && video.mode === 'video';
 
             if (canUseNative) {
@@ -142,9 +144,13 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
                     encoderDetail = nativeResult.encoder_detail ?? null;
                     framesProcessed = nativeResult.frames_processed;
                     audioPreserved = nativeResult.audio_preserved;
+                    trtCacheEnabled = nativeResult.trt_cache_enabled;
+                    trtCacheDir = nativeResult.trt_cache_dir ?? null;
                     setLogs(prev => [
                         ...prev,
                         `[NATIVE] engine=${nativeResult.engine} encoder_mode=${nativeResult.encoder_mode} frames=${nativeResult.frames_processed}`
+                            + ` trt_cache=${String(nativeResult.trt_cache_enabled)}`
+                            + (nativeResult.trt_cache_dir ? ` cache_dir=${nativeResult.trt_cache_dir}` : "")
                             + (nativeResult.encoder_detail ? ` detail=${nativeResult.encoder_detail}` : "")
                     ]);
                 } else {
@@ -165,7 +171,9 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
                 ...(encoderMode ? { encoderMode } : {}),
                 ...(encoderDetail !== undefined ? { encoderDetail } : {}),
                 ...(typeof framesProcessed === "number" ? { framesProcessed } : {}),
-                ...(typeof audioPreserved === "boolean" ? { audioPreserved } : {})
+                ...(typeof audioPreserved === "boolean" ? { audioPreserved } : {}),
+                ...(typeof trtCacheEnabled === "boolean" ? { trtCacheEnabled } : {}),
+                ...(trtCacheDir !== undefined ? { trtCacheDir } : {})
             };
             setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
             setActiveJob(finishedJob);

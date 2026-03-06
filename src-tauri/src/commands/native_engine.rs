@@ -333,6 +333,8 @@ pub struct NativeUpscaleResult {
     pub encoder_detail: Option<String>,
     pub frames_processed: u64,
     pub audio_preserved: bool,
+    pub trt_cache_enabled: bool,
+    pub trt_cache_dir: Option<String>,
 }
 
 /// Structured error returned by `upscale_request_native`.
@@ -371,6 +373,26 @@ fn native_engine_direct_enabled() -> bool {
         ),
         Err(_) => false,
     }
+}
+
+#[cfg(feature = "native_engine")]
+fn trt_cache_runtime(model_path: &str) -> (bool, Option<String>) {
+    let enabled = std::env::var("VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True"))
+        .unwrap_or(false);
+    if !enabled {
+        return (false, None);
+    }
+
+    let cache_root = std::env::var_os("VIDEOFORGE_TRT_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("videoforge").join("trt_cache"));
+    let model_tag = Path::new(model_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    let cache_dir = cache_root.join(model_tag);
+    (true, Some(cache_dir.to_string_lossy().to_string()))
 }
 
 #[cfg(feature = "native_engine")]
@@ -432,6 +454,7 @@ async fn run_native_via_rave_cli(
         output_path
     };
 
+    let (trt_cache_enabled, trt_cache_dir) = trt_cache_runtime(&model_path);
     let mut args = vec![
         "-i".to_string(),
         input_path,
@@ -469,6 +492,8 @@ async fn run_native_via_rave_cli(
         encoder_detail,
         frames_processed: 0,
         audio_preserved: true,
+        trt_cache_enabled,
+        trt_cache_dir,
     })
 }
 
@@ -818,6 +843,7 @@ async fn run_engine_pipeline(
 
     let make_err =
         |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
+    let (trt_cache_enabled, trt_cache_dir) = trt_cache_runtime(&model_path);
 
     // ── Step 1.5: Probe input for dimensions ──────────────────────────────────
     // encoder_nv12_pitch and encoder width/height must be set before
@@ -1054,6 +1080,8 @@ async fn run_engine_pipeline(
         encoder_detail,
         frames_processed: frames,
         audio_preserved: preserve_audio,
+        trt_cache_enabled,
+        trt_cache_dir,
     })
 }
 

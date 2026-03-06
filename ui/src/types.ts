@@ -25,6 +25,8 @@ export interface NativeUpscaleResultJson {
   encoder_detail?: string | null;
   frames_processed: number;
   audio_preserved: boolean;
+  trt_cache_enabled: boolean;
+  trt_cache_dir?: string | null;
 }
 
 export interface ColorSettings {
@@ -69,6 +71,8 @@ export interface Job {
   encoderDetail?: string | null;
   framesProcessed?: number;
   audioPreserved?: boolean;
+  trtCacheEnabled?: boolean;
+  trtCacheDir?: string | null;
 }
 
 export interface Toast {

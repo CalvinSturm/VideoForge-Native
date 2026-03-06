@@ -598,6 +598,14 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
                                 <div style={{ color: 'var(--text-primary)' }}>{job.audioPreserved ? 'Preserved' : 'Dropped'}</div>
                               </div>
                             )}
+                            {typeof job.trtCacheEnabled === 'boolean' && (
+                              <div>
+                                <div style={{ fontSize: '8px', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                                  TRT Cache
+                                </div>
+                                <div style={{ color: 'var(--text-primary)' }}>{job.trtCacheEnabled ? 'Enabled' : 'Disabled'}</div>
+                              </div>
+                            )}
                           </div>
                           {encoderState && (
                             <div style={{
@@ -616,6 +624,16 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
                               color: 'var(--text-secondary)'
                             }}>
                               detail: {job.encoderDetail}
+                            </div>
+                          )}
+                          {job.trtCacheDir && (
+                            <div style={{
+                              marginTop: '6px',
+                              color: 'var(--text-secondary)',
+                              lineHeight: 1.4,
+                              wordBreak: 'break-all'
+                            }}>
+                              cache_dir: {job.trtCacheDir}
                             </div>
                           )}
                         </div>
