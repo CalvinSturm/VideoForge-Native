@@ -1492,12 +1492,7 @@ impl videoforge_engine::engine::pipeline::FrameEncoder for SoftwareBitstreamEnco
         }
 
         self.ctx.sync_all()?;
-        let storage = frame.texture.data.owned_storage().ok_or_else(|| {
-            videoforge_engine::error::EngineError::Encode(
-                "Software fallback encoder requires an owned NV12 allocation".into(),
-            )
-        })?;
-        let host = self.ctx.device().dtoh_sync_copy(&**storage).map_err(|e| {
+        let host = frame.texture.data.copy_to_host_sync(&self.ctx).map_err(|e| {
             videoforge_engine::error::EngineError::Encode(format!(
                 "Software fallback DtoH readback failed: {e}"
             ))

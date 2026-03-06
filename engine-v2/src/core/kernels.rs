@@ -640,10 +640,10 @@ impl PreprocessKernels {
         let channel_stride = w * h;
         let out_bytes = PixelFormat::Nv12.byte_size(input.width, input.height, nv12_pitch);
 
-        let output_buf = ctx.alloc(out_bytes)?;
+        let output_buf = ctx.alloc_raw(out_bytes)?;
 
         let in_ptr = input.device_ptr();
-        let y_ptr = *output_buf.device_ptr() as u64;
+        let y_ptr = output_buf.device_ptr();
         let uv_ptr = y_ptr + (nv12_pitch * h) as u64;
 
         let (config, _) = launch_config_2d(input.width, input.height);
@@ -671,7 +671,7 @@ impl PreprocessKernels {
         }
 
         Ok(GpuTexture {
-            data: GpuBuffer::from_owned(output_buf),
+            data: GpuBuffer::from_raw(output_buf),
             width: input.width,
             height: input.height,
             pitch: nv12_pitch,
@@ -699,10 +699,10 @@ impl PreprocessKernels {
         let channel_stride = w * h;
         let out_bytes = PixelFormat::Nv12.byte_size(input.width, input.height, nv12_pitch);
 
-        let output_buf = ctx.alloc(out_bytes)?;
+        let output_buf = ctx.alloc_raw(out_bytes)?;
 
         let in_ptr = input.device_ptr();
-        let y_ptr = *output_buf.device_ptr() as u64;
+        let y_ptr = output_buf.device_ptr();
         let uv_ptr = y_ptr + (nv12_pitch * h) as u64;
 
         let (config, _) = launch_config_2d(input.width, input.height);
@@ -725,7 +725,7 @@ impl PreprocessKernels {
         }
 
         Ok(GpuTexture {
-            data: GpuBuffer::from_owned(output_buf),
+            data: GpuBuffer::from_raw(output_buf),
             width: input.width,
             height: input.height,
             pitch: nv12_pitch,

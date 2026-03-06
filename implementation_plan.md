@@ -236,6 +236,9 @@
   - the mux sink now accepts an explicit shared codec hint, seeded from input probing and updated from the actual NVENC encoder selection, so mux startup no longer depends primarily on packet sniffing
   - the mux sink starts lazily on the first encoded packet and supplies an explicit FFmpeg stdin format instead of relying entirely on auto-probing
   - when packet sniffing cannot classify a bitstream packet, the sink logs a warning and currently falls back to `hevc`, which matches the current native runtime capability path on this machine
+  - postprocess NV12 outputs now use a dedicated raw CUDA allocation path instead of pooled `CudaSlice` buffers
+  - `GpuBuffer` now supports synchronous host readback from raw CUDA allocations so the software fallback path still works if a raw-backed NV12 frame crosses that boundary
+  - the direct NVENC path now registers postprocess NV12 surfaces successfully on this runtime, eliminating the `nvenc_legacy_staging` fallback
 - Verification:
   - `cargo check --manifest-path src-tauri/Cargo.toml --features native_engine`
   - `cargo run --manifest-path src-tauri/Cargo.toml --features native_engine --bin videoforge_bench -- --native --input input.mp4 --output output_phase3_streammux_fmt2.mp4 --onnx-model weights/2x_SPAN_soft.onnx --scale 2 --precision fp16 --max-batch 4 --native-direct`
@@ -248,9 +251,15 @@
   - `cargo run --manifest-path src-tauri/Cargo.toml --features native_engine --bin videoforge_bench -- --native --input input.mp4 --output output_phase3_hardened.mp4 --onnx-model weights/2x_SPAN_soft.onnx --scale 2 --precision fp16 --max-batch 4 --native-direct`
   - the hardened streamed path reported `Pipeline finished decoded=61 preprocessed=61 inferred=61 encoded=61`
   - `ffprobe` on `output_phase3_hardened.mp4` reported a valid HEVC MP4 with `nb_frames=61`, `duration=2.033313`, and `has_b_frames=0`
+  - `cargo check --manifest-path engine-v2/Cargo.toml`
+  - `cargo run --manifest-path src-tauri/Cargo.toml --features native_engine --bin videoforge_bench -- --native --input input.mp4 --output output_phase3_nvenc_direct.mp4 --onnx-model weights/2x_SPAN_soft.onnx --scale 2 --precision fp16 --max-batch 4 --native-direct`
+  - `ffprobe -hide_banner -show_streams -show_format output_phase3_nvenc_direct.mp4`
+  - the direct-registration run reported `Pipeline finished decoded=61 preprocessed=61 inferred=61 encoded=61`
+  - the final benchmark event reported `encoder_mode=\"nvenc\"`, `frames_processed=61`, and `elapsed_ms=90466`
+  - `ffprobe` on `output_phase3_nvenc_direct.mp4` reported a valid HEVC MP4 with `nb_frames=61`, `duration=2.033313`, and `has_b_frames=0`
 - Follow-up:
   - both major temp-file boundaries have now been removed from the direct native path, but the preferred long-term contract still needs to be formalized: streamed FFmpeg demux/mux around `engine-v2` vs a tighter native-only container/output path
-  - the main remaining performance/workflow issue is still `nvenc_legacy_staging`; direct CUDA resource registration is failing on this runtime and is the next concrete optimization target
+  - direct NVENC registration now works on this runtime, so the main remaining native-engine unknowns are profiler/overlap fidelity and whether further host-boundary simplification is worth the risk
   - the current mux-format fallback is intentionally conservative; if the runtime later selects H.264 more often, the sink should receive codec information directly from the encoder instead of inferring it from packets
   - benchmark/probe steps should not be run in parallel when validating streamed output files, because probing can race the still-running benchmark process and report a false missing-file result
 

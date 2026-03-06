@@ -46,6 +46,7 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, DeviceSlice};
 use tracing::{debug, info, warn};
 
+use crate::codecs::sys::{check_cu, cuMemAlloc_v2, cuMemFree_v2, CUdeviceptr};
 use crate::error::Result;
 
 /// Hardware-preferred alignment for tensor buffers (512 B — matches
@@ -115,7 +116,7 @@ pub struct GpuContext {
     pub pool_stats: PoolStats,
 
     /// Device memory accounting (lock-free reads).
-    vram: VramAccounting,
+    vram: Arc<VramAccounting>,
 
     /// Allocation policy (warm-up vs steady state).
     pub alloc_policy: AllocPolicy,
@@ -157,7 +158,7 @@ impl GpuContext {
             inference_stream,
             buffer_pool: Mutex::new(BucketedPool::new()),
             pool_stats: PoolStats::new(),
-            vram: VramAccounting::new(),
+            vram: Arc::new(VramAccounting::new()),
             alloc_policy: AllocPolicy::new(),
             profiler: PerfProfiler::new(),
             queue_depth: QueueDepthTracker::new(),
@@ -258,6 +259,47 @@ impl GpuContext {
         }
 
         Ok(buf)
+    }
+
+    /// Allocate a dedicated raw CUDA device buffer for NVENC-sensitive surfaces.
+    ///
+    /// Unlike [`GpuContext::alloc`], this bypasses the pooled `CudaSlice` path and
+    /// uses `cuMemAlloc_v2` directly. The intended use is narrow: encoder-facing
+    /// NV12 surfaces that need NVENC-compatible pointer provenance.
+    pub fn alloc_raw(&self, size: usize) -> Result<RawGpuAllocation> {
+        self.device.bind_to_thread()?;
+
+        let mut ptr: CUdeviceptr = 0;
+        unsafe {
+            check_cu(
+                cuMemAlloc_v2(&mut ptr as *mut CUdeviceptr, size),
+                "cuMemAlloc_v2 (raw gpu alloc)",
+            )?;
+        }
+        self.vram.on_alloc(size);
+
+        if self.alloc_policy.is_steady_state() {
+            warn!(size, "Raw CUDA allocation in steady state");
+        }
+
+        let limit = self.vram_limit.load(Ordering::Relaxed);
+        if limit > 0 {
+            let (current, _) = self.vram.snapshot();
+            if current > limit {
+                warn!(
+                    current_mb = current / (1024 * 1024),
+                    limit_mb = limit / (1024 * 1024),
+                    "VRAM usage exceeds configured limit"
+                );
+            }
+        }
+
+        Ok(RawGpuAllocation {
+            ptr,
+            len: size,
+            device: Arc::clone(&self.device),
+            vram: Arc::clone(&self.vram),
+        })
     }
 
     /// Return a buffer to the pool for future reuse.
@@ -841,6 +883,56 @@ impl StreamOverlapTimer {
 
     pub fn reset(&self) {
         self.samples.lock().unwrap().clear();
+    }
+}
+
+/// Raw CUDA driver allocation used where downstream APIs reject pooled `CudaSlice` memory.
+pub struct RawGpuAllocation {
+    ptr: CUdeviceptr,
+    len: usize,
+    device: Arc<CudaDevice>,
+    vram: Arc<VramAccounting>,
+}
+
+impl RawGpuAllocation {
+    #[inline]
+    pub fn device_ptr(&self) -> u64 {
+        self.ptr as u64
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl std::fmt::Debug for RawGpuAllocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawGpuAllocation")
+            .field("ptr", &format_args!("{:#x}", self.ptr))
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl Drop for RawGpuAllocation {
+    fn drop(&mut self) {
+        if self.ptr == 0 {
+            return;
+        }
+
+        if let Err(err) = self.device.bind_to_thread() {
+            warn!(?err, "bind_to_thread failed before raw CUDA free");
+            return;
+        }
+
+        let rc = unsafe { cuMemFree_v2(self.ptr) };
+        if rc == crate::codecs::sys::CUDA_SUCCESS {
+            self.vram.on_free(self.len);
+            self.ptr = 0;
+        } else {
+            warn!(rc, "cuMemFree_v2 failed for raw CUDA allocation");
+        }
     }
 }
 

@@ -24,15 +24,20 @@
 //!    the `GpuTexture` is dropped.  This is guaranteed structurally because
 //!    `CudaSlice` holds an `Arc<CudaDevice>`.
 
-use cudarc::driver::{CudaSlice, DevicePtr, DeviceSlice};
+use std::ffi::c_void;
 use std::sync::Arc;
 
-use crate::core::context::GpuContext;
+use cudarc::driver::{CudaSlice, DevicePtr, DeviceSlice};
+
+use crate::codecs::sys::{check_cu, cuMemcpyDtoH_v2, CUdeviceptr};
+use crate::core::context::{GpuContext, RawGpuAllocation};
+use crate::error::Result;
 
 /// GPU-resident allocation or a view into one.
 #[derive(Clone, Debug)]
 pub enum GpuBuffer {
     Owned(Arc<CudaSlice<u8>>),
+    Raw(Arc<RawGpuAllocation>),
     View {
         storage: Arc<CudaSlice<u8>>,
         offset: usize,
@@ -47,6 +52,10 @@ impl GpuBuffer {
 
     pub fn from_arc(storage: Arc<CudaSlice<u8>>) -> Self {
         Self::Owned(storage)
+    }
+
+    pub fn from_raw(raw: RawGpuAllocation) -> Self {
+        Self::Raw(Arc::new(raw))
     }
 
     pub fn view(storage: Arc<CudaSlice<u8>>, offset: usize, len: usize) -> Self {
@@ -65,6 +74,7 @@ impl GpuBuffer {
     pub fn device_ptr(&self) -> u64 {
         match self {
             Self::Owned(storage) => *storage.device_ptr() as u64,
+            Self::Raw(storage) => storage.device_ptr(),
             Self::View {
                 storage, offset, ..
             } => (*storage.device_ptr() as u64) + *offset as u64,
@@ -75,6 +85,7 @@ impl GpuBuffer {
     pub fn len(&self) -> usize {
         match self {
             Self::Owned(storage) => storage.len(),
+            Self::Raw(storage) => storage.len(),
             Self::View { len, .. } => *len,
         }
     }
@@ -83,8 +94,28 @@ impl GpuBuffer {
     pub fn owned_storage(&self) -> Option<&Arc<CudaSlice<u8>>> {
         match self {
             Self::Owned(storage) => Some(storage),
-            Self::View { .. } => None,
+            Self::Raw(_) | Self::View { .. } => None,
         }
+    }
+
+    pub fn copy_to_host_sync(&self, ctx: &GpuContext) -> Result<Vec<u8>> {
+        let mut host = vec![0u8; self.len()];
+        if host.is_empty() {
+            return Ok(host);
+        }
+
+        ctx.device().bind_to_thread()?;
+        unsafe {
+            check_cu(
+                cuMemcpyDtoH_v2(
+                    host.as_mut_ptr() as *mut c_void,
+                    self.device_ptr() as CUdeviceptr,
+                    host.len(),
+                ),
+                "cuMemcpyDtoH_v2 (GpuBuffer::copy_to_host_sync)",
+            )?;
+        }
+        Ok(host)
     }
 
     pub fn try_recycle(self, ctx: &GpuContext) {
@@ -94,6 +125,7 @@ impl GpuBuffer {
                     ctx.recycle(slice);
                 }
             }
+            Self::Raw(_) => {}
             Self::View { .. } => {}
         }
     }
