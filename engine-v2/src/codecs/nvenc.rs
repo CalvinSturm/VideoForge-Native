@@ -169,6 +169,8 @@ pub struct NvEncoder {
     nvenc_api_version: u32,
     /// Legacy (cuMemAlloc) staging NV12 surface for NVENC compatibility fallback.
     legacy_staging_ptr: CUdeviceptr,
+    /// Allocated legacy staging height in pixels.
+    legacy_staging_height: u32,
     /// Whether to force legacy staging for all frames.
     use_legacy_staging: bool,
     /// Frame counter for encode ordering.
@@ -728,18 +730,31 @@ impl NvEncoder {
             cuda_context: target_cuda_ctx,
             nvenc_api_version: api_version,
             legacy_staging_ptr: 0,
+            legacy_staging_height: 0,
             use_legacy_staging: false,
             frame_idx: 0,
         })
     }
 
-    fn ensure_legacy_staging(&mut self) -> Result<u64> {
-        if self.legacy_staging_ptr != 0 {
+    fn ensure_legacy_staging(&mut self, width: u32, height: u32) -> Result<u64> {
+        let alloc_height = self.config.height.max(height);
+        if self.legacy_staging_ptr != 0 && self.legacy_staging_height >= alloc_height {
             return Ok(self.legacy_staging_ptr as u64);
         }
+
+        if self.legacy_staging_ptr != 0 {
+            unsafe {
+                check_cu_encode(
+                    cuMemFree_v2(self.legacy_staging_ptr),
+                    "cuMemFree_v2 (nvenc legacy staging)",
+                )?;
+            }
+            self.legacy_staging_ptr = 0;
+            self.legacy_staging_height = 0;
+        }
         let bytes = PixelFormat::Nv12.byte_size(
-            self.config.width,
-            self.config.height,
+            self.config.width.max(width),
+            alloc_height,
             self.config.nv12_pitch as usize,
         );
         let mut ptr: CUdeviceptr = 0;
@@ -750,12 +765,13 @@ impl NvEncoder {
             )?;
         }
         self.legacy_staging_ptr = ptr;
+        self.legacy_staging_height = alloc_height;
         info!(
             ptr = %format_args!("{:#x}", ptr),
             bytes,
             pitch = self.config.nv12_pitch,
-            width = self.config.width,
-            height = self.config.height,
+            width = self.config.width.max(width),
+            height = alloc_height,
             "NVENC legacy staging allocated"
         );
         Ok(ptr as u64)
@@ -768,7 +784,7 @@ impl NvEncoder {
         width: u32,
         height: u32,
     ) -> Result<u64> {
-        let dst_dev_ptr = self.ensure_legacy_staging()?;
+        let dst_dev_ptr = self.ensure_legacy_staging(width, height)?;
         let dst_pitch = self.config.nv12_pitch;
         let y_bytes = width as usize;
         let uv_height = height.div_ceil(2) as usize;
@@ -794,19 +810,21 @@ impl NvEncoder {
             Height: y_height,
         };
 
+        let uv_src_offset = (src_dev_ptr + (src_pitch as u64 * height as u64)) as CUdeviceptr;
+        let uv_dst_offset = (dst_dev_ptr + (dst_pitch as u64 * height as u64)) as CUdeviceptr;
         let uv_copy = CUDA_MEMCPY2D {
             srcXInBytes: 0,
-            srcY: height as usize,
+            srcY: 0,
             srcMemoryType: CUmemorytype::Device,
             srcHost: std::ptr::null(),
-            srcDevice: src_dev_ptr as CUdeviceptr,
+            srcDevice: uv_src_offset,
             srcArray: std::ptr::null_mut(),
             srcPitch: src_pitch as usize,
             dstXInBytes: 0,
-            dstY: height as usize,
+            dstY: 0,
             dstMemoryType: CUmemorytype::Device,
             dstHost: std::ptr::null_mut(),
-            dstDevice: dst_dev_ptr as CUdeviceptr,
+            dstDevice: uv_dst_offset,
             dstArray: std::ptr::null_mut(),
             dstPitch: dst_pitch as usize,
             WidthInBytes: uv_row_bytes,
