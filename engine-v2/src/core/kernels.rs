@@ -24,8 +24,8 @@
 //!   └── nv12_to_rgb_planar_f16  → RgbPlanarF16  (fused, skip F32)
 //!
 //! Inference output (RgbPlanarF32 or RgbPlanarF16)
-//!   ├── f16_to_f32              → RgbPlanarF32  (if model outputs F16)
-//!   └── rgb_planar_f32_to_nv12  → NV12          → Encode
+//!   ├── rgb_planar_f32_to_nv12  → NV12          → Encode
+//!   └── rgb_planar_f16_to_nv12  → NV12          → Encode
 //! ```
 //!
 //! # Batch dimension
@@ -235,6 +235,76 @@ extern "C" __global__ void rgb_planar_f32_to_nv12(
         uv_plane[uv_idx + 1] = (unsigned char)fminf(fmaxf(v_avg * 255.0f + 128.0f + 0.5f, 0.0f), 255.0f);
     }
 }
+
+// ============================================================================
+// RGB Planar Float16 (NCHW, [0,1]) → NV12
+// ============================================================================
+extern "C" __global__ void rgb_planar_f16_to_nv12(
+    const __half*        __restrict__ input,
+    unsigned char*       __restrict__ y_plane,
+    unsigned char*       __restrict__ uv_plane,
+    int width,
+    int height,
+    int y_pitch,
+    int uv_pitch,
+    int channel_stride)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    int idx = y * width + x;
+    float r = __half2float(input[0 * channel_stride + idx]);
+    float g = __half2float(input[1 * channel_stride + idx]);
+    float b = __half2float(input[2 * channel_stride + idx]);
+
+    float Y_val = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+    float U_val = -0.1146f * r - 0.3854f * g + 0.5f    * b;
+    float V_val = 0.5f    * r - 0.4542f * g - 0.0458f * b;
+
+    y_plane[y * y_pitch + x] = (unsigned char)fminf(fmaxf(Y_val * 255.0f + 0.5f, 0.0f), 255.0f);
+
+    if ((x & 1) == 0 && (y & 1) == 0) {
+        float u_sum = U_val;
+        float v_sum = V_val;
+        int count = 1;
+
+        if (x + 1 < width) {
+            int idx2 = y * width + (x + 1);
+            float r2 = __half2float(input[0 * channel_stride + idx2]);
+            float g2 = __half2float(input[1 * channel_stride + idx2]);
+            float b2 = __half2float(input[2 * channel_stride + idx2]);
+            u_sum += -0.1146f * r2 - 0.3854f * g2 + 0.5f * b2;
+            v_sum += 0.5f * r2 - 0.4542f * g2 - 0.0458f * b2;
+            count++;
+        }
+        if (y + 1 < height) {
+            int idx3 = (y + 1) * width + x;
+            float r3 = __half2float(input[0 * channel_stride + idx3]);
+            float g3 = __half2float(input[1 * channel_stride + idx3]);
+            float b3 = __half2float(input[2 * channel_stride + idx3]);
+            u_sum += -0.1146f * r3 - 0.3854f * g3 + 0.5f * b3;
+            v_sum += 0.5f * r3 - 0.4542f * g3 - 0.0458f * b3;
+            count++;
+        }
+        if (x + 1 < width && y + 1 < height) {
+            int idx4 = (y + 1) * width + (x + 1);
+            float r4 = __half2float(input[0 * channel_stride + idx4]);
+            float g4 = __half2float(input[1 * channel_stride + idx4]);
+            float b4 = __half2float(input[2 * channel_stride + idx4]);
+            u_sum += -0.1146f * r4 - 0.3854f * g4 + 0.5f * b4;
+            v_sum += 0.5f * r4 - 0.4542f * g4 - 0.0458f * b4;
+            count++;
+        }
+
+        float u_avg = u_sum / (float)count;
+        float v_avg = v_sum / (float)count;
+
+        int uv_idx = (y >> 1) * uv_pitch + (x >> 1) * 2;
+        uv_plane[uv_idx    ] = (unsigned char)fminf(fmaxf(u_avg * 255.0f + 128.0f + 0.5f, 0.0f), 255.0f);
+        uv_plane[uv_idx + 1] = (unsigned char)fminf(fmaxf(v_avg * 255.0f + 128.0f + 0.5f, 0.0f), 255.0f);
+    }
+}
 "#;
 
 const MODULE_NAME: &str = "videoforge_preprocess";
@@ -246,6 +316,7 @@ const KERNEL_NAMES: &[&str] = &[
     "f32_to_f16",
     "f16_to_f32",
     "rgb_planar_f32_to_nv12",
+    "rgb_planar_f16_to_nv12",
 ];
 
 // ─── Compiled kernel handles ─────────────────────────────────────────────────
@@ -262,6 +333,7 @@ pub struct PreprocessKernels {
     f32_to_f16: CudaFunction,
     f16_to_f32: CudaFunction,
     rgb_f32_to_nv12: CudaFunction,
+    rgb_f16_to_nv12: CudaFunction,
 }
 
 impl PreprocessKernels {
@@ -310,6 +382,7 @@ impl PreprocessKernels {
             f32_to_f16: get_fn("f32_to_f16")?,
             f16_to_f32: get_fn("f16_to_f32")?,
             rgb_f32_to_nv12: get_fn("rgb_planar_f32_to_nv12")?,
+            rgb_f16_to_nv12: get_fn("rgb_planar_f16_to_nv12")?,
         };
 
         info!(
@@ -605,6 +678,60 @@ impl PreprocessKernels {
             format: PixelFormat::Nv12,
         })
     }
+
+    /// Convert `RgbPlanarF16` directly to NV12 for NVENC input.
+    pub fn rgb_f16_to_nv12(
+        &self,
+        input: &GpuTexture,
+        nv12_pitch: usize,
+        ctx: &GpuContext,
+        stream: &CudaStream,
+    ) -> Result<GpuTexture> {
+        if input.format != PixelFormat::RgbPlanarF16 {
+            return Err(EngineError::FormatMismatch {
+                expected: PixelFormat::RgbPlanarF16,
+                actual: input.format,
+            });
+        }
+
+        let w = input.width as usize;
+        let h = input.height as usize;
+        let channel_stride = w * h;
+        let out_bytes = PixelFormat::Nv12.byte_size(input.width, input.height, nv12_pitch);
+
+        let output_buf = ctx.alloc(out_bytes)?;
+
+        let in_ptr = input.device_ptr();
+        let y_ptr = *output_buf.device_ptr() as u64;
+        let uv_ptr = y_ptr + (nv12_pitch * h) as u64;
+
+        let (config, _) = launch_config_2d(input.width, input.height);
+
+        unsafe {
+            self.rgb_f16_to_nv12.clone().launch_on_stream(
+                stream,
+                config,
+                (
+                    in_ptr,
+                    y_ptr,
+                    uv_ptr,
+                    input.width as i32,
+                    input.height as i32,
+                    nv12_pitch as i32,
+                    nv12_pitch as i32,
+                    channel_stride as i32,
+                ),
+            )?;
+        }
+
+        Ok(GpuTexture {
+            data: Arc::new(output_buf),
+            width: input.width,
+            height: input.height,
+            pitch: nv12_pitch,
+            format: PixelFormat::Nv12,
+        })
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -820,8 +947,6 @@ impl PreprocessPipeline {
     }
 
     /// Convert model output back to NV12 for encoding.
-    ///
-    /// Handles F16→F32 promotion if needed before RGB→NV12 conversion.
     pub fn postprocess(
         &self,
         output: GpuTexture,
@@ -829,19 +954,21 @@ impl PreprocessPipeline {
         ctx: &GpuContext,
         stream: &CudaStream,
     ) -> Result<GpuTexture> {
-        let f32_texture = match output.format {
-            PixelFormat::RgbPlanarF32 => output,
-            PixelFormat::RgbPlanarF16 => self.kernels.convert_f16_to_f32(&output, ctx, stream)?,
+        match output.format {
+            PixelFormat::RgbPlanarF32 => {
+                self.kernels.rgb_to_nv12(&output, nv12_pitch, ctx, stream)
+            }
+            PixelFormat::RgbPlanarF16 => {
+                self.kernels
+                    .rgb_f16_to_nv12(&output, nv12_pitch, ctx, stream)
+            }
             other => {
-                return Err(EngineError::FormatMismatch {
+                Err(EngineError::FormatMismatch {
                     expected: PixelFormat::RgbPlanarF32,
                     actual: other,
-                });
+                })
             }
-        };
-
-        self.kernels
-            .rgb_to_nv12(&f32_texture, nv12_pitch, ctx, stream)
+        }
     }
 }
 

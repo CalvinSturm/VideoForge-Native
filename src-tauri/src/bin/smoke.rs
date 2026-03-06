@@ -24,6 +24,7 @@
 //! --e2e-scale <n>      Scale factor for E2E check (default: 1)
 //! --timeout-ms <N>     E2E job timeout in milliseconds (default: 600000)
 //! --keep-temp          Keep E2E output file instead of deleting it
+//! --native-direct      Force `VIDEOFORGE_NATIVE_ENGINE_DIRECT=1` for native E2E
 //! ```
 //!
 //! # Exit codes
@@ -775,6 +776,7 @@ async fn check_e2e_native(
     model_path: &str,
     scale: u32,
     precision: &str,
+    native_direct: bool,
     keep_temp: bool,
 ) -> bool {
     use app_lib::commands::native_engine::upscale_request_native;
@@ -809,10 +811,20 @@ async fn check_e2e_native(
     let out = output_path.unwrap_or("").to_string();
 
     // B) Run pipeline
-    println!("  Running native pipeline (this may take time)...");
+    let route_label = if native_direct {
+        "direct engine-v2 path"
+    } else {
+        "default native command path"
+    };
+    println!("  Running native pipeline via {route_label} (this may take time)...");
     // Native engine is runtime-gated; smoke native E2E opts in explicitly.
     unsafe {
         std::env::set_var("VIDEOFORGE_ENABLE_NATIVE_ENGINE", "1");
+        if native_direct {
+            std::env::set_var("VIDEOFORGE_NATIVE_ENGINE_DIRECT", "1");
+        } else {
+            std::env::remove_var("VIDEOFORGE_NATIVE_ENGINE_DIRECT");
+        }
     }
     let result = upscale_request_native(
         input_path.to_string(),
@@ -914,6 +926,7 @@ struct Args {
     keep_temp: bool,
     // E2E Native mode
     e2e_native: bool,
+    native_direct: bool,
     e2e_onnx: Option<String>,
 }
 
@@ -935,6 +948,7 @@ fn parse_args() -> Args {
     let mut e2e_timeout_ms = 600_000u64;
     let mut keep_temp = false;
     let mut e2e_native = false;
+    let mut native_direct = false;
     let mut e2e_onnx: Option<String> = None;
 
     while let Some(arg) = args.next() {
@@ -1005,6 +1019,9 @@ fn parse_args() -> Args {
             "--e2e-native" => {
                 e2e_native = true;
             }
+            "--native-direct" => {
+                native_direct = true;
+            }
             "--e2e-onnx" => {
                 e2e_onnx = args.next();
             }
@@ -1028,6 +1045,7 @@ fn parse_args() -> Args {
         e2e_timeout_ms,
         keep_temp,
         e2e_native,
+        native_direct,
         e2e_onnx,
     }
 }
@@ -1143,6 +1161,7 @@ async fn main() {
                     model,
                     args.e2e_scale,
                     &args.precision,
+                    args.native_direct,
                     args.keep_temp,
                 )
                 .await;

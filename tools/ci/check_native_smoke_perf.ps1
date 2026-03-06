@@ -54,7 +54,7 @@ $runRows = @()
 for ($i = 1; $i -le $Runs; $i++) {
   Write-Host "Run $i/$Runs ..."
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  & $SmokeExe --e2e-native --input "$Input" --e2e-onnx "$Onnx" --e2e-scale $Scale --precision $Precision --keep-temp
+  & $SmokeExe --e2e-native --native-direct --input "$Input" --e2e-onnx "$Onnx" --e2e-scale $Scale --precision $Precision --keep-temp
   $exitCode = $LASTEXITCODE
   $sw.Stop()
 
@@ -106,4 +106,3 @@ Write-Host ("Median FPS: {0} (threshold: {1})" -f ([Math]::Round($medianFps, 3))
 if (-not $pass) {
   throw ("Native perf regression: median FPS {0} is below threshold {1}" -f ([Math]::Round($medianFps, 3)), $MinMedianFps)
 }
-

@@ -47,8 +47,9 @@ use ort::session::Session;
 use ort::sys as ort_sys;
 use ort::tensor::TensorElementType;
 use ort::value::{DynValueTypeMarker, Value as OrtValue};
+use ort::AsPointer;
 
-use cudarc::driver::DevicePtr;
+use cudarc::driver::{CudaSlice, DevicePtr};
 
 use crate::core::backend::{ModelMetadata, UpscaleBackend};
 use crate::core::context::GpuContext;
@@ -57,37 +58,18 @@ use crate::error::{EngineError, Result};
 
 // Create an ORT tensor wrapper over an existing CUDA device buffer.
 unsafe fn create_tensor_from_device_memory(
+    mem_info: &MemoryInfo,
     ptr: *mut std::ffi::c_void,
     bytes: usize,
     shape: &[i64],
     elem_type: TensorElementType,
-    device_id: i32,
 ) -> Result<OrtValue<DynValueTypeMarker>> {
     let api = ort::api();
-
-    let mut mem_info_ptr: *mut ort_sys::OrtMemoryInfo = std::ptr::null_mut();
-    let name = std::ffi::CString::new("Cuda")
-        .map_err(|e| EngineError::ModelMetadata(format!("CreateMemoryInfo name: {e}")))?;
-    let status = unsafe {
-        (api.CreateMemoryInfo)(
-            name.as_ptr(),
-            ort_sys::OrtAllocatorType::OrtArenaAllocator,
-            device_id,
-            ort_sys::OrtMemType::OrtMemTypeDefault,
-            &mut mem_info_ptr,
-        )
-    };
-    if !status.0.is_null() {
-        unsafe { (api.ReleaseStatus)(status.0) };
-        return Err(EngineError::ModelMetadata(
-            "CreateMemoryInfo(CUDA) failed".into(),
-        ));
-    }
 
     let mut ort_value_ptr: *mut ort_sys::OrtValue = std::ptr::null_mut();
     let status = unsafe {
         (api.CreateTensorWithDataAsOrtValue)(
-            mem_info_ptr,
+            mem_info.ptr(),
             ptr,
             bytes as _,
             shape.as_ptr(),
@@ -96,8 +78,6 @@ unsafe fn create_tensor_from_device_memory(
             &mut ort_value_ptr,
         )
     };
-
-    unsafe { (api.ReleaseMemoryInfo)(mem_info_ptr) };
 
     if !status.0.is_null() {
         unsafe { (api.ReleaseStatus)(status.0) };
@@ -389,6 +369,17 @@ impl OutputRing {
 struct InferenceState {
     session: Session,
     ring: Option<OutputRing>,
+    batch_buffers: Option<BatchBuffers>,
+}
+
+struct BatchBuffers {
+    input: CudaSlice<u8>,
+    output: CudaSlice<u8>,
+    alloc_dims: (u32, u32),
+    format: PixelFormat,
+    max_batch: usize,
+    sample_input_bytes: usize,
+    sample_output_bytes: usize,
 }
 
 /// Resolve ORT tensor element type from our PixelFormat.
@@ -419,6 +410,88 @@ pub struct TensorRtBackend {
 }
 
 impl TensorRtBackend {
+    fn sample_output_bytes(meta: &ModelMetadata, input: &GpuTexture) -> usize {
+        let out_w = input.width * meta.scale;
+        let out_h = input.height * meta.scale;
+        3 * (out_w as usize) * (out_h as usize) * input.format.element_bytes()
+    }
+
+    fn copy_dense_texture_batch(
+        src_ptr: u64,
+        dst_ptr: u64,
+        width: u32,
+        height: u32,
+        elem_bytes: usize,
+    ) -> Result<()> {
+        let row_bytes = (width as usize) * elem_bytes;
+        let copy = crate::codecs::sys::CUDA_MEMCPY2D {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcMemoryType: crate::codecs::sys::CUmemorytype::Device,
+            srcHost: std::ptr::null(),
+            srcDevice: src_ptr,
+            srcArray: std::ptr::null(),
+            srcPitch: row_bytes,
+            dstXInBytes: 0,
+            dstY: 0,
+            dstMemoryType: crate::codecs::sys::CUmemorytype::Device,
+            dstHost: std::ptr::null_mut(),
+            dstDevice: dst_ptr,
+            dstArray: std::ptr::null_mut(),
+            dstPitch: row_bytes,
+            WidthInBytes: row_bytes,
+            Height: (height as usize) * 3,
+        };
+        unsafe {
+            crate::codecs::sys::check_cu(
+                crate::codecs::sys::cuMemcpy2D_v2(&copy),
+                "cuMemcpy2D_v2 (batched planar RGB copy)",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_batch_buffers<'a>(
+        &'a self,
+        state: &'a mut InferenceState,
+        meta: &ModelMetadata,
+        input: &GpuTexture,
+    ) -> Result<&'a mut BatchBuffers> {
+        let sample_input_bytes = input.byte_size();
+        let sample_output_bytes = Self::sample_output_bytes(meta, input);
+        let needs_realloc = state.batch_buffers.as_ref().is_none_or(|buffers| {
+            buffers.alloc_dims != (input.width, input.height)
+                || buffers.format != input.format
+                || buffers.max_batch != self.batch_config.max_batch
+                || buffers.sample_input_bytes != sample_input_bytes
+                || buffers.sample_output_bytes != sample_output_bytes
+        });
+
+        if needs_realloc {
+            if let Some(old) = state.batch_buffers.take() {
+                self.ctx.recycle(old.input);
+                self.ctx.recycle(old.output);
+            }
+            let input_buf = self
+                .ctx
+                .alloc(sample_input_bytes * self.batch_config.max_batch)?;
+            let output_buf = self
+                .ctx
+                .alloc(sample_output_bytes * self.batch_config.max_batch)?;
+            state.batch_buffers = Some(BatchBuffers {
+                input: input_buf,
+                output: output_buf,
+                alloc_dims: (input.width, input.height),
+                format: input.format,
+                max_batch: self.batch_config.max_batch,
+                sample_input_bytes,
+                sample_output_bytes,
+            });
+        }
+
+        Ok(state.batch_buffers.as_mut().unwrap())
+    }
+
     fn infer_scale_from_model_path(model_path: &std::path::Path) -> Option<u32> {
         let stem = model_path.file_stem()?.to_str()?.to_ascii_lowercase();
 
@@ -686,8 +759,7 @@ impl TensorRtBackend {
         output_ptr: u64,
         output_bytes: usize,
         _ctx: &GpuContext,
-        _cuda_mem_info: &MemoryInfo,
-        device_id: i32,
+        cuda_mem_info: &MemoryInfo,
     ) -> Result<()> {
         let in_w = input.width as i64;
         let in_h = input.height as i64;
@@ -715,20 +787,20 @@ impl TensorRtBackend {
         // Wrap pre-existing CUDA buffers as ORT tensors (zero-copy).
         let input_tensor = unsafe {
             create_tensor_from_device_memory(
+                cuda_mem_info,
                 input_src_ptr as *mut std::ffi::c_void,
                 input_bytes,
                 input_shape.as_slice(),
                 elem_type,
-                device_id,
             )?
         };
         let output_tensor = unsafe {
             create_tensor_from_device_memory(
+                cuda_mem_info,
                 output_ptr as *mut std::ffi::c_void,
                 output_bytes,
                 output_shape.as_slice(),
                 elem_type,
-                device_id,
             )?
         };
 
@@ -751,6 +823,73 @@ impl TensorRtBackend {
         session
             .run_binding(&binding)
             .map_err(|e| EngineError::ModelMetadata(format!("run_binding: {e}")))?;
+
+        Ok(())
+    }
+
+    fn run_io_bound_batch(
+        session: &mut Session,
+        meta: &ModelMetadata,
+        input_format: PixelFormat,
+        batch_len: usize,
+        in_w: u32,
+        in_h: u32,
+        input_ptr: u64,
+        input_bytes: usize,
+        output_ptr: u64,
+        output_bytes: usize,
+        cuda_mem_info: &MemoryInfo,
+    ) -> Result<()> {
+        let out_w = in_w * meta.scale;
+        let out_h = in_h * meta.scale;
+
+        let input_shape: Vec<i64> = vec![
+            batch_len as i64,
+            meta.input_channels as i64,
+            in_h as i64,
+            in_w as i64,
+        ];
+        let output_shape: Vec<i64> = vec![
+            batch_len as i64,
+            meta.input_channels as i64,
+            out_h as i64,
+            out_w as i64,
+        ];
+
+        let elem_type = ort_element_type(input_format);
+
+        let input_tensor = unsafe {
+            create_tensor_from_device_memory(
+                cuda_mem_info,
+                input_ptr as *mut std::ffi::c_void,
+                input_bytes,
+                input_shape.as_slice(),
+                elem_type,
+            )?
+        };
+        let output_tensor = unsafe {
+            create_tensor_from_device_memory(
+                cuda_mem_info,
+                output_ptr as *mut std::ffi::c_void,
+                output_bytes,
+                output_shape.as_slice(),
+                elem_type,
+            )?
+        };
+
+        let mut binding = session
+            .create_binding()
+            .map_err(|e| EngineError::ModelMetadata(format!("IO binding (batch): {e}")))?;
+        binding
+            .bind_input(&meta.input_name, &input_tensor)
+            .map_err(|e| EngineError::ModelMetadata(format!("bind_input (batch): {e}")))?;
+        binding
+            .bind_output(&meta.output_name, output_tensor)
+            .map_err(|e| EngineError::ModelMetadata(format!("bind_output (batch): {e}")))?;
+
+        session
+            .run_binding(&binding)
+            .map_err(|e| EngineError::ModelMetadata(format!("run_binding (batch): {e}")))?;
 
         Ok(())
     }
@@ -834,13 +973,6 @@ impl UpscaleBackend for TensorRtBackend {
                 );
             }
         }
-        if self.batch_config.max_batch > 1 {
-            warn!(
-                max_batch = self.batch_config.max_batch,
-                "Configured max_batch > 1; current backend process() path remains single-frame"
-            );
-        }
-
         let cuda_ep = CudaEP::default().with_device_id(self.device_id);
         let session = Session::builder()?
             .with_execution_providers([trt_ep.build(), cuda_ep.build()])?
@@ -868,6 +1000,7 @@ impl UpscaleBackend for TensorRtBackend {
         *guard = Some(InferenceState {
             session,
             ring: None,
+            batch_buffers: None,
         });
 
         Ok(())
@@ -944,7 +1077,6 @@ impl UpscaleBackend for TensorRtBackend {
             output_bytes,
             &self.ctx,
             mem_info,
-            self.device_id,
         )?;
 
         let elapsed_us = t_start.elapsed().as_micros() as u64;
@@ -974,13 +1106,143 @@ impl UpscaleBackend for TensorRtBackend {
     }
 
     async fn process_batch(&self, inputs: Vec<GpuTexture>) -> Result<Vec<GpuTexture>> {
-        // Current TensorRT path is single-frame IO binding; micro-batching is
-        // orchestrated at the pipeline layer and executed sequentially here.
-        let mut outputs = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            outputs.push(self.process(input).await?);
+        if inputs.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(outputs)
+        if inputs.len() == 1 {
+            return Ok(vec![self.process(inputs.into_iter().next().unwrap()).await?]);
+        }
+
+        let first = &inputs[0];
+        if inputs.iter().any(|input| {
+            input.width != first.width || input.height != first.height || input.format != first.format
+        }) {
+            warn!(
+                batch_size = inputs.len(),
+                "Mixed-dimension or mixed-format batch encountered; falling back to sequential execution"
+            );
+            let mut outputs = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                outputs.push(self.process(input).await?);
+            }
+            return Ok(outputs);
+        }
+
+        let meta = self.meta.get().ok_or(EngineError::NotInitialized)?;
+        let mut guard = self.state.lock().await;
+        self.ctx.device().bind_to_thread().map_err(|e| {
+            EngineError::ModelMetadata(format!("bind_to_thread (backend process_batch): {:?}", e))
+        })?;
+        let state = guard.as_mut().ok_or(EngineError::NotInitialized)?;
+
+        match &mut state.ring {
+            Some(ring) if ring.needs_realloc(first.width, first.height) => {
+                debug!(
+                    old = ?ring.alloc_dims,
+                    new_w = first.width,
+                    new_h = first.height,
+                    "Reallocating output ring for batch"
+                );
+                ring.reallocate(&self.ctx, first.width, first.height, meta.scale)?;
+            }
+            None => {
+                debug!(
+                    w = first.width,
+                    h = first.height,
+                    slots = self.ring_size,
+                    "Lazily creating output ring for batch"
+                );
+                state.ring = Some(OutputRing::new(
+                    &self.ctx,
+                    first.width,
+                    first.height,
+                    meta.scale,
+                    self.ring_size,
+                    self.min_ring_slots,
+                )?);
+            }
+            Some(_) => {}
+        }
+
+        let sample_input_bytes = first.byte_size();
+        let sample_output_bytes = Self::sample_output_bytes(meta, first);
+        let elem_bytes = first.format.element_bytes();
+        let batch_len = inputs.len();
+
+        #[cfg(feature = "debug-alloc")]
+        {
+            crate::debug_alloc::reset();
+            crate::debug_alloc::enable();
+        }
+
+        let buffers = Self::ensure_batch_buffers(self, state, meta, first)?;
+        let batch_input_ptr = *buffers.input.device_ptr() as u64;
+        let batch_output_ptr = *buffers.output.device_ptr() as u64;
+
+        let ring = state.ring.as_mut().unwrap();
+        let mut output_arcs = Vec::with_capacity(batch_len);
+        for _ in 0..batch_len {
+            output_arcs.push(ring.acquire()?);
+        }
+
+        let t_start = std::time::Instant::now();
+
+        for (i, input) in inputs.iter().enumerate() {
+            let dst_ptr = batch_input_ptr + (i * sample_input_bytes) as u64;
+            Self::copy_dense_texture_batch(
+                input.device_ptr(),
+                dst_ptr,
+                input.width,
+                input.height,
+                elem_bytes,
+            )?;
+        }
+
+        Self::run_io_bound_batch(
+            &mut state.session,
+            meta,
+            first.format,
+            batch_len,
+            first.width,
+            first.height,
+            batch_input_ptr,
+            sample_input_bytes * batch_len,
+            batch_output_ptr,
+            sample_output_bytes * batch_len,
+            self.mem_info()?,
+        )?;
+
+        let out_w = first.width * meta.scale;
+        let out_h = first.height * meta.scale;
+        for (i, output_arc) in output_arcs.iter().enumerate() {
+            let src_ptr = batch_output_ptr + (i * sample_output_bytes) as u64;
+            let dst_ptr = *output_arc.device_ptr() as u64;
+            Self::copy_dense_texture_batch(src_ptr, dst_ptr, out_w, out_h, elem_bytes)?;
+        }
+
+        let elapsed_us = t_start.elapsed().as_micros() as u64;
+        self.inference_metrics.record(elapsed_us);
+
+        #[cfg(feature = "debug-alloc")]
+        {
+            crate::debug_alloc::disable();
+            let host_allocs = crate::debug_alloc::count();
+            debug_assert_eq!(
+                host_allocs, 0,
+                "VIOLATION: {host_allocs} host allocations during batched inference"
+            );
+        }
+
+        Ok(output_arcs
+            .into_iter()
+            .map(|output_arc| GpuTexture {
+                data: output_arc,
+                width: out_w,
+                height: out_h,
+                pitch: (out_w as usize) * elem_bytes,
+                format: first.format,
+            })
+            .collect())
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -1013,6 +1275,10 @@ impl UpscaleBackend for TensorRtBackend {
                 "Final VRAM usage"
             );
 
+            if let Some(batch_buffers) = state.batch_buffers {
+                self.ctx.recycle(batch_buffers.input);
+                self.ctx.recycle(batch_buffers.output);
+            }
             drop(state.ring);
             drop(state.session);
             debug!("TensorRT backend shutdown complete");

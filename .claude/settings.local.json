@@ -26,7 +26,8 @@
       "Bash(where cargo)",
       "Read(//c/Users/Calvin/.cargo/bin/**)",
       "Read(//c/Users/Calvin/Desktop/VideoForge1/third_party/rave/$USERPROFILE/.cargo/**)",
-      "Bash(/c/Users/Calvin/.cargo/bin/cargo.exe build:*)"
+      "Bash(/c/Users/Calvin/.cargo/bin/cargo.exe build:*)",
+      "Bash(git:*)"
     ]
   }
 }

@@ -409,7 +409,7 @@ impl UpscalePipeline {
             let metrics = metrics.clone();
             let ctx_decode = ctx.clone();
             tasks.spawn_blocking(move || -> Result<()> {
-                info!(
+                debug!(
                     thread = ?std::thread::current().id(),
                     "PIPELINE-BND: entered decode spawn_blocking"
                 );
@@ -444,7 +444,7 @@ impl UpscalePipeline {
                 None
             };
             tasks.spawn(async move {
-                info!(
+                debug!(
                     thread = ?std::thread::current().id(),
                     "PIPELINE-BND: entered preprocess task"
                 );
@@ -475,7 +475,7 @@ impl UpscalePipeline {
                 None
             };
             tasks.spawn(async move {
-                info!(
+                debug!(
                     thread = ?std::thread::current().id(),
                     "PIPELINE-BND: entered inference task"
                 );
@@ -508,12 +508,12 @@ impl UpscalePipeline {
             } else {
                 None
             };
-            info!(
+            debug!(
                 thread = ?std::thread::current().id(),
                 "PIPELINE-BND: scheduling encode spawn_blocking"
             );
             tasks.spawn_blocking(move || -> Result<()> {
-                info!(
+                debug!(
                     thread = ?std::thread::current().id(),
                     "PIPELINE-BND: entered encode spawn_blocking"
                 );
@@ -1023,7 +1023,7 @@ fn decode_stage<D: FrameDecoder>(
     metrics: &PipelineMetrics,
     queue: &crate::core::context::QueueDepthTracker,
 ) -> Result<()> {
-    info!(
+    debug!(
         thread = ?std::thread::current().id(),
         "PIPELINE-BND: decode_stage start"
     );
@@ -1036,7 +1036,7 @@ fn decode_stage<D: FrameDecoder>(
         match decoder.decode_next()? {
             Some(decoded) => {
                 let frame = &decoded.frame;
-                info!(
+                debug!(
                     thread = ?std::thread::current().id(),
                     frame_index = frame.frame_index,
                     pts = frame.pts,
@@ -1080,7 +1080,7 @@ async fn preprocess_stage(
     profiler_ctx: Option<&GpuContext>,
 ) -> Result<()> {
     let mut preprocess = PreprocessPipeline::new(kernels.clone(), precision);
-    info!(
+    debug!(
         thread = ?std::thread::current().id(),
         "PIPELINE-BND: preprocess_stage start"
     );
@@ -1114,7 +1114,7 @@ async fn preprocess_stage(
         })?;
 
         let (frame, decode_ready) = decoded.into_parts();
-        info!(
+        debug!(
             frame_index = frame.frame_index,
             pts = frame.pts,
             has_decode_ready = decode_ready.is_some(),
@@ -1123,7 +1123,7 @@ async fn preprocess_stage(
         if let Some(event) = decode_ready {
             event.wait(&ctx.preprocess_stream)?;
         }
-        info!(
+        debug!(
             frame_index = frame.frame_index,
             "PIPELINE-BND: preprocess_stage decode dependency satisfied"
         );
@@ -1135,7 +1135,7 @@ async fn preprocess_stage(
         let t_start = Instant::now();
 
         let model_input = preprocess.prepare(&frame.texture, ctx, &ctx.preprocess_stream)?;
-        info!(
+        debug!(
             frame_index = frame.frame_index,
             out_width = model_input.texture.width,
             out_height = model_input.texture.height,
@@ -1175,7 +1175,7 @@ async fn preprocess_stage(
             ctx.queue_depth.preprocess.fetch_sub(1, Ordering::Relaxed);
             return Err(EngineError::ChannelClosed);
         }
-        info!(
+        debug!(
             frame_index = frame.frame_index,
             "PIPELINE-BND: preprocess_stage sent frame"
         );
@@ -1222,7 +1222,7 @@ async fn inference_stage<B: UpscaleBackend>(
     let preprocess = PreprocessPipeline::new(kernels.clone(), precision);
     let max_batch = inference_max_batch.max(1);
     let batch_wait = Duration::from_micros(inference_batch_wait_us);
-    info!(
+    debug!(
         thread = ?std::thread::current().id(),
         max_batch,
         batch_wait_us = inference_batch_wait_us,
@@ -1298,7 +1298,7 @@ async fn inference_stage<B: UpscaleBackend>(
         let mut inputs = Vec::with_capacity(batch.len());
         for envelope in batch {
             let (frame, preprocess_ready) = envelope.into_parts();
-            info!(
+            debug!(
                 frame_index = frame.frame_index,
                 pts = frame.pts,
                 has_preprocess_ready = preprocess_ready.is_some(),
@@ -1307,7 +1307,7 @@ async fn inference_stage<B: UpscaleBackend>(
             if let Some(event) = preprocess_ready {
                 event.wait(&ctx.inference_stream)?;
             }
-            info!(
+            debug!(
                 frame_index = frame.frame_index,
                 "PIPELINE-BND: inference_stage preprocess dependency satisfied"
             );
@@ -1317,12 +1317,12 @@ async fn inference_stage<B: UpscaleBackend>(
 
         // ── Inference ──
         let t_infer = Instant::now();
-        info!(
+        debug!(
             batch_size = inputs.len(),
             "PIPELINE-BND: inference_stage calling backend.process_batch"
         );
         let upscaled_rgbs = backend.process_batch(inputs.clone()).await?;
-        info!(
+        debug!(
             batch_size = upscaled_rgbs.len(),
             "PIPELINE-BND: inference_stage backend.process_batch complete"
         );
@@ -1364,7 +1364,7 @@ async fn inference_stage<B: UpscaleBackend>(
         for (upscaled_rgb, (frame_index, pts, is_keyframe)) in
             upscaled_rgbs.into_iter().zip(metas.iter().copied())
         {
-            info!(
+            debug!(
                 frame_index,
                 pts,
                 rgb_width = upscaled_rgb.width,
@@ -1375,7 +1375,7 @@ async fn inference_stage<B: UpscaleBackend>(
             );
             let upscaled_nv12 =
                 preprocess.postprocess(upscaled_rgb, encoder_pitch, ctx, &ctx.inference_stream)?;
-            info!(
+            debug!(
                 frame_index,
                 pts,
                 nv12_width = upscaled_nv12.width,
@@ -1420,7 +1420,7 @@ async fn inference_stage<B: UpscaleBackend>(
                 ctx.queue_depth.inference.fetch_sub(pending, Ordering::Relaxed);
                 return Err(EngineError::ChannelClosed);
             }
-            info!(
+            debug!(
                 frame_index,
                 "PIPELINE-BND: inference_stage sent frame"
             );
@@ -1449,7 +1449,7 @@ fn encode_stage<E: FrameEncoder>(
     metrics: &PipelineMetrics,
     profiler_ctx: Option<&GpuContext>,
 ) -> Result<()> {
-    info!(
+    debug!(
         thread = ?std::thread::current().id(),
         "PIPELINE-BND: encode_stage start"
     );
@@ -1463,7 +1463,7 @@ fn encode_stage<E: FrameEncoder>(
         match rx.blocking_recv() {
             Some(envelope) => {
                 let (frame, postprocess_ready) = envelope.into_parts();
-                info!(
+                debug!(
                     frame_index = frame.frame_index,
                     pts = frame.pts,
                     has_postprocess_ready = postprocess_ready.is_some(),
@@ -1472,12 +1472,12 @@ fn encode_stage<E: FrameEncoder>(
                 if let Some(event) = postprocess_ready {
                     event.synchronize()?;
                 }
-                info!(
+                debug!(
                     frame_index = frame.frame_index,
                     "PIPELINE-BND: encode_stage postprocess dependency satisfied"
                 );
                 debug_assert_eq!(frame.texture.format, PixelFormat::Nv12);
-                info!(
+                debug!(
                     thread = ?std::thread::current().id(),
                     frame_index = frame.frame_index,
                     pts = frame.pts,

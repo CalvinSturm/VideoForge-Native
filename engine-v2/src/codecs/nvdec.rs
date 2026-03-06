@@ -33,10 +33,10 @@
 //!
 //! # Cross-stream synchronization
 //!
-//! After the D2D copy completes on `decode_stream`, a CUDA event is
-//! recorded.  The preprocess stage must call
-//! `cuStreamWaitEvent(preprocess_stream, event)` before reading the buffer.
-//! This ensures ordering without CPU-blocking sync.
+//! When async decode-copy mode is enabled, the D2D copy runs on
+//! `decode_stream` and an event is recorded on that stream. The preprocess
+//! stage must call `cuStreamWaitEvent(preprocess_stream, event)` before
+//! reading the buffer. The default path keeps the copy synchronous.
 
 use std::collections::VecDeque;
 use std::ffi::{c_int, c_short, c_uint, c_ulong, c_ulonglong, c_void};
@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use cudarc::driver::DevicePtr;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::codecs::sys::*;
 use crate::core::context::GpuContext;
@@ -124,6 +124,10 @@ pub struct NvDecoder {
 }
 
 impl NvDecoder {
+    fn async_copy_enabled() -> bool {
+        std::env::var_os("VIDEOFORGE_NVDEC_ASYNC_COPY").as_deref() == Some("1".as_ref())
+    }
+
     fn init_parser_if_needed(&mut self) -> Result<()> {
         if !self.parser.is_null() {
             return Ok(());
@@ -421,47 +425,50 @@ impl NvDecoder {
             Height: (height / 2) as usize,
         };
 
-        // Direct-path validation is currently unstable with raw CUstream use
-        // here on Windows, so keep the NVDEC copy path synchronous for now.
-        unsafe {
-            check_cu(
-                cuMemcpy2D_v2(&y_copy),
-                "cuMemcpy2D_v2 (Y plane)",
-            )?;
-            check_cu(
-                cuMemcpy2D_v2(&uv_copy),
-                "cuMemcpy2D_v2 (UV plane)",
-            )?;
-        }
-        info!("NVDEC map_and_copy completed synchronous D2D copies");
+        let decode_ready = if Self::async_copy_enabled() {
+            let raw_stream = get_raw_stream(&self.ctx.decode_stream);
+            unsafe {
+                check_cu(
+                    cuMemcpy2DAsync_v2(&y_copy, raw_stream),
+                    "cuMemcpy2DAsync_v2 (Y plane)",
+                )?;
+                check_cu(
+                    cuMemcpy2DAsync_v2(&uv_copy, raw_stream),
+                    "cuMemcpy2DAsync_v2 (UV plane)",
+                )?;
+            }
+            let decode_ready = StreamReadyEvent::record(&self.ctx.decode_stream, "decode_done")?;
+            self.pending_unmaps.push_back(PendingUnmap {
+                src_ptr,
+                decode_ready: decode_ready.clone(),
+            });
+            debug!(
+                pending_unmaps = self.pending_unmaps.len(),
+                "NVDEC map_and_copy queued async decode copy"
+            );
+            decode_ready
+        } else {
+            unsafe {
+                check_cu(
+                    cuMemcpy2D_v2(&y_copy),
+                    "cuMemcpy2D_v2 (Y plane)",
+                )?;
+                check_cu(
+                    cuMemcpy2D_v2(&uv_copy),
+                    "cuMemcpy2D_v2 (UV plane)",
+                )?;
+            }
+            debug!("NVDEC map_and_copy completed synchronous D2D copies");
 
-        unsafe {
-            check_cu(
-                cuvidUnmapVideoFrame64(decoder, src_ptr),
-                "cuvidUnmapVideoFrame64",
-            )?;
-        }
-        info!("NVDEC map_and_copy unmapped surface");
-
-        // The copy is complete when control returns, but keep the envelope
-        // contract uniform by recording an already-satisfied event.
-        let mut event: CUevent = ptr::null_mut();
-        unsafe {
-            check_cu(
-                cuEventCreate(&mut event, CU_EVENT_DISABLE_TIMING),
-                "cuEventCreate (decode_done)",
-            )?;
-            check_cu(
-                cuEventRecord(event, ptr::null_mut()),
-                "cuEventRecord (decode_done)",
-            )?;
-        }
-        info!(
-            event = format_args!("{:p}", event),
-            "NVDEC map_and_copy recorded decode event"
-        );
-
-        let decode_ready = StreamReadyEvent::from_raw(event);
+            unsafe {
+                check_cu(
+                    cuvidUnmapVideoFrame64(decoder, src_ptr),
+                    "cuvidUnmapVideoFrame64",
+                )?;
+            }
+            debug!("NVDEC map_and_copy unmapped surface");
+            StreamReadyEvent::record(&self.ctx.decode_stream, "decode_done")?
+        };
 
         let texture = GpuTexture {
             data: Arc::new(dst_buf),
@@ -479,7 +486,7 @@ impl NvDecoder {
         };
 
         self.frame_index += 1;
-        info!(
+        debug!(
             frame_index = envelope.frame_index,
             pts = envelope.pts,
             pending_unmaps = self.pending_unmaps.len(),
@@ -539,13 +546,6 @@ impl FrameDecoder for NvDecoder {
 
             match self.source.read_packet()? {
                 Some(packet) => {
-                    info!(
-                        thread = ?std::thread::current().id(),
-                        bytes = packet.data.len(),
-                        pts = packet.pts,
-                        key = packet.is_keyframe,
-                        "NVDEC decode_next got packet from source"
-                    );
                     debug!(
                         thread = ?std::thread::current().id(),
                         bytes = packet.data.len(),
@@ -599,7 +599,7 @@ unsafe extern "system" fn sequence_callback(
     format: *mut CUVIDEOFORMAT,
 ) -> c_int {
     unsafe {
-        info!(
+        debug!(
             user_data = format_args!("{:p}", user_data),
             format_ptr = format_args!("{:p}", format),
             "NVDEC sequence_callback enter"
@@ -646,7 +646,7 @@ unsafe extern "system" fn sequence_callback(
 
         let result = cuvidCreateDecoder(&mut state.decoder, &mut create_info);
         if result != CUDA_SUCCESS {
-            info!(result, "NVDEC sequence_callback decoder creation failed");
+            warn!(result, "NVDEC sequence_callback decoder creation failed");
             // Return 0 to signal failure to the parser.
             return 0;
         }
@@ -671,7 +671,7 @@ unsafe extern "system" fn decode_callback(
     pic_params: *mut CUVIDPICPARAMS,
 ) -> c_int {
     unsafe {
-        info!(
+        debug!(
             user_data = format_args!("{:p}", user_data),
             pic_params = format_args!("{:p}", pic_params),
             "NVDEC decode_callback enter"
@@ -679,17 +679,17 @@ unsafe extern "system" fn decode_callback(
         let state = &mut *(user_data as *mut CallbackState);
 
         if !state.decoder_created || state.decoder.is_null() {
-            info!("NVDEC decode_callback skipped: decoder not ready");
+            debug!("NVDEC decode_callback skipped: decoder not ready");
             return 0;
         }
 
         let result = cuvidDecodePicture(state.decoder, pic_params);
         if result != CUDA_SUCCESS {
-            info!(result, "NVDEC decode_callback cuvidDecodePicture failed");
+            warn!(result, "NVDEC decode_callback cuvidDecodePicture failed");
             return 0;
         }
 
-        info!("NVDEC decode_callback success");
+        debug!("NVDEC decode_callback success");
         1 // Success.
     }
 }
@@ -700,7 +700,7 @@ unsafe extern "system" fn display_callback(
     disp_info: *mut CUVIDPARSERDISPINFO,
 ) -> c_int {
     unsafe {
-        info!(
+        debug!(
             user_data = format_args!("{:p}", user_data),
             disp_info = format_args!("{:p}", disp_info),
             "NVDEC display_callback enter"
@@ -709,12 +709,12 @@ unsafe extern "system" fn display_callback(
 
         if disp_info.is_null() {
             // Null means EOS from parser.
-            info!("NVDEC display_callback EOS");
+            debug!("NVDEC display_callback EOS");
             return 1;
         }
 
         state.pending_display.push_back(*disp_info);
-        info!(
+        debug!(
             queue_len = state.pending_display.len(),
             picture_index = (*disp_info).picture_index,
             timestamp = (*disp_info).timestamp,

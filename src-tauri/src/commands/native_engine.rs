@@ -4,7 +4,7 @@
 //! When the feature is **disabled** (the default), the command returns a
 //! structured `FEATURE_DISABLED` error immediately.
 //!
-//! When the feature is **enabled**, the pipeline is:
+//! When the feature is **enabled** and runtime-gated, the pipeline is:
 //! ```text
 //! FFmpeg demux → Annex B elementary stream (.h264/.hevc temp file)
 //!      ↓
@@ -13,37 +13,25 @@
 //! FFmpeg mux: video_output + audio_from_original → final .mp4
 //! ```
 //!
-//! # STOP CONDITION — dependency resolution
+//! Runtime routing:
 //!
-//! `engine-v2` depends on `ort = "^2.0"` (ONNX Runtime).  As of 2026-02,
-//! `ort 2.0.0` stable has **not** been published to crates.io; only release
-//! candidates exist (`2.0.0-rc.11` is the latest).  Cargo refuses the path
-//! dependency because rc versions do not satisfy the `^2.0` semver constraint.
+//! - `VIDEOFORGE_ENABLE_NATIVE_ENGINE=1` is required before the command runs.
+//! - `VIDEOFORGE_NATIVE_ENGINE_DIRECT=1` routes into the true in-process path.
+//! - without the direct flag, the native command stays on the CLI-backed path.
 //!
-//! **Affected files**:
-//! - `engine-v2/Cargo.toml` line 13: `ort = { version = "2.0", features = ["cuda", "tensorrt"] }`
-//! - `src-tauri/Cargo.toml`: `videoforge-engine` path dep (commented out)
-//!
-//! **Reproduction**:
-//! ```text
-//! cd src-tauri && cargo check --features native_engine
-//! # error: failed to select a version for the requirement `ort = "^2.0"`
-//! # candidate versions found which didn't match: 2.0.0-rc.11, ...
-//! ```
-//!
-//! **Fix before enabling the feature**:
-//! 1. In `engine-v2/Cargo.toml` change `ort = { version = "2.0" }` to
-//!    `ort = { version = "2.0.0-rc.11" }` (or current rc on crates.io).
-//! 2. Uncomment the `videoforge-engine` dep in `src-tauri/Cargo.toml`.
-//! 3. Change `native_engine = []` to `native_engine = ["dep:videoforge-engine"]`.
-//!
-//! The integration code in this file is complete and correct.
-//! See `docs/NATIVE_ENGINE_MVP.md` for full instructions.
+//! This file owns the app-facing runtime gating, FFmpeg file-boundary steps,
+//! and the opt-in engine-v2 direct path.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 #[cfg(feature = "native_engine")]
 use std::path::PathBuf;
+#[cfg(feature = "native_engine")]
+use std::sync::Arc;
+#[cfg(feature = "native_engine")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "native_engine")]
+use std::sync::OnceLock;
 
 #[cfg(all(feature = "native_engine", windows))]
 unsafe extern "system" {
@@ -103,7 +91,15 @@ fn find_file_under(root: &Path, file_name: &str, max_depth: usize) -> Option<Pat
 }
 
 #[cfg(feature = "native_engine")]
-fn configure_native_runtime_env() -> String {
+struct NativeRuntimeEnv {
+    ffmpeg_cmd: String,
+}
+
+#[cfg(feature = "native_engine")]
+static NATIVE_RUNTIME_ENV: OnceLock<NativeRuntimeEnv> = OnceLock::new();
+
+#[cfg(feature = "native_engine")]
+fn discover_native_runtime_env() -> NativeRuntimeEnv {
     let ffmpeg_exe = if cfg!(windows) {
         "ffmpeg.exe"
     } else {
@@ -209,10 +205,48 @@ fn configure_native_runtime_env() -> String {
     }
     prepend_path_dirs(&path_additions);
 
-    if let Some(bin) = ffmpeg_bin {
-        return bin.join(ffmpeg_exe).to_string_lossy().to_string();
-    }
-    "ffmpeg".to_string()
+    let ffmpeg_cmd = if let Some(bin) = ffmpeg_bin {
+        bin.join(ffmpeg_exe).to_string_lossy().to_string()
+    } else {
+        "ffmpeg".to_string()
+    };
+
+    NativeRuntimeEnv { ffmpeg_cmd }
+}
+
+#[cfg(feature = "native_engine")]
+fn configure_native_runtime_env() -> String {
+    NATIVE_RUNTIME_ENV
+        .get_or_init(discover_native_runtime_env)
+        .ffmpeg_cmd
+        .clone()
+}
+
+#[cfg(feature = "native_engine")]
+static NATIVE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "native_engine")]
+fn native_temp_token() -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let pid = std::process::id();
+    let seq = NATIVE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{pid}_{ts}_{seq}")
+}
+
+#[cfg(feature = "native_engine")]
+fn stderr_tail(bytes: &[u8], lines: usize) -> String {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .rev()
+        .take(lines)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Structured response returned by `upscale_request_native`.
@@ -480,16 +514,12 @@ async fn run_native_pipeline(
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         let dir = Path::new(&input_path)
             .parent()
             .unwrap_or(Path::new("."))
-            .display()
-            .to_string();
-        output_path = format!("{}/{}_{}_native_upscaled.mp4", dir, stem, ts);
+            .to_path_buf();
+        let file_name = format!("{}_{}_native_upscaled.mp4", stem, native_temp_token());
+        output_path = dir.join(file_name).to_string_lossy().to_string();
     }
 
     tracing::info!(
@@ -504,19 +534,16 @@ async fn run_native_pipeline(
 
     // ── Step 1: FFmpeg extract elementary stream ──────────────────────────────
     let tmp_dir = std::env::temp_dir();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let elementary_stream_path = tmp_dir.join(format!("vf_native_input_{}.h264", ts));
-    let native_output_path = tmp_dir.join(format!("vf_native_output_{}.h264", ts));
+    let temp_token = native_temp_token();
+    let elementary_stream_path = tmp_dir.join(format!("vf_native_input_{temp_token}.h264"));
+    let native_output_path_h264 = tmp_dir.join(format!("vf_native_output_{temp_token}.h264"));
 
     tracing::info!(
         stream_path = %elementary_stream_path.display(),
         "Extracting H.264 elementary stream with FFmpeg"
     );
 
-    let demux_status = Command::new(&ffmpeg_cmd)
+    let demux_output = Command::new(&ffmpeg_cmd)
         .args([
             "-y",
             "-hide_banner",
@@ -532,15 +559,16 @@ async fn run_native_pipeline(
             elementary_stream_path.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .await
         .map_err(|e| make_err("FFMPEG_SPAWN", &format!("FFmpeg spawn failed: {}", e)))?;
 
-    if !demux_status.success() {
+    if !demux_output.status.success() {
         // Attempt HEVC fallback
-        let hevc_path = tmp_dir.join(format!("vf_native_input_{}.hevc", ts));
-        let hevc_status = Command::new(&ffmpeg_cmd)
+        let hevc_path = tmp_dir.join(format!("vf_native_input_{temp_token}.hevc"));
+        let native_output_path_hevc = tmp_dir.join(format!("vf_native_output_{temp_token}.hevc"));
+        let hevc_output = Command::new(&ffmpeg_cmd)
             .args([
                 "-y",
                 "-hide_banner",
@@ -556,16 +584,16 @@ async fn run_native_pipeline(
                 hevc_path.to_str().unwrap(),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stderr(Stdio::piped())
+            .output()
             .await
             .ok();
 
-        if hevc_status.is_some_and(|s| s.success()) {
+        if hevc_output.as_ref().is_some_and(|o| o.status.success()) {
             tracing::info!("Falling back to HEVC elementary stream");
             return run_engine_pipeline(
                 hevc_path,
-                native_output_path,
+                native_output_path_hevc,
                 output_path,
                 input_path,
                 model_path,
@@ -579,16 +607,26 @@ async fn run_native_pipeline(
             .await;
         }
 
+        let h264_stderr = stderr_tail(&demux_output.stderr, 12);
+        let hevc_stderr = hevc_output
+            .as_ref()
+            .map(|o| stderr_tail(&o.stderr, 12))
+            .unwrap_or_else(|| "FFmpeg HEVC fallback did not produce output.".to_string());
         return Err(make_err(
             "DEMUX_FAILED",
-            "FFmpeg could not extract an H.264 or HEVC elementary stream from the input. \
-             Only H.264 and HEVC containers are supported by the native engine MVP.",
+            &format!(
+                "FFmpeg could not extract an H.264 or HEVC elementary stream from the input. \
+                 Only H.264 and HEVC containers are supported by the native engine MVP.\n\
+                 h264 stderr:\n{}\n\
+                 hevc stderr:\n{}",
+                h264_stderr, hevc_stderr
+            ),
         ));
     }
 
     run_engine_pipeline(
         elementary_stream_path,
-        native_output_path,
+        native_output_path_h264,
         output_path,
         input_path,
         model_path,
@@ -739,9 +777,14 @@ async fn run_engine_pipeline(
     let cuda_ctx = ctx
         .current_context_ptr()
         .map_err(|e| make_err("ENCODER_INIT", &format!("cuCtxGetCurrent failed: {}", e)))?;
-    let encoder =
-        videoforge_engine::codecs::nvenc::NvEncoder::new(cuda_ctx, Box::new(sink), enc_config)
-            .map_err(|e| make_err("ENCODER_INIT", &format!("NVENC encoder init failed: {}", e)))?;
+    let encoder = NativeVideoEncoderWrapper::new(
+        ctx.clone(),
+        cuda_ctx,
+        Box::new(sink),
+        enc_config,
+        engine_output.clone(),
+    )
+    .map_err(|e| make_err("ENCODER_INIT", &format!("Encoder init failed: {}", e)))?;
 
     // ── Step 7: Run the pipeline ──────────────────────────────────────────────
     let config = PipelineConfig {
@@ -818,16 +861,7 @@ async fn run_engine_pipeline(
         .map_err(|e| make_err("FFMPEG_MUX_SPAWN", &e.to_string()))?;
 
     if !mux_output.status.success() {
-        let stderr = String::from_utf8_lossy(&mux_output.stderr);
-        let stderr_tail = stderr
-            .lines()
-            .rev()
-            .take(12)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
+        let stderr_tail = stderr_tail(&mux_output.stderr, 12);
         tracing::error!(
             status = ?mux_output.status.code(),
             input_stream = %input_stream.display(),
@@ -865,18 +899,17 @@ async fn run_engine_pipeline(
 
 #[cfg(feature = "native_engine")]
 struct FileBitstreamSource {
-    data: Vec<u8>,
-    pos: usize,
+    file: std::fs::File,
+    eof: bool,
     pts_counter: i64,
 }
 
 #[cfg(feature = "native_engine")]
 impl FileBitstreamSource {
     fn new(path: &Path) -> std::io::Result<Self> {
-        let data = std::fs::read(path)?;
         Ok(Self {
-            data,
-            pos: 0,
+            file: std::fs::File::open(path)?,
+            eof: false,
             pts_counter: 0,
         })
     }
@@ -888,15 +921,29 @@ impl videoforge_engine::codecs::nvdec::BitstreamSource for FileBitstreamSource {
         &mut self,
     ) -> videoforge_engine::error::Result<Option<videoforge_engine::codecs::nvdec::BitstreamPacket>>
     {
-        if self.pos >= self.data.len() {
+        use std::io::Read;
+
+        if self.eof {
             return Ok(None);
         }
 
         // Feed in 1 MiB chunks.  The NVDEC parser handles cross-chunk NAL
-        // boundaries internally — no client-side start-code splitting needed.
+        // boundaries internally, so we can stream reads directly from disk.
         const CHUNK: usize = 1024 * 1024;
-        let end = (self.pos + CHUNK).min(self.data.len());
-        let chunk = self.data[self.pos..end].to_vec();
+        let mut chunk = vec![0_u8; CHUNK];
+        let bytes_read = self.file.read(&mut chunk).map_err(|e| {
+            videoforge_engine::error::EngineError::Decode(format!(
+                "read elementary stream: {e}"
+            ))
+        })?;
+        if bytes_read == 0 {
+            self.eof = true;
+            return Ok(None);
+        }
+        chunk.truncate(bytes_read);
+        if bytes_read < CHUNK {
+            self.eof = true;
+        }
 
         // Heuristic keyframe detection: IDR NAL type 0x65 after a start code.
         let is_keyframe = chunk.windows(5).any(|w| {
@@ -906,7 +953,6 @@ impl videoforge_engine::codecs::nvdec::BitstreamSource for FileBitstreamSource {
 
         let pts = self.pts_counter;
         self.pts_counter += 1;
-        self.pos = end;
 
         Ok(Some(videoforge_engine::codecs::nvdec::BitstreamPacket {
             data: chunk,
@@ -953,5 +999,300 @@ impl videoforge_engine::codecs::nvenc::BitstreamSink for FileBitstreamSink {
         self.file
             .flush()
             .map_err(|e| videoforge_engine::error::EngineError::Encode(e.to_string()))
+    }
+}
+
+#[cfg(feature = "native_engine")]
+struct SoftwareBitstreamEncoder {
+    child: Option<std::process::Child>,
+    stdin: Option<std::process::ChildStdin>,
+    ctx: Arc<videoforge_engine::core::context::GpuContext>,
+    width: usize,
+    height: usize,
+    tight_nv12: Vec<u8>,
+}
+
+#[cfg(feature = "native_engine")]
+impl SoftwareBitstreamEncoder {
+    fn new(
+        ctx: Arc<videoforge_engine::core::context::GpuContext>,
+        output_path: &Path,
+        width: u32,
+        height: u32,
+        fps_num: u32,
+        fps_den: u32,
+    ) -> videoforge_engine::error::Result<Self> {
+        use std::process::{Command, Stdio};
+
+        let fps_den = fps_den.max(1);
+        let codec = match output_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("h264") | Some("264") => "libx264",
+            _ => "libx265",
+        };
+        let format = if codec == "libx264" { "h264" } else { "hevc" };
+
+        let mut cmd = Command::new("ffmpeg");
+        cmd.arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-y")
+            .arg("-f")
+            .arg("rawvideo")
+            .arg("-pix_fmt")
+            .arg("nv12")
+            .arg("-s:v")
+            .arg(format!("{width}x{height}"))
+            .arg("-framerate")
+            .arg(format!("{fps_num}/{fps_den}"))
+            .arg("-i")
+            .arg("-")
+            .arg("-an")
+            .arg("-c:v")
+            .arg(codec)
+            .arg("-preset")
+            .arg("medium")
+            .arg("-f")
+            .arg(format)
+            .arg(output_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| {
+            videoforge_engine::error::EngineError::Encode(format!(
+                "Software encode fallback unavailable (failed to launch ffmpeg): {e}"
+            ))
+        })?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            videoforge_engine::error::EngineError::Encode(
+                "Software encode fallback stdin unavailable".into(),
+            )
+        })?;
+
+        Ok(Self {
+            child: Some(child),
+            stdin: Some(stdin),
+            ctx,
+            width: width as usize,
+            height: height as usize,
+            tight_nv12: Vec::new(),
+        })
+    }
+
+    fn tight_size_bytes(&self) -> usize {
+        self.width * self.height * 3 / 2
+    }
+
+    fn repack_nv12_tight(
+        &mut self,
+        src: &[u8],
+        src_pitch: usize,
+    ) -> videoforge_engine::error::Result<&[u8]> {
+        let y_size_tight = self.width * self.height;
+        let uv_size_tight = y_size_tight / 2;
+        let total_tight = y_size_tight + uv_size_tight;
+        let src_required = src_pitch * self.height * 3 / 2;
+        if src.len() < src_required {
+            return Err(videoforge_engine::error::EngineError::Encode(format!(
+                "Software encoder readback too small: got {} bytes, need at least {} bytes",
+                src.len(),
+                src_required
+            )));
+        }
+
+        self.tight_nv12.resize(total_tight, 0);
+        for row in 0..self.height {
+            let src_off = row * src_pitch;
+            let dst_off = row * self.width;
+            self.tight_nv12[dst_off..dst_off + self.width]
+                .copy_from_slice(&src[src_off..src_off + self.width]);
+        }
+
+        let uv_src_base = src_pitch * self.height;
+        let uv_dst_base = y_size_tight;
+        for row in 0..(self.height / 2) {
+            let src_off = uv_src_base + row * src_pitch;
+            let dst_off = uv_dst_base + row * self.width;
+            self.tight_nv12[dst_off..dst_off + self.width]
+                .copy_from_slice(&src[src_off..src_off + self.width]);
+        }
+
+        Ok(&self.tight_nv12)
+    }
+}
+
+#[cfg(feature = "native_engine")]
+impl videoforge_engine::engine::pipeline::FrameEncoder for SoftwareBitstreamEncoder {
+    fn encode(
+        &mut self,
+        frame: videoforge_engine::core::types::FrameEnvelope,
+    ) -> videoforge_engine::error::Result<()> {
+        use std::io::Write;
+
+        if frame.texture.format != videoforge_engine::core::types::PixelFormat::Nv12 {
+            return Err(videoforge_engine::error::EngineError::Encode(format!(
+                "Software fallback encoder expected NV12 frame, got {:?}",
+                frame.texture.format
+            )));
+        }
+
+        self.ctx.sync_all()?;
+        let host = self.ctx.device().dtoh_sync_copy(&*frame.texture.data).map_err(|e| {
+            videoforge_engine::error::EngineError::Encode(format!(
+                "Software fallback DtoH readback failed: {e}"
+            ))
+        })?;
+
+        let payload: Vec<u8> = if frame.texture.pitch == self.width {
+            let tight = self.tight_size_bytes();
+            if host.len() < tight {
+                return Err(videoforge_engine::error::EngineError::Encode(format!(
+                    "Software encoder readback too small for tight NV12: got {} bytes, need {} bytes",
+                    host.len(),
+                    tight
+                )));
+            }
+            host[..tight].to_vec()
+        } else {
+            self.repack_nv12_tight(&host, frame.texture.pitch)?.to_vec()
+        };
+
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            videoforge_engine::error::EngineError::Encode(
+                "Software fallback encoder stdin closed".into(),
+            )
+        })?;
+        stdin.write_all(&payload).map_err(|e| {
+            videoforge_engine::error::EngineError::Encode(format!(
+                "Software fallback failed writing frame to ffmpeg stdin: {e}"
+            ))
+        })
+    }
+
+    fn flush(&mut self) -> videoforge_engine::error::Result<()> {
+        drop(self.stdin.take());
+        let child = self.child.take().ok_or_else(|| {
+            videoforge_engine::error::EngineError::Encode(
+                "Software fallback process missing".into(),
+            )
+        })?;
+        let output = child.wait_with_output().map_err(|e| {
+            videoforge_engine::error::EngineError::Encode(format!(
+                "Software fallback failed waiting for ffmpeg exit: {e}"
+            ))
+        })?;
+        if !output.status.success() {
+            return Err(videoforge_engine::error::EngineError::Encode(format!(
+                "Software fallback ffmpeg exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "native_engine")]
+enum NativeVideoEncoder {
+    Nvenc(videoforge_engine::codecs::nvenc::NvEncoder),
+    Software(SoftwareBitstreamEncoder),
+}
+
+#[cfg(feature = "native_engine")]
+struct NativeVideoEncoderConfig {
+    ctx: Arc<videoforge_engine::core::context::GpuContext>,
+    output_path: PathBuf,
+    enc_config: videoforge_engine::codecs::nvenc::NvEncConfig,
+}
+
+#[cfg(feature = "native_engine")]
+struct NativeVideoEncoderWrapper {
+    inner: NativeVideoEncoder,
+    fallback: NativeVideoEncoderConfig,
+}
+
+#[cfg(feature = "native_engine")]
+impl NativeVideoEncoderWrapper {
+    fn new(
+        ctx: Arc<videoforge_engine::core::context::GpuContext>,
+        cuda_ctx: *mut std::ffi::c_void,
+        sink: Box<dyn videoforge_engine::codecs::nvenc::BitstreamSink>,
+        config: videoforge_engine::codecs::nvenc::NvEncConfig,
+        output_path: PathBuf,
+    ) -> videoforge_engine::error::Result<Self> {
+        let fallback = NativeVideoEncoderConfig {
+            ctx,
+            output_path,
+            enc_config: config.clone(),
+        };
+        match videoforge_engine::codecs::nvenc::NvEncoder::new(cuda_ctx, sink, config) {
+            Ok(enc) => Ok(Self {
+                inner: NativeVideoEncoder::Nvenc(enc),
+                fallback,
+            }),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    output = %fallback.output_path.display(),
+                    "NVENC init failed; falling back to software bitstream encoder"
+                );
+                Ok(Self {
+                    inner: NativeVideoEncoder::Software(SoftwareBitstreamEncoder::new(
+                        fallback.ctx.clone(),
+                        &fallback.output_path,
+                        fallback.enc_config.width,
+                        fallback.enc_config.height,
+                        fallback.enc_config.fps_num,
+                        fallback.enc_config.fps_den,
+                    )?),
+                    fallback,
+                })
+            }
+        }
+    }
+}
+
+#[cfg(feature = "native_engine")]
+impl videoforge_engine::engine::pipeline::FrameEncoder for NativeVideoEncoderWrapper {
+    fn encode(
+        &mut self,
+        frame: videoforge_engine::core::types::FrameEnvelope,
+    ) -> videoforge_engine::error::Result<()> {
+        match &mut self.inner {
+            NativeVideoEncoder::Nvenc(enc) => match enc.encode(frame.clone()) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        output = %self.fallback.output_path.display(),
+                        "NVENC encode failed; switching to software bitstream encoder"
+                    );
+                    let mut software = SoftwareBitstreamEncoder::new(
+                        self.fallback.ctx.clone(),
+                        &self.fallback.output_path,
+                        self.fallback.enc_config.width,
+                        self.fallback.enc_config.height,
+                        self.fallback.enc_config.fps_num,
+                        self.fallback.enc_config.fps_den,
+                    )?;
+                    software.encode(frame)?;
+                    self.inner = NativeVideoEncoder::Software(software);
+                    Ok(())
+                }
+            },
+            NativeVideoEncoder::Software(enc) => enc.encode(frame),
+        }
+    }
+
+    fn flush(&mut self) -> videoforge_engine::error::Result<()> {
+        match &mut self.inner {
+            NativeVideoEncoder::Nvenc(enc) => enc.flush(),
+            NativeVideoEncoder::Software(enc) => enc.flush(),
+        }
     }
 }

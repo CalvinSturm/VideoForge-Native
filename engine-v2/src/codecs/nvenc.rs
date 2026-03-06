@@ -1,4 +1,4 @@
-//! NVENC hardware encoder — zero-copy GPU-resident NV12 input.
+//! NVENC hardware encoder for GPU-resident NV12 input.
 //!
 //! # Architecture
 //!
@@ -17,11 +17,13 @@
 //!                                    nvEncUnmapInputResource
 //! ```
 //!
-//! # Zero-copy input
+//! # Input strategy
 //!
-//! The NV12 `GpuTexture` device pointer is registered directly as an NVENC
-//! input resource via `nvEncRegisterResource(CUDADEVICEPTR)`.  No host
-//! staging, no intermediate copies (the NVENC ASIC reads from device memory).
+//! The preferred path registers the NV12 `GpuTexture` device pointer directly
+//! as an NVENC input resource via `nvEncRegisterResource(CUDADEVICEPTR)`.
+//! Some runtime and driver combinations reject that path, so the encoder can
+//! fall back to a legacy CUDA staging surface and register that surface
+//! instead.
 //!
 //! # Resource registration strategy
 //!
@@ -169,10 +171,6 @@ pub struct NvEncoder {
     legacy_staging_ptr: CUdeviceptr,
     /// Whether to force legacy staging for all frames.
     use_legacy_staging: bool,
-    /// Whether to bypass register/map and use NVENC-owned input buffer copies.
-    use_owned_input_buffer: bool,
-    /// NVENC-owned input buffer handle used by fallback path.
-    owned_input_buffer: *mut c_void,
     /// Frame counter for encode ordering.
     frame_idx: u32,
 }
@@ -183,13 +181,6 @@ unsafe impl Send for NvEncoder {}
 
 fn ptr_hex(ptr: *mut c_void) -> String {
     format!("{ptr:p}")
-}
-
-fn current_cuda_ctx_ptr() -> CUcontext {
-    let mut ctx: CUcontext = ptr::null_mut();
-    // Best-effort diagnostics only; keep callsites non-fallible.
-    let _ = unsafe { cuCtxGetCurrent(&mut ctx) };
-    ctx
 }
 
 fn guid_short(guid: GUID) -> String {
@@ -705,14 +696,12 @@ impl NvEncoder {
         bs_params.version = struct_version(1);
 
         // SAFETY: bs_params is initialized. NVENC allocates the buffer.
-        info!("NVENC creating bitstream buffer");
         unsafe {
             check_nvenc(
                 create_bs_fn(encoder, &mut bs_params),
                 "nvEncCreateBitstreamBuffer",
             )?;
         }
-        info!("NVENC created bitstream buffer");
 
         let bitstream_buf = bs_params.bitstreamBuffer;
         debug!("NVENC bitstream buffer created");
@@ -728,8 +717,6 @@ impl NvEncoder {
             nvenc_api_version: api_version,
             legacy_staging_ptr: 0,
             use_legacy_staging: false,
-            use_owned_input_buffer: false,
-            owned_input_buffer: ptr::null_mut(),
             frame_idx: 0,
         })
     }
@@ -820,133 +807,6 @@ impl NvEncoder {
         Ok(dst_dev_ptr)
     }
 
-    fn ensure_owned_input_buffer(&mut self) -> Result<*mut c_void> {
-        if !self.owned_input_buffer.is_null() {
-            return Ok(self.owned_input_buffer);
-        }
-        let create_input_fn = self
-            .fns
-            .nvEncCreateInputBuffer
-            .ok_or_else(|| EngineError::Encode("nvEncCreateInputBuffer not found".into()))?;
-
-        let mut create_input: NV_ENC_CREATE_INPUT_BUFFER = unsafe { std::mem::zeroed() };
-        create_input.version = self.struct_version(1);
-        create_input.width = self.config.width;
-        create_input.height = self.config.height;
-        create_input.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
-        create_input.memoryHeap = 0;
-        create_input.inputBuffer = ptr::null_mut();
-
-        unsafe {
-            check_nvenc(
-                create_input_fn(self.encoder, &mut create_input),
-                "nvEncCreateInputBuffer",
-            )?;
-        }
-        self.owned_input_buffer = create_input.inputBuffer;
-        info!(
-            input_buffer = %ptr_hex(self.owned_input_buffer),
-            width = self.config.width,
-            height = self.config.height,
-            "NVENC owned input buffer created"
-        );
-        Ok(self.owned_input_buffer)
-    }
-
-    fn copy_to_owned_input_buffer(
-        &mut self,
-        src_dev_ptr: u64,
-        src_pitch: u32,
-        width: u32,
-        height: u32,
-    ) -> Result<(*mut c_void, u32)> {
-        let input_buffer = self.ensure_owned_input_buffer()?;
-        let lock_input_fn = self
-            .fns
-            .nvEncLockInputBuffer
-            .ok_or_else(|| EngineError::Encode("nvEncLockInputBuffer not found".into()))?;
-        let unlock_input_fn = self
-            .fns
-            .nvEncUnlockInputBuffer
-            .ok_or_else(|| EngineError::Encode("nvEncUnlockInputBuffer not found".into()))?;
-
-        let mut lock_input: NV_ENC_LOCK_INPUT_BUFFER = unsafe { std::mem::zeroed() };
-        lock_input.version = self.struct_version(1);
-        lock_input.inputBuffer = input_buffer;
-
-        unsafe {
-            check_nvenc(
-                lock_input_fn(self.encoder, &mut lock_input),
-                "nvEncLockInputBuffer",
-            )?;
-        }
-
-        let dst_pitch = lock_input.pitch;
-        let dst_ptr = lock_input.bufferDataPtr as *mut u8;
-
-        let y_copy = CUDA_MEMCPY2D {
-            srcXInBytes: 0,
-            srcY: 0,
-            srcMemoryType: CUmemorytype::Device,
-            srcHost: ptr::null(),
-            srcDevice: src_dev_ptr as CUdeviceptr,
-            srcArray: ptr::null_mut(),
-            srcPitch: src_pitch as usize,
-            dstXInBytes: 0,
-            dstY: 0,
-            dstMemoryType: CUmemorytype::Host,
-            dstHost: dst_ptr as *mut c_void,
-            dstDevice: 0,
-            dstArray: ptr::null_mut(),
-            dstPitch: dst_pitch as usize,
-            WidthInBytes: width as usize,
-            Height: height as usize,
-        };
-
-        let uv_src = (src_dev_ptr + (src_pitch as u64 * height as u64)) as CUdeviceptr;
-        let uv_dst = unsafe { dst_ptr.add((dst_pitch * height) as usize) };
-        let uv_copy = CUDA_MEMCPY2D {
-            srcXInBytes: 0,
-            srcY: 0,
-            srcMemoryType: CUmemorytype::Device,
-            srcHost: ptr::null(),
-            srcDevice: uv_src,
-            srcArray: ptr::null_mut(),
-            srcPitch: src_pitch as usize,
-            dstXInBytes: 0,
-            dstY: 0,
-            dstMemoryType: CUmemorytype::Host,
-            dstHost: uv_dst as *mut c_void,
-            dstDevice: 0,
-            dstArray: ptr::null_mut(),
-            dstPitch: dst_pitch as usize,
-            WidthInBytes: width as usize,
-            Height: (height / 2) as usize,
-        };
-
-        let copy_res = unsafe {
-            check_cu_encode(
-                cuMemcpy2D_v2(&y_copy as *const _),
-                "cuMemcpy2D_v2 Y (nvenc owned input)",
-            )?;
-            check_cu_encode(
-                cuMemcpy2D_v2(&uv_copy as *const _),
-                "cuMemcpy2D_v2 UV (nvenc owned input)",
-            )
-        };
-
-        let unlock_res = unsafe {
-            check_nvenc(
-                unlock_input_fn(self.encoder, input_buffer),
-                "nvEncUnlockInputBuffer",
-            )
-        };
-
-        copy_res?;
-        unlock_res?;
-        Ok((input_buffer, dst_pitch))
-    }
-
     /// Register a CUDA device pointer as an NVENC input resource.
     fn register_resource(
         &mut self,
@@ -986,71 +846,14 @@ impl NvEncoder {
         reg.width = width;
         reg.height = height;
         reg.pitch = pitch;
-        reg.subResourceIndex = 0;
         reg.resourceToRegister = dev_ptr as *mut c_void;
         reg.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
-        reg.bufferUsage = NV_ENC_INPUT_IMAGE;
-        // Newer SDK layouts expose explicit chroma offsets; provide NV12 UV
-        // plane byte offset from the luma base to avoid INVALID_PARAM on
-        // drivers that validate these fields for external resources.
-        let uv_offset = pitch.saturating_mul(height);
-        reg.chromaOffset[0] = uv_offset;
-        reg.chromaOffset[1] = 0;
-        reg.chromaOffsetIn[0] = uv_offset;
-        reg.chromaOffsetIn[1] = 0;
+        reg.version = self.struct_version(1);
 
         // SAFETY: reg is fully initialized. NVENC validates the device pointer.
-        let thread_id = std::thread::current().id();
-        let current_ctx = current_cuda_ctx_ptr();
-        let version_probe = [1u32, 5, 4, 3, 2];
-        let mut last_status = NV_ENC_ERR_INVALID_PARAM;
-        let mut used_ver = 1u32;
-        let mut ok = false;
-        for ver in version_probe {
-            reg.version = self.struct_version(ver);
-            info!(
-                phase = "enter",
-                ?thread_id,
-                reg_version = format_args!("{:#010x}", reg.version),
-                reg_struct_ver = ver,
-                current_cuda_ctx = %ptr_hex(current_ctx as *mut c_void),
-                target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
-                dev_ptr = %format_args!("{:#x}", dev_ptr),
-                pitch,
-                width,
-                height,
-                "NVENC register resource boundary"
-            );
-            let status = unsafe { reg_fn(self.encoder, &mut reg) };
-            if status == NV_ENC_SUCCESS {
-                used_ver = ver;
-                ok = true;
-                break;
-            }
-            last_status = status;
-            warn!(
-                reg_struct_ver = ver,
-                reg_version = format_args!("{:#010x}", reg.version),
-                status = status as i32,
-                "NVENC register resource version probe failed"
-            );
+        unsafe {
+            check_nvenc(reg_fn(self.encoder, &mut reg), "nvEncRegisterResource")?;
         }
-        if !ok {
-            return Err(EngineError::Encode(format!(
-                "nvEncRegisterResource: all probed struct versions failed (last status {})",
-                last_status as i32
-            )));
-        }
-        info!(
-            phase = "exit",
-            ?thread_id,
-            reg_struct_ver = used_ver,
-            current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
-            target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
-            dev_ptr = %format_args!("{:#x}", dev_ptr),
-            handle = %ptr_hex(reg.registeredResource),
-            "NVENC register resource boundary"
-        );
 
         let handle = reg.registeredResource;
         self.reg_cache.insert(dev_ptr, handle);
@@ -1068,109 +871,66 @@ impl NvEncoder {
 
         let mut dev_ptr = input_dev_ptr;
         let mut pitch = input_pitch;
-        let mut mapped_resource: *mut c_void = ptr::null_mut();
-        let mut used_registered_mapping = false;
         let encode_input_buffer: *mut c_void;
 
-        if self.use_owned_input_buffer {
-            let (input_buffer, input_buffer_pitch) =
-                self.copy_to_owned_input_buffer(input_dev_ptr, input_pitch, width, height)?;
-            encode_input_buffer = input_buffer;
-            pitch = input_buffer_pitch;
-        } else {
-            // Get or create registration. If direct registration is rejected, fallback
-            // to NVENC-owned input buffer path that bypasses register/map.
-            let reg_handle = if self.use_legacy_staging {
-                dev_ptr = self.copy_to_legacy_staging(input_dev_ptr, input_pitch, width, height)?;
-                pitch = self.config.nv12_pitch;
-                match self.reg_cache.get(dev_ptr) {
-                    Some(h) => h,
-                    None => self.register_resource(dev_ptr, pitch, width, height)?,
-                }
-            } else {
-                match self.reg_cache.get(dev_ptr) {
-                    Some(h) => h,
-                    None => match self.register_resource(dev_ptr, pitch, width, height) {
-                        Ok(h) => h,
-                        Err(EngineError::Encode(msg))
-                            if msg.contains("NV_ENC_ERR_INVALID_PARAM")
-                                || msg.contains("last status 8")
-                                || msg.contains("all probed struct versions failed") =>
-                        {
-                            warn!(
-                                dev_ptr = %format_args!("{:#x}", dev_ptr),
-                                pitch,
-                                width,
-                                height,
-                                err = %msg,
-                                "NVENC direct resource registration rejected; enabling owned-input-buffer fallback"
-                            );
-                            self.use_owned_input_buffer = true;
-                            // Sentinel; mapping branch is skipped after mode switch.
-                            ptr::null_mut()
-                        }
-                        Err(e) => return Err(e),
-                    },
-                }
-            };
-
-            if !self.use_owned_input_buffer {
-                // Map input resource.
-                let map_fn = self
-                    .fns
-                    .nvEncMapInputResource
-                    .ok_or_else(|| EngineError::Encode("nvEncMapInputResource not found".into()))?;
-
-                let mut map_params: NV_ENC_MAP_INPUT_RESOURCE = unsafe { std::mem::zeroed() };
-                map_params.version = self.struct_version(1);
-                map_params.subResourceIndex = 0;
-                // Populate both legacy and current handles for compatibility
-                // across NVENC header versions.
-                map_params.inputResource = reg_handle;
-                map_params.registeredResource = reg_handle;
-
-                // SAFETY: reg_handle is valid (from nvEncRegisterResource).
-                let thread_id = std::thread::current().id();
-                info!(
-                    phase = "enter",
-                    ?thread_id,
-                    map_version = format_args!("{:#010x}", map_params.version),
-                    current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
-                    target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
-                    reg_handle = %ptr_hex(reg_handle),
-                    dev_ptr = %format_args!("{:#x}", dev_ptr),
-                    pitch,
-                    width,
-                    height,
-                    "NVENC map input resource boundary"
-                );
-                unsafe {
-                    check_nvenc(
-                        map_fn(self.encoder, &mut map_params),
-                        "nvEncMapInputResource",
-                    )?;
-                }
-                info!(
-                    phase = "exit",
-                    ?thread_id,
-                    current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
-                    target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
-                    reg_handle = %ptr_hex(reg_handle),
-                    mapped_resource = %ptr_hex(map_params.mappedResource),
-                    dev_ptr = %format_args!("{:#x}", dev_ptr),
-                    "NVENC map input resource boundary"
-                );
-                mapped_resource = map_params.mappedResource;
-                encode_input_buffer = mapped_resource;
-                used_registered_mapping = true;
-            } else {
-                // Registration failure switched us into owned-input mode in this same frame.
-                let (input_buffer, input_buffer_pitch) =
-                    self.copy_to_owned_input_buffer(input_dev_ptr, input_pitch, width, height)?;
-                encode_input_buffer = input_buffer;
-                pitch = input_buffer_pitch;
+        // Get or create registration. If direct registration is rejected, fall back
+        // to a legacy CUDA staging surface and register that surface instead.
+        let reg_handle = if self.use_legacy_staging {
+            dev_ptr = self.copy_to_legacy_staging(input_dev_ptr, input_pitch, width, height)?;
+            pitch = self.config.nv12_pitch;
+            match self.reg_cache.get(dev_ptr) {
+                Some(h) => h,
+                None => self.register_resource(dev_ptr, pitch, width, height)?,
             }
+        } else {
+            match self.reg_cache.get(dev_ptr) {
+                Some(h) => h,
+                None => match self.register_resource(dev_ptr, pitch, width, height) {
+                    Ok(h) => h,
+                    Err(EngineError::Encode(msg))
+                        if msg.contains("NV_ENC_ERR_INVALID_PARAM")
+                            || msg.contains("last status 8")
+                            || msg.contains("all probed struct versions failed") =>
+                    {
+                        warn!(
+                            dev_ptr = %format_args!("{:#x}", dev_ptr),
+                            pitch,
+                            width,
+                            height,
+                            err = %msg,
+                            "NVENC direct resource registration rejected; enabling legacy-staging fallback"
+                        );
+                        self.use_legacy_staging = true;
+                        dev_ptr = self.copy_to_legacy_staging(input_dev_ptr, input_pitch, width, height)?;
+                        pitch = self.config.nv12_pitch;
+                        match self.reg_cache.get(dev_ptr) {
+                            Some(h) => h,
+                            None => self.register_resource(dev_ptr, pitch, width, height)?,
+                        }
+                    }
+                    Err(e) => return Err(e),
+                },
+            }
+        };
+
+        let map_fn = self
+            .fns
+            .nvEncMapInputResource
+            .ok_or_else(|| EngineError::Encode("nvEncMapInputResource not found".into()))?;
+
+        let mut map_params: NV_ENC_MAP_INPUT_RESOURCE = unsafe { std::mem::zeroed() };
+        map_params.version = self.struct_version(1);
+        map_params.subResourceIndex = 0;
+        map_params.registeredResource = reg_handle;
+
+        unsafe {
+            check_nvenc(
+                map_fn(self.encoder, &mut map_params),
+                "nvEncMapInputResource",
+            )?;
         }
+        let mapped_resource = map_params.mappedResource;
+        encode_input_buffer = mapped_resource;
 
         // Encode.
         let encode_fn = self
@@ -1196,32 +956,10 @@ impl NvEncoder {
         }
 
         // SAFETY: All pointers are valid NVENC-owned handles.
-        let thread_id = std::thread::current().id();
-        info!(
-            phase = "enter",
-            ?thread_id,
-            current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
-            target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
-            dev_ptr = %format_args!("{:#x}", dev_ptr),
-            pitch,
-            width,
-            height,
-            frame_idx = self.frame_idx,
-            "NVENC encode picture boundary"
-        );
         let encode_status = unsafe { encode_fn(self.encoder, &mut pic_params) };
         if encode_status != NV_ENC_SUCCESS && encode_status != NV_ENC_ERR_NEED_MORE_INPUT {
             check_nvenc(encode_status, "nvEncEncodePicture")?;
         }
-        info!(
-            phase = "exit",
-            ?thread_id,
-            current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
-            target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
-            dev_ptr = %format_args!("{:#x}", dev_ptr),
-            frame_idx = self.frame_idx,
-            "NVENC encode picture boundary"
-        );
 
         self.frame_idx += 1;
 
@@ -1230,17 +968,15 @@ impl NvEncoder {
                 frame_idx = self.frame_idx,
                 "NVENC encode returned NEED_MORE_INPUT; waiting for additional frames"
             );
-            if used_registered_mapping {
-                let unmap_fn = self
-                    .fns
-                    .nvEncUnmapInputResource
-                    .ok_or_else(|| EngineError::Encode("nvEncUnmapInputResource not found".into()))?;
-                unsafe {
-                    check_nvenc(
-                        unmap_fn(self.encoder, mapped_resource),
-                        "nvEncUnmapInputResource",
-                    )?;
-                }
+            let unmap_fn = self
+                .fns
+                .nvEncUnmapInputResource
+                .ok_or_else(|| EngineError::Encode("nvEncUnmapInputResource not found".into()))?;
+            unsafe {
+                check_nvenc(
+                    unmap_fn(self.encoder, mapped_resource),
+                    "nvEncUnmapInputResource",
+                )?;
             }
             return Ok(());
         }
@@ -1260,29 +996,12 @@ impl NvEncoder {
         lock_params.outputBitstream = self.bitstream_buf;
 
         // SAFETY: bitstream_buf is valid (from nvEncCreateBitstreamBuffer).
-        let thread_id = std::thread::current().id();
-        info!(
-            phase = "enter",
-            ?thread_id,
-            current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
-            target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
-            bitstream_buf = %ptr_hex(self.bitstream_buf),
-            "NVENC lock bitstream boundary"
-        );
         unsafe {
             check_nvenc(
                 lock_fn(self.encoder, &mut lock_params),
                 "nvEncLockBitstream",
             )?;
         }
-        info!(
-            phase = "exit",
-            ?thread_id,
-            current_cuda_ctx = %ptr_hex(current_cuda_ctx_ptr() as *mut c_void),
-            target_cuda_ctx = %ptr_hex(self.cuda_context as *mut c_void),
-            bytes = lock_params.bitstreamSizeInBytes,
-            "NVENC lock bitstream boundary"
-        );
 
         // Copy encoded data to sink.
         let is_idr = lock_params.pictureType == NV_ENC_PIC_TYPE_IDR;
@@ -1298,31 +1017,25 @@ impl NvEncoder {
 
         // Unlock regardless of sink result.
         // SAFETY: bitstream_buf was locked above.
-        info!("NVENC unlock bitstream");
         unsafe {
             check_nvenc(
                 unlock_fn(self.encoder, self.bitstream_buf),
                 "nvEncUnlockBitstream",
             )?;
         }
-        info!("NVENC unlock bitstream ok");
 
         // Unmap input resource.
-        if used_registered_mapping {
-            let unmap_fn = self
-                .fns
-                .nvEncUnmapInputResource
-                .ok_or_else(|| EngineError::Encode("nvEncUnmapInputResource not found".into()))?;
+        let unmap_fn = self
+            .fns
+            .nvEncUnmapInputResource
+            .ok_or_else(|| EngineError::Encode("nvEncUnmapInputResource not found".into()))?;
 
-            // SAFETY: mapped_resource is valid (from nvEncMapInputResource).
-            info!("NVENC unmap input resource");
-            unsafe {
-                check_nvenc(
-                    unmap_fn(self.encoder, mapped_resource),
-                    "nvEncUnmapInputResource",
-                )?;
-            }
-            info!("NVENC unmap input resource ok");
+        // SAFETY: mapped_resource is valid (from nvEncMapInputResource).
+        unsafe {
+            check_nvenc(
+                unmap_fn(self.encoder, mapped_resource),
+                "nvEncUnmapInputResource",
+            )?;
         }
 
         sink_result
@@ -1354,7 +1067,6 @@ impl NvEncoder {
 
 impl FrameEncoder for NvEncoder {
     fn encode(&mut self, frame: FrameEnvelope) -> Result<()> {
-        info!(pts = frame.pts, "NVENC encode() called");
         if frame.texture.format != PixelFormat::Nv12 {
             return Err(EngineError::FormatMismatch {
                 expected: PixelFormat::Nv12,
@@ -1375,12 +1087,10 @@ impl FrameEncoder for NvEncoder {
 impl Drop for NvEncoder {
     fn drop(&mut self) {
         let _ctx_guard = CudaContextGuard::make_current(self.cuda_context).ok();
-        info!("NVENC drop: begin");
         // Unregister all cached resources.
         if let Some(unreg_fn) = self.fns.nvEncUnregisterResource {
             for handle in self.reg_cache.handles().collect::<Vec<_>>() {
                 // SAFETY: handle was registered via nvEncRegisterResource.
-                info!("NVENC drop: unregister resource");
                 unsafe {
                     unreg_fn(self.encoder, handle);
                 }
@@ -1391,7 +1101,6 @@ impl Drop for NvEncoder {
         if !self.bitstream_buf.is_null() {
             if let Some(destroy_fn) = self.fns.nvEncDestroyBitstreamBuffer {
                 // SAFETY: bitstream_buf was created via nvEncCreateBitstreamBuffer.
-                info!("NVENC drop: destroy bitstream buffer");
                 unsafe {
                     destroy_fn(self.encoder, self.bitstream_buf);
                 }
@@ -1399,40 +1108,20 @@ impl Drop for NvEncoder {
         }
 
         if self.legacy_staging_ptr != 0 {
-            info!(
-                ptr = %format_args!("{:#x}", self.legacy_staging_ptr),
-                "NVENC drop: free legacy staging"
-            );
             unsafe {
                 let _ = cuMemFree_v2(self.legacy_staging_ptr);
             }
             self.legacy_staging_ptr = 0;
         }
 
-        if !self.owned_input_buffer.is_null() {
-            if let Some(destroy_input_fn) = self.fns.nvEncDestroyInputBuffer {
-                info!(
-                    input_buffer = %ptr_hex(self.owned_input_buffer),
-                    "NVENC drop: destroy owned input buffer"
-                );
-                unsafe {
-                    destroy_input_fn(self.encoder, self.owned_input_buffer);
-                }
-            }
-            self.owned_input_buffer = ptr::null_mut();
-        }
-
         // Destroy encoder session.
         if !self.encoder.is_null() {
             if let Some(destroy_fn) = self.fns.nvEncDestroyEncoder {
                 // SAFETY: encoder was opened via nvEncOpenEncodeSessionEx.
-                info!("NVENC drop: destroy encoder");
                 unsafe {
                     destroy_fn(self.encoder);
                 }
             }
         }
-
-        info!("NVENC drop: complete");
     }
 }
