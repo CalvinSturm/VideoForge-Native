@@ -779,6 +779,7 @@ async fn run_engine_pipeline(
         .map_err(|e| make_err("ENCODER_INIT", &format!("cuCtxGetCurrent failed: {}", e)))?;
     let encoder = NativeVideoEncoderWrapper::new(
         ctx.clone(),
+        ffmpeg_cmd.clone(),
         cuda_ctx,
         Box::new(sink),
         enc_config,
@@ -1016,6 +1017,7 @@ struct SoftwareBitstreamEncoder {
 impl SoftwareBitstreamEncoder {
     fn new(
         ctx: Arc<videoforge_engine::core::context::GpuContext>,
+        ffmpeg_cmd: &str,
         output_path: &Path,
         width: u32,
         height: u32,
@@ -1036,7 +1038,7 @@ impl SoftwareBitstreamEncoder {
         };
         let format = if codec == "libx264" { "h264" } else { "hevc" };
 
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = Command::new(ffmpeg_cmd);
         cmd.arg("-hide_banner")
             .arg("-loglevel")
             .arg("error")
@@ -1206,20 +1208,23 @@ enum NativeVideoEncoder {
 #[cfg(feature = "native_engine")]
 struct NativeVideoEncoderConfig {
     ctx: Arc<videoforge_engine::core::context::GpuContext>,
+    ffmpeg_cmd: String,
     output_path: PathBuf,
     enc_config: videoforge_engine::codecs::nvenc::NvEncConfig,
 }
 
 #[cfg(feature = "native_engine")]
 struct NativeVideoEncoderWrapper {
-    inner: NativeVideoEncoder,
+    inner: Option<NativeVideoEncoder>,
     fallback: NativeVideoEncoderConfig,
+    frames_encoded: u64,
 }
 
 #[cfg(feature = "native_engine")]
 impl NativeVideoEncoderWrapper {
     fn new(
         ctx: Arc<videoforge_engine::core::context::GpuContext>,
+        ffmpeg_cmd: String,
         cuda_ctx: *mut std::ffi::c_void,
         sink: Box<dyn videoforge_engine::codecs::nvenc::BitstreamSink>,
         config: videoforge_engine::codecs::nvenc::NvEncConfig,
@@ -1227,13 +1232,15 @@ impl NativeVideoEncoderWrapper {
     ) -> videoforge_engine::error::Result<Self> {
         let fallback = NativeVideoEncoderConfig {
             ctx,
+            ffmpeg_cmd,
             output_path,
             enc_config: config.clone(),
         };
         match videoforge_engine::codecs::nvenc::NvEncoder::new(cuda_ctx, sink, config) {
             Ok(enc) => Ok(Self {
-                inner: NativeVideoEncoder::Nvenc(enc),
+                inner: Some(NativeVideoEncoder::Nvenc(enc)),
                 fallback,
+                frames_encoded: 0,
             }),
             Err(err) => {
                 tracing::warn!(
@@ -1242,15 +1249,17 @@ impl NativeVideoEncoderWrapper {
                     "NVENC init failed; falling back to software bitstream encoder"
                 );
                 Ok(Self {
-                    inner: NativeVideoEncoder::Software(SoftwareBitstreamEncoder::new(
+                    inner: Some(NativeVideoEncoder::Software(SoftwareBitstreamEncoder::new(
                         fallback.ctx.clone(),
+                        &fallback.ffmpeg_cmd,
                         &fallback.output_path,
                         fallback.enc_config.width,
                         fallback.enc_config.height,
                         fallback.enc_config.fps_num,
                         fallback.enc_config.fps_den,
-                    )?),
+                    )?)),
                     fallback,
+                    frames_encoded: 0,
                 })
             }
         }
@@ -1263,17 +1272,33 @@ impl videoforge_engine::engine::pipeline::FrameEncoder for NativeVideoEncoderWra
         &mut self,
         frame: videoforge_engine::core::types::FrameEnvelope,
     ) -> videoforge_engine::error::Result<()> {
-        match &mut self.inner {
-            NativeVideoEncoder::Nvenc(enc) => match enc.encode(frame.clone()) {
-                Ok(()) => Ok(()),
+        let inner = self.inner.take().ok_or_else(|| {
+            videoforge_engine::error::EngineError::Encode("Native encoder missing".into())
+        })?;
+        match inner {
+            NativeVideoEncoder::Nvenc(mut enc) => match enc.encode(frame.clone()) {
+                Ok(()) => {
+                    self.frames_encoded += 1;
+                    self.inner = Some(NativeVideoEncoder::Nvenc(enc));
+                    Ok(())
+                }
                 Err(err) => {
+                    if self.frames_encoded > 0 {
+                        self.inner = Some(NativeVideoEncoder::Nvenc(enc));
+                        return Err(videoforge_engine::error::EngineError::Encode(format!(
+                            "NVENC encode failed after {} frame(s); refusing mid-stream software fallback: {}",
+                            self.frames_encoded, err
+                        )));
+                    }
                     tracing::warn!(
                         error = %err,
                         output = %self.fallback.output_path.display(),
                         "NVENC encode failed; switching to software bitstream encoder"
                     );
+                    drop(enc);
                     let mut software = SoftwareBitstreamEncoder::new(
                         self.fallback.ctx.clone(),
+                        &self.fallback.ffmpeg_cmd,
                         &self.fallback.output_path,
                         self.fallback.enc_config.width,
                         self.fallback.enc_config.height,
@@ -1281,16 +1306,26 @@ impl videoforge_engine::engine::pipeline::FrameEncoder for NativeVideoEncoderWra
                         self.fallback.enc_config.fps_den,
                     )?;
                     software.encode(frame)?;
-                    self.inner = NativeVideoEncoder::Software(software);
+                    self.frames_encoded += 1;
+                    self.inner = Some(NativeVideoEncoder::Software(software));
                     Ok(())
                 }
             },
-            NativeVideoEncoder::Software(enc) => enc.encode(frame),
+            NativeVideoEncoder::Software(mut enc) => {
+                let result = enc.encode(frame);
+                if result.is_ok() {
+                    self.frames_encoded += 1;
+                }
+                self.inner = Some(NativeVideoEncoder::Software(enc));
+                result
+            }
         }
     }
 
     fn flush(&mut self) -> videoforge_engine::error::Result<()> {
-        match &mut self.inner {
+        match self.inner.as_mut().ok_or_else(|| {
+            videoforge_engine::error::EngineError::Encode("Native encoder missing".into())
+        })? {
             NativeVideoEncoder::Nvenc(enc) => enc.flush(),
             NativeVideoEncoder::Software(enc) => enc.flush(),
         }
