@@ -29,7 +29,7 @@
 //!
 //! `OutputRing` owns N pre-allocated device buffers.  `acquire()` checks
 //! `Arc::strong_count == 1` before returning a slot, guaranteeing no
-//! concurrent reader.  Ring size must be ≥ `downstream_channel_capacity + 2`.
+//! concurrent reader.  Ring size must be ≥ `downstream_channel_capacity + max_batch + 1`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,7 +53,7 @@ use cudarc::driver::{CudaSlice, DevicePtr};
 
 use crate::core::backend::{ModelMetadata, UpscaleBackend};
 use crate::core::context::GpuContext;
-use crate::core::types::{GpuTexture, PixelFormat};
+use crate::core::types::{GpuBuffer, GpuTexture, PixelFormat};
 use crate::error::{EngineError, Result};
 
 // Create an ORT tensor wrapper over an existing CUDA device buffer.
@@ -159,7 +159,11 @@ impl InferenceMetrics {
     }
 
     pub fn record(&self, elapsed_us: u64) {
-        self.frames_inferred.fetch_add(1, Ordering::Relaxed);
+        self.record_frames(1, elapsed_us);
+    }
+
+    pub fn record_frames(&self, frames: u64, elapsed_us: u64) {
+        self.frames_inferred.fetch_add(frames, Ordering::Relaxed);
         self.total_inference_us
             .fetch_add(elapsed_us, Ordering::Relaxed);
         self.peak_inference_us
@@ -233,7 +237,7 @@ pub struct OutputRing {
 impl OutputRing {
     /// Allocate `count` output buffers.
     ///
-    /// `min_slots` is the enforced minimum (`downstream_capacity + 2`).
+    /// `min_slots` is the enforced minimum (`downstream_capacity + max_batch + 1`).
     /// Returns error if `count < min_slots`.
     pub fn new(
         ctx: &GpuContext,
@@ -247,7 +251,7 @@ impl OutputRing {
         if count < min_slots {
             return Err(EngineError::DimensionMismatch(format!(
                 "OutputRing: ring_size ({count}) < required minimum ({min_slots}). \
-                 Ring must be ≥ downstream_channel_capacity + 2."
+                 Ring must be ≥ downstream_channel_capacity + max_batch + 1."
             )));
         }
         if count < 2 {
@@ -370,6 +374,11 @@ impl OutputRing {
     pub fn len(&self) -> usize {
         self.slots.len()
     }
+
+    /// Total bytes tracked by this ring for VRAM accounting.
+    pub fn accounted_bytes(&self) -> usize {
+        self.slot_bytes * self.slots.len()
+    }
 }
 
 // ─── Inference state ─────────────────────────────────────────────────────────
@@ -382,7 +391,7 @@ struct InferenceState {
 
 struct BatchBuffers {
     input: CudaSlice<u8>,
-    output: CudaSlice<u8>,
+    output: Arc<CudaSlice<u8>>,
     alloc_dims: (u32, u32),
     format: PixelFormat,
     max_batch: usize,
@@ -429,6 +438,32 @@ pub struct TensorRtBackend {
 }
 
 impl TensorRtBackend {
+    pub fn required_ring_slots(downstream_capacity: usize, max_batch: usize) -> usize {
+        downstream_capacity + max_batch.max(1) + 1
+    }
+
+    fn release_state_resources(&self, state: InferenceState) {
+        let InferenceState {
+            session,
+            ring,
+            batch_buffers,
+        } = state;
+
+        if let Some(batch_buffers) = batch_buffers {
+            self.ctx.recycle(batch_buffers.input);
+            if let Ok(output) = Arc::try_unwrap(batch_buffers.output) {
+                self.ctx.recycle(output);
+            }
+        }
+
+        if let Some(ring) = ring {
+            self.ctx.vram_dec(ring.accounted_bytes());
+            drop(ring);
+        }
+
+        drop(session);
+    }
+
     fn sample_output_bytes(meta: &ModelMetadata, input: &GpuTexture) -> usize {
         let out_w = input.width * meta.scale;
         let out_h = input.height * meta.scale;
@@ -489,14 +524,17 @@ impl TensorRtBackend {
         if needs_realloc {
             if let Some(old) = state.batch_buffers.take() {
                 self.ctx.recycle(old.input);
-                self.ctx.recycle(old.output);
+                if let Ok(output) = Arc::try_unwrap(old.output) {
+                    self.ctx.recycle(output);
+                }
             }
             let input_buf = self
                 .ctx
                 .alloc(sample_input_bytes * self.batch_config.max_batch)?;
-            let output_buf = self
-                .ctx
-                .alloc(sample_output_bytes * self.batch_config.max_batch)?;
+            let output_buf = Arc::new(
+                self.ctx
+                    .alloc(sample_output_bytes * self.batch_config.max_batch)?,
+            );
             state.batch_buffers = Some(BatchBuffers {
                 input: input_buf,
                 output: output_buf,
@@ -547,7 +585,7 @@ impl TensorRtBackend {
     ///
     /// - `ring_size`: number of output ring slots to pre-allocate.
     /// - `downstream_capacity`: the bounded channel capacity between inference
-    ///   and the encoder.  Ring size is validated ≥ `downstream_capacity + 2`.
+    ///   and the encoder.  Ring size is validated against batch-aware minimums.
     pub fn new(
         model_path: PathBuf,
         ctx: Arc<GpuContext>,
@@ -576,10 +614,10 @@ impl TensorRtBackend {
         precision_policy: PrecisionPolicy,
         batch_config: BatchConfig,
     ) -> Self {
-        let min_ring_slots = downstream_capacity + 2;
+        let min_ring_slots = Self::required_ring_slots(downstream_capacity, batch_config.max_batch);
         assert!(
             ring_size >= min_ring_slots,
-            "ring_size ({ring_size}) must be ≥ downstream_capacity + 2 ({min_ring_slots})"
+            "ring_size ({ring_size}) must be ≥ downstream_capacity + max_batch + 1 ({min_ring_slots})"
         );
         Self {
             model_path,
@@ -1144,7 +1182,7 @@ impl UpscaleBackend for TensorRtBackend {
         let elem_bytes = meta.output_format.element_bytes();
 
         Ok(GpuTexture {
-            data: output_arc,
+            data: GpuBuffer::from_arc(output_arc),
             width: out_w,
             height: out_h,
             pitch: (out_w as usize) * elem_bytes,
@@ -1152,12 +1190,12 @@ impl UpscaleBackend for TensorRtBackend {
         })
     }
 
-    async fn process_batch(&self, inputs: Vec<GpuTexture>) -> Result<Vec<GpuTexture>> {
+    async fn process_batch(&self, inputs: &[GpuTexture]) -> Result<Vec<GpuTexture>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
         if inputs.len() == 1 {
-            return Ok(vec![self.process(inputs.into_iter().next().unwrap()).await?]);
+            return Ok(vec![self.process(inputs[0].clone()).await?]);
         }
 
         let first = &inputs[0];
@@ -1170,7 +1208,7 @@ impl UpscaleBackend for TensorRtBackend {
             );
             let mut outputs = Vec::with_capacity(inputs.len());
             for input in inputs {
-                outputs.push(self.process(input).await?);
+                outputs.push(self.process(input.clone()).await?);
             }
             return Ok(outputs);
         }
@@ -1181,42 +1219,6 @@ impl UpscaleBackend for TensorRtBackend {
             EngineError::ModelMetadata(format!("bind_to_thread (backend process_batch): {:?}", e))
         })?;
         let state = guard.as_mut().ok_or(EngineError::NotInitialized)?;
-
-        match &mut state.ring {
-            Some(ring) if ring.needs_realloc(first.width, first.height) => {
-                debug!(
-                    old = ?ring.alloc_dims,
-                    new_w = first.width,
-                    new_h = first.height,
-                    "Reallocating output ring for batch"
-                );
-                ring.reallocate(
-                    &self.ctx,
-                    first.width,
-                    first.height,
-                    meta.scale,
-                    meta.output_format,
-                )?;
-            }
-            None => {
-                debug!(
-                    w = first.width,
-                    h = first.height,
-                    slots = self.ring_size,
-                    "Lazily creating output ring for batch"
-                );
-                state.ring = Some(OutputRing::new(
-                    &self.ctx,
-                    first.width,
-                    first.height,
-                    meta.scale,
-                    meta.output_format,
-                    self.ring_size,
-                    self.min_ring_slots,
-                )?);
-            }
-            Some(_) => {}
-        }
 
         let sample_input_bytes = first.byte_size();
         let sample_output_bytes = Self::sample_output_bytes(meta, first);
@@ -1230,15 +1232,14 @@ impl UpscaleBackend for TensorRtBackend {
             crate::debug_alloc::enable();
         }
 
-        let buffers = Self::ensure_batch_buffers(self, state, meta, first)?;
-        let batch_input_ptr = *buffers.input.device_ptr() as u64;
-        let batch_output_ptr = *buffers.output.device_ptr() as u64;
-
-        let ring = state.ring.as_mut().unwrap();
-        let mut output_arcs = Vec::with_capacity(batch_len);
-        for _ in 0..batch_len {
-            output_arcs.push(ring.acquire()?);
-        }
+        let (batch_input_ptr, batch_output_ptr, output_storage) = {
+            let buffers = Self::ensure_batch_buffers(self, state, meta, first)?;
+            (
+                *buffers.input.device_ptr() as u64,
+                *buffers.output.device_ptr() as u64,
+                Arc::clone(&buffers.output),
+            )
+        };
 
         let t_start = std::time::Instant::now();
 
@@ -1267,16 +1268,9 @@ impl UpscaleBackend for TensorRtBackend {
             self.mem_info()?,
         )?;
 
-        let out_w = first.width * meta.scale;
-        let out_h = first.height * meta.scale;
-        for (i, output_arc) in output_arcs.iter().enumerate() {
-            let src_ptr = batch_output_ptr + (i * sample_output_bytes) as u64;
-            let dst_ptr = *output_arc.device_ptr() as u64;
-            Self::copy_dense_texture_batch(src_ptr, dst_ptr, out_w, out_h, output_elem_bytes)?;
-        }
-
         let elapsed_us = t_start.elapsed().as_micros() as u64;
-        self.inference_metrics.record(elapsed_us);
+        self.inference_metrics
+            .record_frames(batch_len as u64, elapsed_us);
 
         #[cfg(feature = "debug-alloc")]
         {
@@ -1288,10 +1282,15 @@ impl UpscaleBackend for TensorRtBackend {
             );
         }
 
-        Ok(output_arcs
-            .into_iter()
-            .map(|output_arc| GpuTexture {
-                data: output_arc,
+        let out_w = first.width * meta.scale;
+        let out_h = first.height * meta.scale;
+        Ok((0..batch_len)
+            .map(|i| GpuTexture {
+                data: GpuBuffer::view(
+                    Arc::clone(&output_storage),
+                    i * sample_output_bytes,
+                    sample_output_bytes,
+                ),
                 width: out_w,
                 height: out_h,
                 pitch: (out_w as usize) * output_elem_bytes,
@@ -1330,12 +1329,7 @@ impl UpscaleBackend for TensorRtBackend {
                 "Final VRAM usage"
             );
 
-            if let Some(batch_buffers) = state.batch_buffers {
-                self.ctx.recycle(batch_buffers.input);
-                self.ctx.recycle(batch_buffers.output);
-            }
-            drop(state.ring);
-            drop(state.session);
+            self.release_state_resources(state);
             debug!("TensorRT backend shutdown complete");
         }
         Ok(())
@@ -1348,7 +1342,7 @@ impl UpscaleBackend for TensorRtBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::TensorRtBackend;
+    use super::{InferenceMetrics, TensorRtBackend};
     use std::path::Path;
 
     #[test]
@@ -1374,6 +1368,23 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn required_ring_slots_scales_with_batch_size() {
+        assert_eq!(TensorRtBackend::required_ring_slots(4, 1), 6);
+        assert_eq!(TensorRtBackend::required_ring_slots(4, 4), 9);
+    }
+
+    #[test]
+    fn inference_metrics_record_frames_counts_per_frame() {
+        let metrics = InferenceMetrics::new();
+        metrics.record_frames(4, 400);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.frames_inferred, 4);
+        assert_eq!(snapshot.avg_inference_us, 100);
+        assert_eq!(snapshot.peak_inference_us, 400);
+    }
 }
 
 impl Drop for TensorRtBackend {
@@ -1381,7 +1392,7 @@ impl Drop for TensorRtBackend {
         if let Ok(mut guard) = self.state.try_lock() {
             if let Some(state) = guard.take() {
                 let _ = self.ctx.sync_all();
-                drop(state);
+                self.release_state_resources(state);
             }
         }
     }

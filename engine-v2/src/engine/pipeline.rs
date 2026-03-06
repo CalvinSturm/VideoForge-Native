@@ -420,6 +420,11 @@ impl UpscalePipeline {
                         &cancel,
                         &metrics,
                         &ctx_decode.queue_depth,
+                        if enable_profiler {
+                            Some(ctx_decode.as_ref())
+                        } else {
+                            None
+                        },
                     )
                 }));
                 match result {
@@ -633,6 +638,8 @@ impl UpscalePipeline {
             ..config.clone()
         };
 
+        ctx.reset_steady_state();
+
         // ── Phase 1: Warm-up (5 seconds) ──
         // Populates the bucketed pool without tracking metrics.
         {
@@ -654,11 +661,9 @@ impl UpscalePipeline {
             )
             .await;
 
-            // Reset pool stats so measured phase starts clean.
-            ctx.pool_stats.hits.store(0, Ordering::Relaxed);
-            ctx.pool_stats.misses.store(0, Ordering::Relaxed);
-            ctx.pool_stats.recycled.store(0, Ordering::Relaxed);
-            ctx.pool_stats.overflows.store(0, Ordering::Relaxed);
+            ctx.enter_steady_state();
+            ctx.reset_pool_stats();
+            ctx.reset_runtime_telemetry();
         }
 
         // ── Phase 2: Measured run ──
@@ -831,6 +836,8 @@ impl AuditSuite {
         let height = 256u32;
         let nv12_pitch = ((width as usize + 255) / 256) * 256;
 
+        ctx.reset_steady_state();
+
         // ── 1. Warm-up phase (5s / 300 frames) ──
         {
             let warmup_config = PipelineConfig {
@@ -848,11 +855,9 @@ impl AuditSuite {
             .await;
         }
 
-        // Reset pool stats for clean measurement.
-        ctx.pool_stats.hits.store(0, Ordering::Relaxed);
-        ctx.pool_stats.misses.store(0, Ordering::Relaxed);
-        ctx.pool_stats.recycled.store(0, Ordering::Relaxed);
-        ctx.pool_stats.overflows.store(0, Ordering::Relaxed);
+        ctx.enter_steady_state();
+        ctx.reset_pool_stats();
+        ctx.reset_runtime_telemetry();
 
         // ── 2. Enable debug-alloc tracking ──
         crate::debug_alloc::reset();
@@ -1022,6 +1027,7 @@ fn decode_stage<D: FrameDecoder>(
     cancel: &CancellationToken,
     metrics: &PipelineMetrics,
     queue: &crate::core::context::QueueDepthTracker,
+    profiler_ctx: Option<&GpuContext>,
 ) -> Result<()> {
     debug!(
         thread = ?std::thread::current().id(),
@@ -1035,19 +1041,31 @@ fn decode_stage<D: FrameDecoder>(
         debug!("PIPELINE-BND: decode_stage calling decode_next");
         match decoder.decode_next()? {
             Some(decoded) => {
-                let frame = &decoded.frame;
+                let frame_index = decoded.frame.frame_index;
+                let pts = decoded.frame.pts;
                 debug!(
                     thread = ?std::thread::current().id(),
-                    frame_index = frame.frame_index,
-                    pts = frame.pts,
+                    frame_index,
+                    pts,
                     "PIPELINE-BND: decode_stage got frame"
                 );
-                debug_assert_eq!(frame.texture.format, PixelFormat::Nv12);
+                debug_assert_eq!(decoded.frame.texture.format, PixelFormat::Nv12);
                 queue.decode.fetch_add(1, Ordering::Relaxed);
                 if tx.blocking_send(decoded).is_err() {
                     debug!("Decode: downstream closed");
                     queue.decode.fetch_sub(1, Ordering::Relaxed);
                     return Ok(());
+                }
+                if let Some(ctx) = profiler_ctx {
+                    if frame_index % 8 == 0 {
+                        if let Err(err) = ctx.overlap_timer.mark_decode_done(&ctx.decode_stream) {
+                            warn!(
+                                frame_index,
+                                error = %err,
+                                "Failed to record decode overlap marker"
+                            );
+                        }
+                    }
                 }
                 metrics.frames_decoded.fetch_add(1, Ordering::Release);
             }
@@ -1127,9 +1145,15 @@ async fn preprocess_stage(
             frame_index = frame.frame_index,
             "PIPELINE-BND: preprocess_stage decode dependency satisfied"
         );
-        if profiler_ctx.is_some() && frame.frame_index % 60 == 0 {
+        if profiler_ctx.is_some() && frame.frame_index % 8 == 0 {
             ctx.overlap_timer.mark_preprocess_start(&ctx.preprocess_stream)?;
-            let _ = ctx.overlap_timer.sample();
+            if let Err(err) = ctx.overlap_timer.sample() {
+                warn!(
+                    frame_index = frame.frame_index,
+                    error = %err,
+                    "Failed to sample stream overlap telemetry"
+                );
+            }
         }
 
         let t_start = Instant::now();
@@ -1158,9 +1182,7 @@ async fn preprocess_stage(
         }
 
         // Recycle the consumed NV12 buffer.
-        if let Ok(slice) = Arc::try_unwrap(frame.texture.data) {
-            ctx.recycle(slice);
-        }
+        frame.texture.try_recycle(ctx);
 
         let out = FrameEnvelope {
             texture: model_input.texture,
@@ -1222,6 +1244,10 @@ async fn inference_stage<B: UpscaleBackend>(
     let preprocess = PreprocessPipeline::new(kernels.clone(), precision);
     let max_batch = inference_max_batch.max(1);
     let batch_wait = Duration::from_micros(inference_batch_wait_us);
+    let mut batch = Vec::with_capacity(max_batch);
+    let mut metas = Vec::with_capacity(max_batch);
+    let mut inputs = Vec::with_capacity(max_batch);
+    let mut outbound = Vec::with_capacity(max_batch);
     debug!(
         thread = ?std::thread::current().id(),
         max_batch,
@@ -1250,7 +1276,8 @@ async fn inference_stage<B: UpscaleBackend>(
             }
         };
 
-        let mut batch = vec![first];
+        batch.clear();
+        batch.push(first);
         let mut upstream_closed = false;
 
         // Opportunistic micro-batch accumulation with latency bound.
@@ -1279,7 +1306,6 @@ async fn inference_stage<B: UpscaleBackend>(
         };
         for envelope in &batch {
             debug_assert_eq!(envelope.frame.texture.format, expected_format);
-            ctx.queue_depth.preprocess.fetch_sub(1, Ordering::Relaxed);
             ctx.queue_depth.inference.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -1294,9 +1320,9 @@ async fn inference_stage<B: UpscaleBackend>(
             EngineError::DimensionMismatch(format!("bind_to_thread (inference): {:?}", e))
         })?;
 
-        let mut metas = Vec::with_capacity(batch.len());
-        let mut inputs = Vec::with_capacity(batch.len());
-        for envelope in batch {
+        metas.clear();
+        inputs.clear();
+        for envelope in batch.drain(..) {
             let (frame, preprocess_ready) = envelope.into_parts();
             debug!(
                 frame_index = frame.frame_index,
@@ -1321,7 +1347,7 @@ async fn inference_stage<B: UpscaleBackend>(
             batch_size = inputs.len(),
             "PIPELINE-BND: inference_stage calling backend.process_batch"
         );
-        let upscaled_rgbs = backend.process_batch(inputs.clone()).await?;
+        let upscaled_rgbs = backend.process_batch(&inputs).await?;
         debug!(
             batch_size = upscaled_rgbs.len(),
             "PIPELINE-BND: inference_stage backend.process_batch complete"
@@ -1337,10 +1363,8 @@ async fn inference_stage<B: UpscaleBackend>(
         }
 
         // Recycle the consumed RGB input buffer.
-        for input in inputs {
-            if let Ok(slice) = Arc::try_unwrap(input.data) {
-                ctx.recycle(slice);
-            }
+        for input in inputs.drain(..) {
+            input.try_recycle(ctx);
         }
 
         ctx.device().bind_to_thread().map_err(|e| {
@@ -1360,7 +1384,7 @@ async fn inference_stage<B: UpscaleBackend>(
 
         // ── Postprocess: RGB → NV12 ──
         let t_post = Instant::now();
-        let mut envelopes = Vec::with_capacity(metas.len());
+        outbound.clear();
         for (upscaled_rgb, (frame_index, pts, is_keyframe)) in
             upscaled_rgbs.into_iter().zip(metas.iter().copied())
         {
@@ -1383,7 +1407,7 @@ async fn inference_stage<B: UpscaleBackend>(
                 nv12_pitch = upscaled_nv12.pitch,
                 "PIPELINE-BND: inference_stage postprocess complete"
             );
-            envelopes.push(FrameEnvelope {
+            outbound.push(FrameEnvelope {
                 texture: upscaled_nv12,
                 frame_index,
                 pts,
@@ -1405,10 +1429,10 @@ async fn inference_stage<B: UpscaleBackend>(
             pctx.profiler.record_frame_latency(infer_us + post_us);
         }
 
-        let total_envelopes = envelopes.len();
+        let total_envelopes = outbound.len();
         let mut pending = total_envelopes;
         let mut postprocess_ready = postprocess_ready;
-        for frame in envelopes {
+        for frame in outbound.drain(..) {
             let frame_index = frame.frame_index;
             let ready = if pending == total_envelopes {
                 postprocess_ready.take()
@@ -1543,7 +1567,7 @@ impl FrameDecoder for MockDecoder {
         let buf = self.ctx.alloc(nv12_bytes)?;
 
         let texture = GpuTexture {
-            data: Arc::new(buf),
+            data: crate::core::types::GpuBuffer::from_owned(buf),
             width: self.width,
             height: self.height,
             pitch: self.pitch,

@@ -101,10 +101,10 @@ pub trait UpscaleBackend: Send + Sync {
     /// Run super-resolution inference on a batch of GPU-resident frames.
     ///
     /// Default implementation falls back to sequential single-frame process.
-    async fn process_batch(&self, inputs: Vec<GpuTexture>) -> Result<Vec<GpuTexture>> {
+    async fn process_batch(&self, inputs: &[GpuTexture]) -> Result<Vec<GpuTexture>> {
         let mut outputs = Vec::with_capacity(inputs.len());
         for input in inputs {
-            outputs.push(self.process(input).await?);
+            outputs.push(self.process(input.clone()).await?);
         }
         Ok(outputs)
     }

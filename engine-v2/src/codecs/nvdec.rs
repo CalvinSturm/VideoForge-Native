@@ -49,7 +49,7 @@ use tracing::{debug, info, warn};
 
 use crate::codecs::sys::*;
 use crate::core::context::GpuContext;
-use crate::core::types::{FrameEnvelope, GpuTexture, PixelFormat};
+use crate::core::types::{FrameEnvelope, GpuBuffer, GpuTexture, PixelFormat};
 use crate::engine::pipeline::{DecodedFrameEnvelope, FrameDecoder, StreamReadyEvent};
 use crate::error::{EngineError, Result};
 
@@ -471,7 +471,7 @@ impl NvDecoder {
         };
 
         let texture = GpuTexture {
-            data: Arc::new(dst_buf),
+            data: GpuBuffer::from_owned(dst_buf),
             width,
             height,
             pitch: src_pitch_usize,

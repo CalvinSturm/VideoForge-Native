@@ -2,7 +2,7 @@
 //!
 //! # Ownership model
 //!
-//! [`GpuTexture`] wraps device memory via `Arc<CudaSlice<u8>>`.  This provides:
+//! [`GpuTexture`] wraps device memory via [`GpuBuffer`].  This provides:
 //!
 //! - **RAII**: device memory is freed when the last `Arc` reference drops.
 //!   `CudaSlice` stores an internal `Arc<CudaDevice>` so the CUDA context
@@ -11,6 +11,8 @@
 //!   thread-safe for distinct streams). The `Arc` wrapper preserves these bounds.
 //! - **Cheap clone**: cloning a `GpuTexture` increments a reference count.
 //!   No device memory is copied.
+//! - **View support**: batched inference can return sub-buffer views into
+//!   larger device allocations without copying frame payloads.
 //!
 //! # Invariants
 //!
@@ -22,8 +24,80 @@
 //!    the `GpuTexture` is dropped.  This is guaranteed structurally because
 //!    `CudaSlice` holds an `Arc<CudaDevice>`.
 
-use cudarc::driver::{CudaSlice, DevicePtr};
+use cudarc::driver::{CudaSlice, DevicePtr, DeviceSlice};
 use std::sync::Arc;
+
+use crate::core::context::GpuContext;
+
+/// GPU-resident allocation or a view into one.
+#[derive(Clone, Debug)]
+pub enum GpuBuffer {
+    Owned(Arc<CudaSlice<u8>>),
+    View {
+        storage: Arc<CudaSlice<u8>>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl GpuBuffer {
+    pub fn from_owned(buf: CudaSlice<u8>) -> Self {
+        Self::Owned(Arc::new(buf))
+    }
+
+    pub fn from_arc(storage: Arc<CudaSlice<u8>>) -> Self {
+        Self::Owned(storage)
+    }
+
+    pub fn view(storage: Arc<CudaSlice<u8>>, offset: usize, len: usize) -> Self {
+        assert!(
+            offset + len <= storage.len(),
+            "GpuBuffer view exceeds backing allocation"
+        );
+        Self::View {
+            storage,
+            offset,
+            len,
+        }
+    }
+
+    #[inline]
+    pub fn device_ptr(&self) -> u64 {
+        match self {
+            Self::Owned(storage) => *storage.device_ptr() as u64,
+            Self::View {
+                storage, offset, ..
+            } => (*storage.device_ptr() as u64) + *offset as u64,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Owned(storage) => storage.len(),
+            Self::View { len, .. } => *len,
+        }
+    }
+
+    #[inline]
+    pub fn owned_storage(&self) -> Option<&Arc<CudaSlice<u8>>> {
+        match self {
+            Self::Owned(storage) => Some(storage),
+            Self::View { .. } => None,
+        }
+    }
+
+    pub fn try_recycle(self, ctx: &GpuContext) {
+        match self {
+            Self::Owned(storage) => {
+                if let Ok(slice) = Arc::try_unwrap(storage) {
+                    ctx.recycle(slice);
+                }
+            }
+            Self::View { .. } => {}
+        }
+    }
+}
 
 // ─── Pixel format ────────────────────────────────────────────────────────────
 
@@ -119,7 +193,7 @@ impl PixelFormat {
 #[derive(Clone, Debug)]
 pub struct GpuTexture {
     /// Device-resident memory.  Never host-backed.
-    pub data: Arc<CudaSlice<u8>>,
+    pub data: GpuBuffer,
 
     /// Frame width in pixels.
     pub width: u32,
@@ -154,7 +228,7 @@ impl GpuTexture {
     /// Callers must not free the pointer or pass it to a different CUDA context.
     #[inline]
     pub fn device_ptr(&self) -> u64 {
-        *self.data.device_ptr() as u64
+        self.data.device_ptr()
     }
 
     /// Total byte size of the device allocation.
@@ -180,6 +254,10 @@ impl GpuTexture {
     #[inline]
     pub fn channel_stride_elements(&self) -> usize {
         (self.width as usize) * (self.height as usize)
+    }
+
+    pub fn try_recycle(self, ctx: &GpuContext) {
+        self.data.try_recycle(ctx);
     }
 }
 

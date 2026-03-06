@@ -189,6 +189,30 @@ impl GpuContext {
         Ok(ctx as *mut std::ffi::c_void)
     }
 
+    /// Reset lock-free pool counters for a clean measurement window.
+    pub fn reset_pool_stats(&self) {
+        self.pool_stats.hits.store(0, Ordering::Relaxed);
+        self.pool_stats.misses.store(0, Ordering::Relaxed);
+        self.pool_stats.recycled.store(0, Ordering::Relaxed);
+        self.pool_stats.overflows.store(0, Ordering::Relaxed);
+    }
+
+    /// Enter steady-state allocation mode after a deliberate warm-up pass.
+    pub fn enter_steady_state(&self) {
+        self.alloc_policy.enter_steady_state();
+    }
+
+    /// Reset back to warm-up allocation mode.
+    pub fn reset_steady_state(&self) {
+        self.alloc_policy.reset();
+    }
+
+    /// Reset profiling and overlap telemetry for a clean measurement window.
+    pub fn reset_runtime_telemetry(&self) {
+        self.profiler.reset();
+        self.overlap_timer.reset();
+    }
+
     /// Allocate `size` bytes of device memory, preferring a pooled buffer.
     ///
     /// The returned buffer may be **larger** than `size` due to bucket
@@ -813,6 +837,10 @@ impl StreamOverlapTimer {
             overlap_count: overlaps,
             overlap_pct: (overlaps as f64 / n as f64) * 100.0,
         }
+    }
+
+    pub fn reset(&self) {
+        self.samples.lock().unwrap().clear();
     }
 }
 

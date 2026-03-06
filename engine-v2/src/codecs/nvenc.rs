@@ -175,6 +175,10 @@ pub struct NvEncoder {
     use_legacy_staging: bool,
     /// Frame counter for encode ordering.
     frame_idx: u32,
+    /// Number of bitstream packets successfully written to the sink.
+    packets_written: u32,
+    /// Selected output codec label for mux/container integration.
+    codec_label: &'static str,
 }
 
 // SAFETY: NvEncoder is only used from the encode stage (single blocking thread).
@@ -258,6 +262,10 @@ impl NvEncoder {
         } else {
             "nvenc"
         }
+    }
+
+    pub fn output_codec_name(&self) -> &'static str {
+        self.codec_label
     }
 
     #[inline]
@@ -590,7 +598,7 @@ impl NvEncoder {
             );
             unsafe { std::mem::zeroed() }
         };
-        let use_custom_enc_config = false;
+        let use_custom_enc_config = true;
         if use_custom_enc_config {
             if enc_config.version == 0 {
                 enc_config.version = struct_version(9) | (1 << 31);
@@ -604,6 +612,8 @@ impl NvEncoder {
             }
             enc_config.gopLength = config.gop_length;
             enc_config.frameIntervalP = (config.b_frames + 1) as i32;
+            enc_config.rcParams.set_enableLookahead(0);
+            enc_config.rcParams.set_zeroReorderDelay(1);
 
             if config.bitrate > 0 {
                 // VBR mode.
@@ -628,7 +638,9 @@ impl NvEncoder {
         init_params.darHeight = config.height;
         init_params.frameRateNum = config.fps_num;
         init_params.frameRateDen = config.fps_den;
+        init_params.enableEncodeAsync = 0;
         init_params.enablePTD = 1; // Enable picture-type decision.
+        init_params.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
         init_params.encodeConfig = if use_custom_enc_config {
             &mut enc_config
         } else {
@@ -733,6 +745,8 @@ impl NvEncoder {
             legacy_staging_height: 0,
             use_legacy_staging: false,
             frame_idx: 0,
+            packets_written: 0,
+            codec_label: selected_codec_name,
         })
     }
 
@@ -1054,48 +1068,7 @@ impl NvEncoder {
             return Ok(());
         }
 
-        // Lock bitstream output.
-        let lock_fn = self
-            .fns
-            .nvEncLockBitstream
-            .ok_or_else(|| EngineError::Encode("nvEncLockBitstream not found".into()))?;
-        let unlock_fn = self
-            .fns
-            .nvEncUnlockBitstream
-            .ok_or_else(|| EngineError::Encode("nvEncUnlockBitstream not found".into()))?;
-
-        let mut lock_params: NV_ENC_LOCK_BITSTREAM = unsafe { std::mem::zeroed() };
-        lock_params.version = self.struct_version_ext(2);
-        lock_params.outputBitstream = self.bitstream_buf;
-
-        // SAFETY: bitstream_buf is valid (from nvEncCreateBitstreamBuffer).
-        unsafe {
-            check_nvenc(
-                lock_fn(self.encoder, &mut lock_params),
-                "nvEncLockBitstream",
-            )?;
-        }
-
-        // Copy encoded data to sink.
-        let is_idr = lock_params.pictureType == NV_ENC_PIC_TYPE_IDR;
-        let data = unsafe {
-            // SAFETY: bitstreamBufferPtr is valid for bitstreamSizeInBytes.
-            std::slice::from_raw_parts(
-                lock_params.bitstreamBufferPtr as *const u8,
-                lock_params.bitstreamSizeInBytes as usize,
-            )
-        };
-
-        let sink_result = self.sink.write_packet(data, frame.pts, is_idr);
-
-        // Unlock regardless of sink result.
-        // SAFETY: bitstream_buf was locked above.
-        unsafe {
-            check_nvenc(
-                unlock_fn(self.encoder, self.bitstream_buf),
-                "nvEncUnlockBitstream",
-            )?;
-        }
+        self.lock_and_write_packet()?;
 
         // Unmap input resource.
         let unmap_fn = self
@@ -1111,7 +1084,56 @@ impl NvEncoder {
             )?;
         }
 
-        sink_result
+        Ok(())
+    }
+
+    fn lock_and_write_packet(&mut self) -> Result<()> {
+        let lock_fn = self
+            .fns
+            .nvEncLockBitstream
+            .ok_or_else(|| EngineError::Encode("nvEncLockBitstream not found".into()))?;
+        let unlock_fn = self
+            .fns
+            .nvEncUnlockBitstream
+            .ok_or_else(|| EngineError::Encode("nvEncUnlockBitstream not found".into()))?;
+
+        let mut lock_params: NV_ENC_LOCK_BITSTREAM = unsafe { std::mem::zeroed() };
+        lock_params.version = self.struct_version_ext(2);
+        lock_params.outputBitstream = self.bitstream_buf;
+        lock_params.set_doNotWait(0);
+
+        // SAFETY: bitstream_buf is valid (from nvEncCreateBitstreamBuffer).
+        unsafe {
+            check_nvenc(
+                lock_fn(self.encoder, &mut lock_params),
+                "nvEncLockBitstream",
+            )?;
+        }
+
+        // Copy encoded data to sink.
+        let is_idr = lock_params.pictureType == NV_ENC_PIC_TYPE_IDR;
+        let output_pts = lock_params.outputTimeStamp as i64;
+        let data = unsafe {
+            // SAFETY: bitstreamBufferPtr is valid for bitstreamSizeInBytes.
+            std::slice::from_raw_parts(
+                lock_params.bitstreamBufferPtr as *const u8,
+                lock_params.bitstreamSizeInBytes as usize,
+            )
+        };
+
+        self.sink.write_packet(data, output_pts, is_idr)?;
+
+        // Unlock regardless of sink result.
+        // SAFETY: bitstream_buf was locked above.
+        unsafe {
+            check_nvenc(
+                unlock_fn(self.encoder, self.bitstream_buf),
+                "nvEncUnlockBitstream",
+            )?;
+        }
+
+        self.packets_written += 1;
+        Ok(())
     }
 
     /// Send EOS to flush the encoder.
@@ -1152,7 +1174,11 @@ impl FrameEncoder for NvEncoder {
     fn flush(&mut self) -> Result<()> {
         self.send_eos()?;
         self.sink.flush()?;
-        info!(frames = self.frame_idx, "NVENC encoder flushed");
+        info!(
+            frames = self.frame_idx,
+            packets_written = self.packets_written,
+            "NVENC encoder flushed"
+        );
         Ok(())
     }
 }

@@ -41,7 +41,7 @@ use tracing::info;
 
 use crate::codecs::sys::{self, CUevent};
 use crate::core::context::GpuContext;
-use crate::core::types::{GpuTexture, PixelFormat};
+use crate::core::types::{GpuBuffer, GpuTexture, PixelFormat};
 use crate::error::{EngineError, Result};
 
 // ─── CUDA C kernel source ────────────────────────────────────────────────────
@@ -457,7 +457,7 @@ impl PreprocessKernels {
         }
 
         Ok(GpuTexture {
-            data: Arc::new(output_buf),
+            data: GpuBuffer::from_owned(output_buf),
             width: input.width,
             height: input.height,
             pitch: w * std::mem::size_of::<f32>(), // dense planar pitch
@@ -516,7 +516,7 @@ impl PreprocessKernels {
         }
 
         Ok(GpuTexture {
-            data: Arc::new(output_buf),
+            data: GpuBuffer::from_owned(output_buf),
             width: input.width,
             height: input.height,
             pitch: w * 2, // F16 element = 2 bytes
@@ -562,7 +562,7 @@ impl PreprocessKernels {
         }
 
         Ok(GpuTexture {
-            data: Arc::new(output_buf),
+            data: GpuBuffer::from_owned(output_buf),
             width: input.width,
             height: input.height,
             pitch: (input.width as usize) * 2,
@@ -608,7 +608,7 @@ impl PreprocessKernels {
         }
 
         Ok(GpuTexture {
-            data: Arc::new(output_buf),
+            data: GpuBuffer::from_owned(output_buf),
             width: input.width,
             height: input.height,
             pitch: (input.width as usize) * 4,
@@ -671,7 +671,7 @@ impl PreprocessKernels {
         }
 
         Ok(GpuTexture {
-            data: Arc::new(output_buf),
+            data: GpuBuffer::from_owned(output_buf),
             width: input.width,
             height: input.height,
             pitch: nv12_pitch,
@@ -725,7 +725,7 @@ impl PreprocessKernels {
         }
 
         Ok(GpuTexture {
-            data: Arc::new(output_buf),
+            data: GpuBuffer::from_owned(output_buf),
             width: input.width,
             height: input.height,
             pitch: nv12_pitch,

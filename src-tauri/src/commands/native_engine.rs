@@ -8,9 +8,9 @@
 //! ```text
 //! FFmpeg demux → Annex B elementary stream (.h264/.hevc temp file)
 //!      ↓
-//! engine-v2 NVDEC → TensorRT → NVENC → compressed output temp file
+//! engine-v2 NVDEC → TensorRT → NVENC → FFmpeg mux stdin
 //!      ↓
-//! FFmpeg mux: video_output + audio_from_original → final .mp4
+//! final .mp4 (+ optional copied audio from original input)
 //! ```
 //!
 //! Runtime routing:
@@ -24,6 +24,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+#[cfg(feature = "native_engine")]
+use std::collections::VecDeque;
 #[cfg(feature = "native_engine")]
 use std::path::PathBuf;
 #[cfg(feature = "native_engine")]
@@ -225,7 +227,19 @@ fn configure_native_runtime_env() -> String {
 }
 
 #[cfg(feature = "native_engine")]
-fn probe_video_coded_geometry(path: &str) -> Result<(usize, usize, f64, f64, u64), String> {
+fn probe_video_coded_geometry(
+    path: &str,
+) -> Result<
+    (
+        usize,
+        usize,
+        f64,
+        f64,
+        u64,
+        videoforge_engine::codecs::sys::cudaVideoCodec,
+    ),
+    String,
+> {
     let output = std::process::Command::new("ffprobe")
         .args([
             "-v",
@@ -233,7 +247,7 @@ fn probe_video_coded_geometry(path: &str) -> Result<(usize, usize, f64, f64, u64
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height,coded_width,coded_height,r_frame_rate",
+            "stream=width,height,coded_width,coded_height,r_frame_rate,codec_name",
             "-show_entries",
             "format=duration",
             "-of",
@@ -277,6 +291,21 @@ fn probe_video_coded_geometry(path: &str) -> Result<(usize, usize, f64, f64, u64
     } else {
         fps_str.parse::<f64>().unwrap_or(30.0)
     };
+    let codec = match stream
+        .get("codec_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "h264" => videoforge_engine::codecs::sys::cudaVideoCodec::H264,
+        "hevc" | "h265" => videoforge_engine::codecs::sys::cudaVideoCodec::HEVC,
+        other => {
+            return Err(format!(
+                "Unsupported native input codec '{other}'. Only H.264 and HEVC are supported."
+            ))
+        }
+    };
 
     let duration = json
         .get("format")
@@ -291,10 +320,11 @@ fn probe_video_coded_geometry(path: &str) -> Result<(usize, usize, f64, f64, u64
         display_h = display_height,
         coded_w = coded_width,
         coded_h = coded_height,
+        codec = ?codec,
         "Resolved native coded geometry"
     );
 
-    Ok((coded_width, coded_height, duration, fps, total_frames))
+    Ok((coded_width, coded_height, duration, fps, total_frames, codec))
 }
 
 #[cfg(feature = "native_engine")]
@@ -309,19 +339,6 @@ fn native_temp_token() -> String {
     let pid = std::process::id();
     let seq = NATIVE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{pid}_{ts}_{seq}")
-}
-
-#[cfg(feature = "native_engine")]
-fn stderr_tail(bytes: &[u8], lines: usize) -> String {
-    String::from_utf8_lossy(bytes)
-        .lines()
-        .rev()
-        .take(lines)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Structured response returned by `upscale_request_native`.
@@ -419,7 +436,7 @@ async fn run_native_via_rave_cli(
     model_path: String,
     _scale: u32,
     precision: String,
-    _preserve_audio: bool,
+    preserve_audio: bool,
     max_batch: u32,
     encoder_detail: Option<String>,
 ) -> Result<NativeUpscaleResult, String> {
@@ -491,7 +508,7 @@ async fn run_native_via_rave_cli(
         encoder_mode: "rave_cli".to_string(),
         encoder_detail,
         frames_processed: 0,
-        audio_preserved: true,
+        audio_preserved: preserve_audio,
         trt_cache_enabled,
         trt_cache_dir,
     })
@@ -658,9 +675,6 @@ async fn run_native_pipeline(
     preserve_audio: bool,
     max_batch: u32,
 ) -> Result<NativeUpscaleResult, String> {
-    use std::process::Stdio;
-    use tokio::process::Command;
-
     use videoforge_engine::codecs::sys::cudaVideoCodec as CudaCodec;
 
     let make_err =
@@ -706,101 +720,7 @@ async fn run_native_pipeline(
         "Native engine pipeline starting"
     );
 
-    // ── Step 1: FFmpeg extract elementary stream ──────────────────────────────
-    let tmp_dir = std::env::temp_dir();
-    let temp_token = native_temp_token();
-    let elementary_stream_path = tmp_dir.join(format!("vf_native_input_{temp_token}.h264"));
-    let native_output_path_h264 = tmp_dir.join(format!("vf_native_output_{temp_token}.h264"));
-
-    tracing::info!(
-        stream_path = %elementary_stream_path.display(),
-        "Extracting H.264 elementary stream with FFmpeg"
-    );
-
-    let demux_output = Command::new(&ffmpeg_cmd)
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-i",
-            &input_path,
-            "-vcodec",
-            "copy",
-            "-an", // no audio in elementary stream
-            "-bsf:v",
-            "h264_mp4toannexb", // convert to Annex B
-            elementary_stream_path.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| make_err("FFMPEG_SPAWN", &format!("FFmpeg spawn failed: {}", e)))?;
-
-    if !demux_output.status.success() {
-        // Attempt HEVC fallback
-        let hevc_path = tmp_dir.join(format!("vf_native_input_{temp_token}.hevc"));
-        let native_output_path_hevc = tmp_dir.join(format!("vf_native_output_{temp_token}.hevc"));
-        let hevc_output = Command::new(&ffmpeg_cmd)
-            .args([
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "warning",
-                "-i",
-                &input_path,
-                "-vcodec",
-                "copy",
-                "-an",
-                "-bsf:v",
-                "hevc_mp4toannexb",
-                hevc_path.to_str().unwrap(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .ok();
-
-        if hevc_output.as_ref().is_some_and(|o| o.status.success()) {
-            tracing::info!("Falling back to HEVC elementary stream");
-            return run_engine_pipeline(
-                hevc_path,
-                native_output_path_hevc,
-                output_path,
-                input_path,
-                model_path,
-                scale,
-                precision,
-                preserve_audio,
-                max_batch,
-                ffmpeg_cmd.clone(),
-                CudaCodec::HEVC,
-            )
-            .await;
-        }
-
-        let h264_stderr = stderr_tail(&demux_output.stderr, 12);
-        let hevc_stderr = hevc_output
-            .as_ref()
-            .map(|o| stderr_tail(&o.stderr, 12))
-            .unwrap_or_else(|| "FFmpeg HEVC fallback did not produce output.".to_string());
-        return Err(make_err(
-            "DEMUX_FAILED",
-            &format!(
-                "FFmpeg could not extract an H.264 or HEVC elementary stream from the input. \
-                 Only H.264 and HEVC containers are supported by the native engine MVP.\n\
-                 h264 stderr:\n{}\n\
-                 hevc stderr:\n{}",
-                h264_stderr, hevc_stderr
-            ),
-        ));
-    }
-
     run_engine_pipeline(
-        elementary_stream_path,
-        native_output_path_h264,
         output_path,
         input_path,
         model_path,
@@ -817,8 +737,6 @@ async fn run_native_pipeline(
 #[cfg(feature = "native_engine")]
 #[allow(clippy::too_many_arguments)] // TODO(clippy): this pipeline entry mirrors explicit stage inputs; keep stable for now.
 async fn run_engine_pipeline(
-    input_stream: PathBuf,
-    engine_output: PathBuf,
     final_output: String,
     original_input: String,
     model_path: String,
@@ -829,9 +747,7 @@ async fn run_engine_pipeline(
     ffmpeg_cmd: String,
     codec: videoforge_engine::codecs::sys::cudaVideoCodec,
 ) -> Result<NativeUpscaleResult, String> {
-    use std::process::Stdio;
     use std::sync::Arc;
-    use tokio::process::Command;
 
     use videoforge_engine::backends::tensorrt::{BatchConfig, PrecisionPolicy, TensorRtBackend};
     use videoforge_engine::codecs::nvdec::NvDecoder;
@@ -849,8 +765,15 @@ async fn run_engine_pipeline(
     // encoder_nv12_pitch and encoder width/height must be set before
     // UpscalePipeline::new() — the pipeline asserts pitch > 0.
     tracing::info!(path = %original_input, "Probing input video dimensions");
-    let (input_w, input_h, _duration, fps, _) = probe_video_coded_geometry(&original_input)
+    let (input_w, input_h, _duration, fps, _, probed_codec) = probe_video_coded_geometry(&original_input)
         .map_err(|e| make_err("PROBE_FAILED", &e))?;
+    if probed_codec != codec {
+        tracing::warn!(
+            requested = ?codec,
+            probed = ?probed_codec,
+            "Native codec routing differed from ffprobe result; using probed codec for streamed demux"
+        );
+    }
     let output_w = input_w.saturating_mul(scale as usize);
     let output_h = input_h.saturating_mul(scale as usize);
     // NV12 row stride must be 256-byte aligned (NVENC hardware requirement).
@@ -880,14 +803,17 @@ async fn run_engine_pipeline(
         "fp16" => PrecisionPolicy::Fp16,
         _ => PrecisionPolicy::Fp32,
     };
+    let downstream_capacity = 4usize;
+    let ring_size = TensorRtBackend::required_ring_slots(downstream_capacity, max_batch as usize);
+
     // TensorRtBackend::new(model_path, ctx, device_id, ring_size, downstream_capacity).
-    // Use with_precision to apply the precision policy.
+    // Use with_precision to apply the precision policy and keep output slots batch-safe.
     let backend = TensorRtBackend::with_precision(
         std::path::PathBuf::from(&model_path),
         ctx.clone(),
         0, // device_id
-        8, // ring_size (≥ downstream_capacity + 2)
-        4, // downstream_capacity
+        ring_size,
+        downstream_capacity,
         precision_policy,
         BatchConfig {
             max_batch: max_batch as usize,
@@ -907,8 +833,8 @@ async fn run_engine_pipeline(
         .map_err(|e| make_err("KERNEL_COMPILE", &format!("Kernel compile failed: {}", e)))?;
     let kernels = Arc::new(kernels);
 
-    // ── Step 5: Create decoder with FileBitstreamSource ───────────────────────
-    tracing::info!(path = %input_stream.display(), "Creating NVDEC decoder");
+    // ── Step 5: Create decoder with FFmpeg-streamed elementary source ────────
+    tracing::info!(path = %original_input, codec = ?probed_codec, "Creating NVDEC decoder");
     let model_prec = match backend
         .metadata()
         .map_err(|e| make_err("BACKEND_INIT", &format!("Model metadata unavailable: {}", e)))?
@@ -917,17 +843,13 @@ async fn run_engine_pipeline(
         videoforge_engine::core::types::PixelFormat::RgbPlanarF16 => ModelPrecision::F16,
         _ => ModelPrecision::F32,
     };
-    let source = FileBitstreamSource::new(&input_stream).map_err(|e| {
-        make_err(
-            "SOURCE_OPEN",
-            &format!("Cannot open elementary stream: {}", e),
-        )
-    })?;
-    let decoder = NvDecoder::new(ctx.clone(), Box::new(source), codec)
+    let source = FfmpegBitstreamSource::spawn(&ffmpeg_cmd, &original_input, probed_codec)
+        .map_err(|e| make_err("SOURCE_OPEN", &format!("Cannot stream elementary input: {}", e)))?;
+    let decoder = NvDecoder::new(ctx.clone(), Box::new(source), probed_codec)
         .map_err(|e| make_err("DECODER_INIT", &format!("NVDEC decoder init failed: {}", e)))?;
 
-    // ── Step 6: Create encoder with FileBitstreamSink ─────────────────────────
-    tracing::info!(path = %engine_output.display(), "Creating NVENC encoder");
+    // ── Step 6: Create encoder with streaming FFmpeg mux sink ────────────────
+    tracing::info!(path = %final_output, "Creating NVENC encoder and mux sink");
 
     let enc_config = NvEncConfig {
         width: output_w as u32,
@@ -940,8 +862,19 @@ async fn run_engine_pipeline(
         b_frames: 0,
         nv12_pitch: encoder_nv12_pitch as u32,
     };
-    let sink = FileBitstreamSink::new(&engine_output)
-        .map_err(|e| make_err("SINK_OPEN", &format!("Cannot create output stream: {}", e)))?;
+    let mux_codec_hint = StreamingCodecHint::new(match probed_codec {
+        videoforge_engine::codecs::sys::cudaVideoCodec::H264 => Some("h264"),
+        videoforge_engine::codecs::sys::cudaVideoCodec::HEVC => Some("hevc"),
+        _ => None,
+    });
+    let sink = StreamingMuxSink::new(
+        &ffmpeg_cmd,
+        &final_output,
+        &original_input,
+        preserve_audio,
+        mux_codec_hint.clone(),
+    )
+        .map_err(|e| make_err("SINK_OPEN", &format!("Cannot create mux stream: {}", e)))?;
     // NvEncoder::new takes (raw_cuda_context: *mut c_void, sink, config).
     // Bind the primary context to this thread, then retrieve whatever is
     // current via cuCtxGetCurrent — the NVENC-canonical approach (matches
@@ -961,7 +894,8 @@ async fn run_engine_pipeline(
         cuda_ctx,
         Box::new(sink),
         enc_config,
-        engine_output.clone(),
+        PathBuf::from(&final_output),
+        mux_codec_hint,
     )
     .map_err(|e| make_err("ENCODER_INIT", &format!("Encoder init failed: {}", e)))?;
     let encoder_mode = encoder.mode_handle();
@@ -977,10 +911,27 @@ async fn run_engine_pipeline(
     let pipeline = UpscalePipeline::new(ctx.clone(), kernels, config);
 
     tracing::info!("Running engine-v2 pipeline");
-    pipeline
-        .run(decoder, backend, encoder)
-        .await
-        .map_err(|e| make_err("PIPELINE", &format!("Pipeline error: {}", e)))?;
+    let pipeline_backend = backend.clone();
+    let pipeline_result = pipeline.run(decoder, pipeline_backend, encoder).await;
+    let shutdown_result = backend.shutdown().await;
+
+    if let Err(e) = pipeline_result {
+        let shutdown_detail = shutdown_result
+            .err()
+            .map(|shutdown_err| format!(" Cleanup error after pipeline failure: {shutdown_err}"))
+            .unwrap_or_default();
+        return Err(make_err(
+            "PIPELINE",
+            &format!("Pipeline error: {e}.{shutdown_detail}"),
+        ));
+    }
+
+    if let Err(e) = shutdown_result {
+        return Err(make_err(
+            "BACKEND_SHUTDOWN",
+            &format!("TensorRT backend shutdown failed: {e}"),
+        ));
+    }
 
     let frames = pipeline
         .metrics()
@@ -994,82 +945,6 @@ async fn run_engine_pipeline(
         encoder_detail = encoder_detail.as_deref().unwrap_or("none"),
         "engine-v2 pipeline complete"
     );
-
-    // ── Step 8: FFmpeg mux video + audio ──────────────────────────────────────
-    tracing::info!(
-        video = %engine_output.display(),
-        audio_src = %original_input,
-        output = %final_output,
-        "Muxing video and audio with FFmpeg"
-    );
-
-    let mut mux_args = vec![
-        "-y".to_string(),
-        "-hide_banner".to_string(),
-        "-loglevel".to_string(),
-        "warning".to_string(),
-        // video from native engine output
-        "-i".to_string(),
-        engine_output.to_str().unwrap().to_string(),
-    ];
-
-    if preserve_audio {
-        // Audio from original input
-        mux_args.push("-i".to_string());
-        mux_args.push(original_input.clone());
-    }
-
-    mux_args.extend(["-c:v".to_string(), "copy".to_string()]);
-
-    if preserve_audio {
-        mux_args.extend([
-            "-c:a".to_string(),
-            "copy".to_string(),
-            "-map".to_string(),
-            "0:v:0".to_string(),
-            "-map".to_string(),
-            "1:a?".to_string(), // optional audio — won't fail if absent
-        ]);
-    } else {
-        mux_args.push("-an".to_string());
-    }
-
-    mux_args.extend([
-        "-movflags".to_string(),
-        "+faststart".to_string(),
-        final_output.clone(),
-    ]);
-
-    let mux_output = Command::new(&ffmpeg_cmd)
-        .args(&mux_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| make_err("FFMPEG_MUX_SPAWN", &e.to_string()))?;
-
-    if !mux_output.status.success() {
-        let stderr_tail = stderr_tail(&mux_output.stderr, 12);
-        tracing::error!(
-            status = ?mux_output.status.code(),
-            input_stream = %input_stream.display(),
-            engine_output = %engine_output.display(),
-            final_output = %final_output,
-            stderr = %stderr_tail,
-            "FFmpeg mux step failed"
-        );
-        return Err(make_err(
-            "MUX_FAILED",
-            &format!(
-                "FFmpeg mux step failed. Temporary files were preserved for inspection. stderr:\n{}",
-                stderr_tail
-            ),
-        ));
-    }
-
-    // Clean up temp files after a successful mux.
-    let _ = std::fs::remove_file(&input_stream);
-    let _ = std::fs::remove_file(&engine_output);
 
     tracing::info!(output = %final_output, "Native engine upscale complete");
 
@@ -1086,21 +961,143 @@ async fn run_engine_pipeline(
 }
 
 // =============================================================================
-// FileBitstreamSource — reads Annex B elementary stream from disk
+// FfmpegBitstreamSource — streams Annex B elementary video from FFmpeg stdout
 // =============================================================================
 
 #[cfg(feature = "native_engine")]
-struct FileBitstreamSource {
-    file: std::fs::File,
+struct FfmpegBitstreamSource {
+    child: std::process::Child,
+    stdout: std::process::ChildStdout,
+    stderr_tail: SharedStderrTail,
     eof: bool,
     pts_counter: i64,
 }
 
 #[cfg(feature = "native_engine")]
-impl FileBitstreamSource {
-    fn new(path: &Path) -> std::io::Result<Self> {
+#[derive(Clone, Default)]
+struct SharedStderrTail(Arc<Mutex<VecDeque<String>>>);
+
+#[cfg(feature = "native_engine")]
+impl SharedStderrTail {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(VecDeque::with_capacity(16))))
+    }
+
+    fn spawn_reader<R>(&self, reader: R)
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        let tail = self.clone();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+
+            let buf = BufReader::new(reader);
+            for line in buf.lines().map_while(Result::ok) {
+                tail.push(line);
+            }
+        });
+    }
+
+    fn push(&self, line: String) {
+        let mut guard = self.0.lock().expect("stderr tail mutex poisoned");
+        if guard.len() >= 12 {
+            guard.pop_front();
+        }
+        guard.push_back(line);
+    }
+
+    fn snapshot(&self) -> String {
+        self.0
+            .lock()
+            .expect("stderr tail mutex poisoned")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+#[cfg(feature = "native_engine")]
+#[derive(Clone, Default)]
+struct StreamingCodecHint(Arc<Mutex<Option<&'static str>>>);
+
+#[cfg(feature = "native_engine")]
+impl StreamingCodecHint {
+    fn new(initial: Option<&'static str>) -> Self {
+        Self(Arc::new(Mutex::new(initial)))
+    }
+
+    fn set(&self, format: &'static str) {
+        let mut guard = self.0.lock().expect("codec hint mutex poisoned");
+        *guard = Some(format);
+    }
+
+    fn get(&self) -> Option<&'static str> {
+        *self.0.lock().expect("codec hint mutex poisoned")
+    }
+}
+
+#[cfg(feature = "native_engine")]
+impl FfmpegBitstreamSource {
+    fn spawn(
+        ffmpeg_cmd: &str,
+        input_path: &str,
+        codec: videoforge_engine::codecs::sys::cudaVideoCodec,
+    ) -> std::io::Result<Self> {
+        use std::process::{Command, Stdio};
+
+        let bitstream_filter = match codec {
+            videoforge_engine::codecs::sys::cudaVideoCodec::H264 => "h264_mp4toannexb",
+            videoforge_engine::codecs::sys::cudaVideoCodec::HEVC => "hevc_mp4toannexb",
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Unsupported streamed demux codec: {codec:?}"),
+                ));
+            }
+        };
+        let output_format = match codec {
+            videoforge_engine::codecs::sys::cudaVideoCodec::H264 => "h264",
+            videoforge_engine::codecs::sys::cudaVideoCodec::HEVC => "hevc",
+            _ => unreachable!(),
+        };
+
+        let mut child = Command::new(ffmpeg_cmd)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                input_path,
+                "-vcodec",
+                "copy",
+                "-an",
+                "-bsf:v",
+                bitstream_filter,
+                "-f",
+                output_format,
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let stdout = child.stdout.take().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "FFmpeg demux stdout unavailable",
+            )
+        })?;
+        let stderr_tail = SharedStderrTail::new();
+        if let Some(stderr) = child.stderr.take() {
+            stderr_tail.spawn_reader(stderr);
+        }
+
         Ok(Self {
-            file: std::fs::File::open(path)?,
+            child,
+            stdout,
+            stderr_tail,
             eof: false,
             pts_counter: 0,
         })
@@ -1108,7 +1105,7 @@ impl FileBitstreamSource {
 }
 
 #[cfg(feature = "native_engine")]
-impl videoforge_engine::codecs::nvdec::BitstreamSource for FileBitstreamSource {
+impl videoforge_engine::codecs::nvdec::BitstreamSource for FfmpegBitstreamSource {
     fn read_packet(
         &mut self,
     ) -> videoforge_engine::error::Result<Option<videoforge_engine::codecs::nvdec::BitstreamPacket>>
@@ -1119,25 +1116,31 @@ impl videoforge_engine::codecs::nvdec::BitstreamSource for FileBitstreamSource {
             return Ok(None);
         }
 
-        // Feed in 1 MiB chunks.  The NVDEC parser handles cross-chunk NAL
-        // boundaries internally, so we can stream reads directly from disk.
         const CHUNK: usize = 1024 * 1024;
         let mut chunk = vec![0_u8; CHUNK];
-        let bytes_read = self.file.read(&mut chunk).map_err(|e| {
+        let bytes_read = self.stdout.read(&mut chunk).map_err(|e| {
             videoforge_engine::error::EngineError::Decode(format!(
-                "read elementary stream: {e}"
+                "read FFmpeg demux stream: {e}"
             ))
         })?;
+
         if bytes_read == 0 {
             self.eof = true;
+            let status = self.child.wait().map_err(|e| {
+                videoforge_engine::error::EngineError::Decode(format!(
+                    "wait for FFmpeg demux process: {e}"
+                ))
+            })?;
+            if !status.success() {
+                return Err(videoforge_engine::error::EngineError::Decode(format!(
+                    "FFmpeg demux failed with {status}: {}",
+                    self.stderr_tail.snapshot()
+                )));
+            }
             return Ok(None);
         }
-        chunk.truncate(bytes_read);
-        if bytes_read < CHUNK {
-            self.eof = true;
-        }
 
-        // Heuristic keyframe detection: IDR NAL type 0x65 after a start code.
+        chunk.truncate(bytes_read);
         let is_keyframe = chunk.windows(5).any(|w| {
             (w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 1 && (w[4] & 0x1F) == 5)
                 || (w[0] == 0 && w[1] == 0 && w[2] == 1 && (w[3] & 0x1F) == 5)
@@ -1159,21 +1162,152 @@ impl videoforge_engine::codecs::nvdec::BitstreamSource for FileBitstreamSource {
 // =============================================================================
 
 #[cfg(feature = "native_engine")]
-struct FileBitstreamSink {
-    file: std::fs::File,
+struct StreamingMuxSink {
+    ffmpeg_cmd: String,
+    output_path: String,
+    original_input: String,
+    preserve_audio: bool,
+    codec_hint: StreamingCodecHint,
+    stderr_tail: SharedStderrTail,
+    child: Option<std::process::Child>,
+    stdin: Option<std::process::ChildStdin>,
 }
 
 #[cfg(feature = "native_engine")]
-impl FileBitstreamSink {
-    fn new(path: &Path) -> std::io::Result<Self> {
+impl StreamingMuxSink {
+    fn new(
+        ffmpeg_cmd: &str,
+        output_path: &str,
+        original_input: &str,
+        preserve_audio: bool,
+        codec_hint: StreamingCodecHint,
+    ) -> std::io::Result<Self> {
         Ok(Self {
-            file: std::fs::File::create(path)?,
+            ffmpeg_cmd: ffmpeg_cmd.to_string(),
+            output_path: output_path.to_string(),
+            original_input: original_input.to_string(),
+            preserve_audio,
+            codec_hint,
+            stderr_tail: SharedStderrTail::new(),
+            child: None,
+            stdin: None,
+        })
+    }
+
+    fn ensure_started(
+        &mut self,
+        bitstream_format: &'static str,
+    ) -> videoforge_engine::error::Result<&mut std::process::ChildStdin> {
+        use std::process::{Command, Stdio};
+
+        if self.stdin.is_none() {
+            let mut cmd = Command::new(&self.ffmpeg_cmd);
+            cmd.arg("-y")
+                .arg("-hide_banner")
+                .arg("-loglevel")
+                .arg("warning")
+                .arg("-f")
+                .arg(bitstream_format)
+                .arg("-i")
+                .arg("-");
+
+            if self.preserve_audio {
+                cmd.arg("-i").arg(&self.original_input);
+            }
+
+            cmd.arg("-c:v").arg("copy");
+
+            if self.preserve_audio {
+                cmd.arg("-c:a")
+                    .arg("copy")
+                    .arg("-map")
+                    .arg("0:v:0")
+                    .arg("-map")
+                    .arg("1:a?");
+            } else {
+                cmd.arg("-an");
+            }
+
+            cmd.arg("-movflags")
+                .arg("+faststart")
+                .arg(&self.output_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+
+            let mut child = cmd.spawn().map_err(|e| {
+                videoforge_engine::error::EngineError::Encode(format!(
+                    "FFmpeg mux spawn failed for {bitstream_format}: {e}"
+                ))
+            })?;
+            if let Some(stderr) = child.stderr.take() {
+                self.stderr_tail.spawn_reader(stderr);
+            }
+            let stdin = child.stdin.take().ok_or_else(|| {
+                videoforge_engine::error::EngineError::Encode("Mux stdin unavailable".into())
+            })?;
+            self.stdin = Some(stdin);
+            self.child = Some(child);
+        }
+
+        self.stdin.as_mut().ok_or_else(|| {
+            videoforge_engine::error::EngineError::Encode("Mux stdin closed".into())
         })
     }
 }
 
 #[cfg(feature = "native_engine")]
-impl videoforge_engine::codecs::nvenc::BitstreamSink for FileBitstreamSink {
+fn infer_annex_b_bitstream_format(data: &[u8]) -> Option<&'static str> {
+    let mut i = 0usize;
+    while i + 4 < data.len() {
+        let (nal_start, header_index) = if data[i..].starts_with(&[0, 0, 1]) {
+            (i, i + 3)
+        } else if data[i..].starts_with(&[0, 0, 0, 1]) {
+            (i, i + 4)
+        } else {
+            i += 1;
+            continue;
+        };
+
+        if header_index >= data.len() {
+            break;
+        }
+
+        let header = data[header_index];
+        let h264_type = header & 0x1F;
+        if matches!(h264_type, 1 | 5 | 7 | 8) {
+            return Some("h264");
+        }
+
+        if header_index + 1 < data.len() {
+            let hevc_type = (header >> 1) & 0x3F;
+            if matches!(hevc_type, 1 | 19 | 20 | 32 | 33 | 34) {
+                return Some("hevc");
+            }
+        }
+
+        i = nal_start + 3;
+    }
+
+    None
+}
+
+#[cfg(feature = "native_engine")]
+fn pick_streaming_mux_format(data: &[u8]) -> &'static str {
+    match infer_annex_b_bitstream_format(data) {
+        Some(format) => format,
+        None => {
+            tracing::warn!(
+                bytes = data.len(),
+                "Could not infer Annex B bitstream format from packet; defaulting streaming mux to HEVC"
+            );
+            "hevc"
+        }
+    }
+}
+
+#[cfg(feature = "native_engine")]
+impl videoforge_engine::codecs::nvenc::BitstreamSink for StreamingMuxSink {
     fn write_packet(
         &mut self,
         data: &[u8],
@@ -1181,16 +1315,39 @@ impl videoforge_engine::codecs::nvenc::BitstreamSink for FileBitstreamSink {
         _is_keyframe: bool,
     ) -> videoforge_engine::error::Result<()> {
         use std::io::Write;
-        self.file
+        let bitstream_format = self
+            .codec_hint
+            .get()
+            .unwrap_or_else(|| pick_streaming_mux_format(data));
+        let stdin = self.ensure_started(bitstream_format)?;
+        stdin
             .write_all(data)
             .map_err(|e| videoforge_engine::error::EngineError::Encode(e.to_string()))
     }
 
     fn flush(&mut self) -> videoforge_engine::error::Result<()> {
-        use std::io::Write;
-        self.file
-            .flush()
-            .map_err(|e| videoforge_engine::error::EngineError::Encode(e.to_string()))
+        if self.child.is_none() {
+            return Err(videoforge_engine::error::EngineError::Encode(
+                "Streaming mux never received any packets".into(),
+            ));
+        }
+        drop(self.stdin.take());
+        let child = self.child.take().ok_or_else(|| {
+            videoforge_engine::error::EngineError::Encode("Mux process missing".into())
+        })?;
+        let output = child.wait_with_output().map_err(|e| {
+            videoforge_engine::error::EngineError::Encode(format!(
+                "FFmpeg mux wait failed: {e}"
+            ))
+        })?;
+        if !output.status.success() {
+            return Err(videoforge_engine::error::EngineError::Encode(format!(
+                "FFmpeg mux failed with {}: {}",
+                output.status,
+                self.stderr_tail.snapshot()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1335,7 +1492,12 @@ impl videoforge_engine::engine::pipeline::FrameEncoder for SoftwareBitstreamEnco
         }
 
         self.ctx.sync_all()?;
-        let host = self.ctx.device().dtoh_sync_copy(&*frame.texture.data).map_err(|e| {
+        let storage = frame.texture.data.owned_storage().ok_or_else(|| {
+            videoforge_engine::error::EngineError::Encode(
+                "Software fallback encoder requires an owned NV12 allocation".into(),
+            )
+        })?;
+        let host = self.ctx.device().dtoh_sync_copy(&**storage).map_err(|e| {
             videoforge_engine::error::EngineError::Encode(format!(
                 "Software fallback DtoH readback failed: {e}"
             ))
@@ -1458,6 +1620,7 @@ struct NativeVideoEncoderWrapper {
     frames_encoded: u64,
     mode: NativeEncoderModeHandle,
     detail: NativeEncoderDetailHandle,
+    mux_codec_hint: StreamingCodecHint,
 }
 
 #[cfg(feature = "native_engine")]
@@ -1469,6 +1632,7 @@ impl NativeVideoEncoderWrapper {
         sink: Box<dyn videoforge_engine::codecs::nvenc::BitstreamSink>,
         config: videoforge_engine::codecs::nvenc::NvEncConfig,
         output_path: PathBuf,
+        mux_codec_hint: StreamingCodecHint,
     ) -> videoforge_engine::error::Result<Self> {
         let fallback = NativeVideoEncoderConfig {
             ctx,
@@ -1478,13 +1642,17 @@ impl NativeVideoEncoderWrapper {
         };
         let detail = NativeEncoderDetailHandle::default();
         match videoforge_engine::codecs::nvenc::NvEncoder::new(cuda_ctx, sink, config) {
-            Ok(enc) => Ok(Self {
-                inner: Some(NativeVideoEncoder::Nvenc(enc)),
-                fallback,
-                frames_encoded: 0,
-                mode: NativeEncoderModeHandle::new(NativeEncoderModeHandle::NVENC),
-                detail,
-            }),
+            Ok(enc) => {
+                mux_codec_hint.set(enc.output_codec_name());
+                Ok(Self {
+                    inner: Some(NativeVideoEncoder::Nvenc(enc)),
+                    fallback,
+                    frames_encoded: 0,
+                    mode: NativeEncoderModeHandle::new(NativeEncoderModeHandle::NVENC),
+                    detail,
+                    mux_codec_hint,
+                })
+            }
             Err(err) => {
                 detail.set(format!("nvenc_init_failed: {err}"));
                 tracing::warn!(
@@ -1527,6 +1695,7 @@ impl videoforge_engine::engine::pipeline::FrameEncoder for NativeVideoEncoderWra
                         }
                         _ => self.mode.set(NativeEncoderModeHandle::NVENC),
                     }
+                    self.mux_codec_hint.set(enc.output_codec_name());
                     self.inner = Some(NativeVideoEncoder::Nvenc(enc));
                     Ok(())
                 }
