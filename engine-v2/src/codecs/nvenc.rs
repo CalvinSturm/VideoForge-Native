@@ -250,6 +250,14 @@ fn preset_attempts() -> [PresetAttempt; 6] {
 }
 
 impl NvEncoder {
+    pub fn runtime_mode(&self) -> &'static str {
+        if self.use_legacy_staging {
+            "nvenc_legacy_staging"
+        } else {
+            "nvenc"
+        }
+    }
+
     #[inline]
     fn struct_version(&self, ver: u32) -> u32 {
         nvenc_struct_version_with_api(self.nvenc_api_version, ver)

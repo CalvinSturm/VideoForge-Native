@@ -1229,7 +1229,8 @@ struct NativeEncoderModeHandle(Arc<AtomicU8>);
 #[cfg(feature = "native_engine")]
 impl NativeEncoderModeHandle {
     const NVENC: u8 = 1;
-    const SOFTWARE: u8 = 2;
+    const NVENC_LEGACY_STAGING: u8 = 2;
+    const SOFTWARE: u8 = 3;
 
     fn new(initial: u8) -> Self {
         Self(Arc::new(AtomicU8::new(initial)))
@@ -1242,6 +1243,7 @@ impl NativeEncoderModeHandle {
     fn as_str(&self) -> &'static str {
         match self.0.load(Ordering::Relaxed) {
             Self::NVENC => "nvenc",
+            Self::NVENC_LEGACY_STAGING => "nvenc_legacy_staging",
             Self::SOFTWARE => "software",
             _ => "unknown",
         }
@@ -1357,6 +1359,12 @@ impl videoforge_engine::engine::pipeline::FrameEncoder for NativeVideoEncoderWra
             NativeVideoEncoder::Nvenc(mut enc) => match enc.encode(frame.clone()) {
                 Ok(()) => {
                     self.frames_encoded += 1;
+                    match enc.runtime_mode() {
+                        "nvenc_legacy_staging" => {
+                            self.mode.set(NativeEncoderModeHandle::NVENC_LEGACY_STAGING)
+                        }
+                        _ => self.mode.set(NativeEncoderModeHandle::NVENC),
+                    }
                     self.inner = Some(NativeVideoEncoder::Nvenc(enc));
                     Ok(())
                 }
