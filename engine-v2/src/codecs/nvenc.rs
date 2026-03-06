@@ -771,8 +771,9 @@ impl NvEncoder {
         let dst_dev_ptr = self.ensure_legacy_staging()?;
         let dst_pitch = self.config.nv12_pitch;
         let y_bytes = width as usize;
-        let uv_height = (height / 2) as usize;
+        let uv_height = height.div_ceil(2) as usize;
         let y_height = height as usize;
+        let uv_row_bytes = width.div_ceil(2) as usize * 2;
 
         let y_copy = CUDA_MEMCPY2D {
             srcXInBytes: 0,
@@ -795,26 +796,31 @@ impl NvEncoder {
 
         let uv_copy = CUDA_MEMCPY2D {
             srcXInBytes: 0,
-            srcY: 0,
+            srcY: height as usize,
             srcMemoryType: CUmemorytype::Device,
             srcHost: std::ptr::null(),
-            srcDevice: (src_dev_ptr + (src_pitch as u64 * height as u64)) as CUdeviceptr,
+            srcDevice: src_dev_ptr as CUdeviceptr,
             srcArray: std::ptr::null_mut(),
             srcPitch: src_pitch as usize,
             dstXInBytes: 0,
-            dstY: 0,
+            dstY: height as usize,
             dstMemoryType: CUmemorytype::Device,
             dstHost: std::ptr::null_mut(),
-            dstDevice: (dst_dev_ptr + (dst_pitch as u64 * height as u64)) as CUdeviceptr,
+            dstDevice: dst_dev_ptr as CUdeviceptr,
             dstArray: std::ptr::null_mut(),
             dstPitch: dst_pitch as usize,
-            WidthInBytes: y_bytes,
+            WidthInBytes: uv_row_bytes,
             Height: uv_height,
         };
 
         unsafe {
             check_cu_encode(cuMemcpy2D_v2(&y_copy as *const _), "cuMemcpy2D_v2 Y (nvenc)")?;
-            check_cu_encode(cuMemcpy2D_v2(&uv_copy as *const _), "cuMemcpy2D_v2 UV (nvenc)")?;
+            if let Err(err) = check_cu_encode(cuMemcpy2D_v2(&uv_copy as *const _), "cuMemcpy2D_v2 UV (nvenc)") {
+                return Err(EngineError::Encode(format!(
+                    "cuMemcpy2D_v2 UV (nvenc) failed: {err} [src_pitch={}, dst_pitch={}, width={}, uv_row_bytes={}, height={}, uv_height={}]",
+                    src_pitch, dst_pitch, width, uv_row_bytes, height, uv_height
+                )));
+            }
         }
         Ok(dst_dev_ptr)
     }
