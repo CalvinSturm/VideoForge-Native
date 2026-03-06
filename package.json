@@ -5,8 +5,10 @@
   "scripts": {
     "dev": "npx --prefix ui tauri dev",
     "dev:native": "npx --prefix ui tauri dev --features native_engine",
+    "dev:native:cached": "pwsh -NoProfile -Command \"$env:VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE='1'; if (-not $env:VIDEOFORGE_TRT_CACHE_DIR) { $env:VIDEOFORGE_TRT_CACHE_DIR = (Join-Path $PWD 'artifacts/trt_cache') }; npx --prefix ui tauri dev --features native_engine\"",
     "build": "npx --prefix ui tauri build",
     "build:native": "npx --prefix ui tauri build --features native_engine",
+    "build:native:cached": "pwsh -NoProfile -Command \"$env:VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE='1'; if (-not $env:VIDEOFORGE_TRT_CACHE_DIR) { $env:VIDEOFORGE_TRT_CACHE_DIR = (Join-Path $PWD 'artifacts/trt_cache') }; npx --prefix ui tauri build --features native_engine\"",
     "ui-install": "npm install --prefix ui",
     "tauri": "npx --prefix ui tauri"
   },
