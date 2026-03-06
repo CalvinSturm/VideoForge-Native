@@ -51,6 +51,12 @@ pub struct ModelMetadata {
     /// Output tensor storage type from the ONNX graph.
     pub output_format: PixelFormat,
 
+    /// Whether runtime batch sizes > 1 appear safe for this model.
+    ///
+    /// This is conservative. Models with fixed `N=1` batch axes stay on the
+    /// sequential path even if the runtime accepts larger bound tensors.
+    pub supports_runtime_batching: bool,
+
     /// Minimum supported input spatial dimensions.
     /// Models with dynamic axes report `(1, 1)`.
     pub min_input_hw: (u32, u32),

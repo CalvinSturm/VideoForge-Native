@@ -173,6 +173,29 @@
   - add real hardware before/after numbers once a representative native test clip and ONNX model are selected for the team baseline
   - if image-level corruption is still reported visually after the packet-count/duration fix, compare extracted frames from `output_batch1_cfgfix.mp4` and `output_batch4_cfgfix.mp4` to rule out a remaining batch-output ownership issue
   - if a future optimization effort needs true GPU overlap measurement rather than queue-gap sampling, replace the current decode-to-preprocess sampled timer with explicit cross-stream stage-pair telemetry
+  - controlled native benchmark matrix on `input.mp4` was recorded under `artifacts/benchmarks/native_matrix/`:
+    - `SPAN fp16 batch=1`: `elapsed_ms=52662`, `inference_avg_us=826930`, `encode_avg_us=1737`, `vram_peak_mb=31`, `encoder_mode=nvenc`
+    - `SPAN fp16 batch=4`: `elapsed_ms=80624`, `inference_avg_us=1284791`, `encode_avg_us=1783`, `vram_peak_mb=60`, `encoder_mode=nvenc`
+    - `Nomos fp32 batch=1`: `elapsed_ms=97102`, `inference_avg_us=1333370`, `encode_avg_us=30696`, `vram_peak_mb=79`, `encoder_mode=nvenc`
+    - `Nomos fp32 batch=4`: `elapsed_ms=93071`, `inference_avg_us=1265306`, `encode_avg_us=45182`, `vram_peak_mb=122`, `encoder_mode=nvenc`
+  - important interpretation from that matrix:
+    - on this clip and runtime, CNN batching did not improve throughput and increased VRAM materially
+    - the transformer `batch=4` result is not evidence of true batching speedup, because transformer-family models are currently conservatively routed to sequential execution
+    - overlap telemetry still reports `overlap_pct=0.0` in every case, so it remains useful only as a gap sampler, not as proof of real cross-stream overlap
+  - profiling semantics were tightened after the first matrix run so batched inference and postprocess now report both per-dispatch and per-frame-equivalent timings instead of one ambiguous average
+  - rerunning `SPAN fp16 batch=4` after the profiler fix produced:
+    - `elapsed_ms=85552`
+    - `inference_dispatch_avg_us=5010431`
+    - `inference_frame_equiv_us=1314211`
+    - `inference_dispatches=16`
+    - `postprocess_dispatch_avg_us=216`
+    - `postprocess_frame_equiv_us=56`
+  - follow-up investigation showed that the apparent `SPAN batch=4` slowdown was heavily polluted by lazy TensorRT engine/profile build on the first real inference dispatch:
+    - uncached `SPAN fp16 batch=4`: `elapsed_ms=85552`
+    - same model with TRT cache enabled, first cache-populating run: `elapsed_ms=80196`
+    - same model with TRT cache enabled, second warm run: `elapsed_ms=1043`, `inference_dispatch_avg_us=7509`, `inference_frame_equiv_us=1969`
+  - `videoforge_bench` now supports native warm benchmarking directly via `--trt-cache --warmup-runs <n>`, so future comparisons can exclude one-time TensorRT cold-start compilation noise without manual env-var setup
+  - next optimization target should be chosen from measured evidence rather than assumptions; likely candidates are backend execution tuning for CNN models and profiler fidelity, not broader host-architecture changes
 
 #### Native Verification Workflow
 - Correctness smoke:
@@ -261,6 +284,7 @@
   - both major temp-file boundaries have now been removed from the direct native path, but the preferred long-term contract still needs to be formalized: streamed FFmpeg demux/mux around `engine-v2` vs a tighter native-only container/output path
   - direct NVENC registration now works on this runtime, so the main remaining native-engine unknowns are profiler/overlap fidelity and whether further host-boundary simplification is worth the risk
   - known-bad transformer export `weights/4xNomos2_hq_dat2_fp32.fp16.onnx` is now filtered from normal model discovery, and explicit native use of that file returns an `Invalid ONNX artifact` error instead of a generic backend-init failure
+  - transformer-family ONNX models are currently routed off the true batched inference path and back to sequential execution even when the graph advertises dynamic batch axes; this remains a conservative guard, but the original `4xNomos2_hq_dat2_fp32.onnx` `max_batch=4` concern was not reproduced in multiple players and appears to have been a VLC playback false signal rather than a confirmed engine-output corruption bug
   - the current mux-format fallback is intentionally conservative; if the runtime later selects H.264 more often, the sink should receive codec information directly from the encoder instead of inferring it from packets
   - benchmark/probe steps should not be run in parallel when validating streamed output files, because probing can race the still-running benchmark process and report a false missing-file result
 

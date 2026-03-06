@@ -34,6 +34,10 @@ struct BenchArgs {
     max_batch: u32,
     #[allow(dead_code)]
     preserve_audio: bool,
+    #[allow(dead_code)]
+    trt_cache: bool,
+    #[allow(dead_code)]
+    warmup_runs: u32,
 }
 
 #[derive(Default)]
@@ -226,19 +230,56 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
         } else {
             env::remove_var("VIDEOFORGE_NATIVE_ENGINE_DIRECT");
         }
+        if args.trt_cache {
+            let cache_dir = default_trt_cache_dir();
+            if let Err(err) = std::fs::create_dir_all(&cache_dir) {
+                emit_error_and_exit(&format!(
+                    "Failed to create TensorRT cache directory {}: {err}",
+                    cache_dir.display()
+                ));
+            }
+            env::set_var("VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE", "1");
+            env::set_var("VIDEOFORGE_TRT_CACHE_DIR", &cache_dir);
+        }
     }
 
-    match upscale_request_native(
-        args.input.clone(),
-        args.output.clone(),
-        onnx_model.clone(),
-        args.scale,
-        Some(precision.to_string()),
-        Some(args.preserve_audio),
-        Some(args.max_batch),
-    )
-    .await
-    {
+    for warmup_idx in 0..args.warmup_runs {
+        let warmup_output = warmup_output_path(&args.output, warmup_idx + 1);
+        emit_json(json!({
+            "event": "warmup_start",
+            "index": warmup_idx + 1,
+            "output": warmup_output,
+            "native_direct": args.native_direct,
+            "trt_cache_enabled": args.trt_cache,
+        }));
+        let warmup_started = Instant::now();
+        match run_native_once(
+            args,
+            precision,
+            onnx_model,
+            &warmup_output,
+        )
+        .await
+        {
+            Ok(report) => {
+                emit_json(json!({
+                    "event": "warmup_done",
+                    "index": warmup_idx + 1,
+                    "elapsed_ms": warmup_started.elapsed().as_millis(),
+                    "engine": report.engine,
+                    "encoder_mode": report.encoder_mode,
+                    "frames_processed": report.frames_processed,
+                    "trt_cache_enabled": report.trt_cache_enabled,
+                    "trt_cache_dir": report.trt_cache_dir,
+                    "output": report.output_path,
+                }));
+                let _ = std::fs::remove_file(&warmup_output);
+            }
+            Err(message) => emit_error_and_exit(&message),
+        }
+    }
+
+    match run_native_once(args, precision, onnx_model, &args.output).await {
         Ok(report) => emit_json(json!({
             "event": "done",
             "output": report.output_path,
@@ -253,6 +294,7 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
             "mode": "native",
             "native_direct": args.native_direct,
             "max_batch": args.max_batch,
+            "warmup_runs": args.warmup_runs,
         })),
         Err(message) => emit_error_and_exit(&message),
     }
@@ -280,6 +322,44 @@ fn check_command(cmd: &str) -> Result<(), String> {
             "{cmd} returned non-zero status when running '-version'"
         ))
     }
+}
+
+#[cfg(feature = "native_engine")]
+async fn run_native_once(
+    args: &BenchArgs,
+    precision: &str,
+    onnx_model: &str,
+    output_path: &str,
+) -> Result<app_lib::commands::native_engine::NativeUpscaleResult, String> {
+    upscale_request_native(
+        args.input.clone(),
+        output_path.to_string(),
+        onnx_model.to_string(),
+        args.scale,
+        Some(precision.to_string()),
+        Some(args.preserve_audio),
+        Some(args.max_batch),
+    )
+    .await
+}
+
+fn default_trt_cache_dir() -> std::path::PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("artifacts")
+        .join("benchmarks")
+        .join("trt_cache")
+}
+
+fn warmup_output_path(output: &str, run_idx: u32) -> String {
+    let path = Path::new(output);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    parent
+        .join(format!("{stem}.warmup{run_idx}.{ext}"))
+        .to_string_lossy()
+        .to_string()
 }
 
 fn parse_total_from_message(message: &str) -> Option<u64> {
@@ -323,6 +403,8 @@ fn parse_args(args: Vec<String>) -> Result<BenchArgs, CliExit> {
     let mut onnx_model = None;
     let mut max_batch = 1u32;
     let mut preserve_audio = false;
+    let mut trt_cache = false;
+    let mut warmup_runs = 0u32;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -348,6 +430,10 @@ fn parse_args(args: Vec<String>) -> Result<BenchArgs, CliExit> {
                 preserve_audio = true;
                 i += 1;
             }
+            "--trt-cache" => {
+                trt_cache = true;
+                i += 1;
+            }
             "--input" => {
                 input = Some(next_value(&args, &mut i, "--input")?);
             }
@@ -369,6 +455,12 @@ fn parse_args(args: Vec<String>) -> Result<BenchArgs, CliExit> {
                     return Err(CliExit::Error("--max-batch must be >= 1".to_string()));
                 }
                 max_batch = parsed;
+            }
+            "--warmup-runs" => {
+                let raw = next_value(&args, &mut i, "--warmup-runs")?;
+                warmup_runs = raw.parse::<u32>().map_err(|_| {
+                    CliExit::Error(format!("Invalid --warmup-runs '{}': expected u32", raw))
+                })?;
             }
             "--scale" => {
                 let raw = next_value(&args, &mut i, "--scale")?;
@@ -434,6 +526,8 @@ fn parse_args(args: Vec<String>) -> Result<BenchArgs, CliExit> {
         onnx_model,
         max_batch,
         preserve_audio,
+        trt_cache,
+        warmup_runs,
     })
 }
 
@@ -452,6 +546,6 @@ fn required_arg<T>(value: Option<T>, flag: &str) -> Result<T, CliExit> {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  Python mode:\n    cargo run --bin videoforge_bench -- --input <path> --output <path> --model <key> --scale <u32> --precision <fp16|fp32> [--deterministic] [--edit-config <json>] [--dry-run]\n  Native mode:\n    cargo run --features native_engine --bin videoforge_bench -- --native --input <path> --output <path> --onnx-model <path> --scale <u32> --precision <fp16|fp32> [--max-batch <u32>] [--native-direct] [--preserve-audio] [--dry-run]"
+        "Usage:\n  Python mode:\n    cargo run --bin videoforge_bench -- --input <path> --output <path> --model <key> --scale <u32> --precision <fp16|fp32> [--deterministic] [--edit-config <json>] [--dry-run]\n  Native mode:\n    cargo run --features native_engine --bin videoforge_bench -- --native --input <path> --output <path> --onnx-model <path> --scale <u32> --precision <fp16|fp32> [--max-batch <u32>] [--native-direct] [--preserve-audio] [--trt-cache] [--warmup-runs <u32>] [--dry-run]"
     );
 }

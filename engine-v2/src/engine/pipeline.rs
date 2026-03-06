@@ -240,6 +240,8 @@ pub struct PipelineMetrics {
     pub frames_preprocessed: AtomicU64,
     pub frames_inferred: AtomicU64,
     pub frames_encoded: AtomicU64,
+    pub inference_dispatches: AtomicU64,
+    pub postprocess_dispatches: AtomicU64,
     // Stage latency accumulators (microseconds).
     pub preprocess_total_us: AtomicU64,
     pub inference_total_us: AtomicU64,
@@ -254,6 +256,8 @@ impl PipelineMetrics {
             frames_preprocessed: AtomicU64::new(0),
             frames_inferred: AtomicU64::new(0),
             frames_encoded: AtomicU64::new(0),
+            inference_dispatches: AtomicU64::new(0),
+            postprocess_dispatches: AtomicU64::new(0),
             preprocess_total_us: AtomicU64::new(0),
             inference_total_us: AtomicU64::new(0),
             postprocess_total_us: AtomicU64::new(0),
@@ -275,6 +279,8 @@ impl PipelineMetrics {
         let pp = self.frames_preprocessed.load(Ordering::Relaxed);
         let inf = self.frames_inferred.load(Ordering::Relaxed);
         let enc = self.frames_encoded.load(Ordering::Relaxed);
+        let inf_dispatches = self.inference_dispatches.load(Ordering::Relaxed);
+        let post_dispatches = self.postprocess_dispatches.load(Ordering::Relaxed);
 
         let avg = |total: &AtomicU64, count: u64| -> u64 {
             if count > 0 {
@@ -286,8 +292,10 @@ impl PipelineMetrics {
 
         info!(
             preprocess_avg_us = avg(&self.preprocess_total_us, pp),
-            inference_avg_us = avg(&self.inference_total_us, inf),
-            postprocess_avg_us = avg(&self.postprocess_total_us, inf),
+            inference_frame_equiv_us = avg(&self.inference_total_us, inf),
+            inference_dispatch_avg_us = avg(&self.inference_total_us, inf_dispatches),
+            postprocess_frame_equiv_us = avg(&self.postprocess_total_us, inf),
+            postprocess_dispatch_avg_us = avg(&self.postprocess_total_us, post_dispatches),
             encode_avg_us = avg(&self.encode_total_us, enc),
             "Stage latencies"
         );
@@ -1356,10 +1364,12 @@ async fn inference_stage<B: UpscaleBackend>(
         metrics
             .inference_total_us
             .fetch_add(infer_us, Ordering::Relaxed);
+        metrics.inference_dispatches.fetch_add(1, Ordering::Relaxed);
 
         // Phase 8: profiler hook — inference GPU timing.
         if let Some(pctx) = profiler_ctx {
-            pctx.profiler.record_stage(PerfStage::Inference, infer_us);
+            pctx.profiler
+                .record_stage_frames(PerfStage::Inference, infer_us, metas.len() as u64);
         }
 
         // Recycle the consumed RGB input buffer.
@@ -1421,10 +1431,14 @@ async fn inference_stage<B: UpscaleBackend>(
         metrics
             .postprocess_total_us
             .fetch_add(post_us, Ordering::Relaxed);
+        metrics
+            .postprocess_dispatches
+            .fetch_add(1, Ordering::Relaxed);
 
         // Phase 8: profiler hook — postprocess GPU timing.
         if let Some(pctx) = profiler_ctx {
-            pctx.profiler.record_stage(PerfStage::Postprocess, post_us);
+            pctx.profiler
+                .record_stage_frames(PerfStage::Postprocess, post_us, metas.len() as u64);
             // Record total frame latency (inference + postprocess).
             pctx.profiler.record_frame_latency(infer_us + post_us);
         }

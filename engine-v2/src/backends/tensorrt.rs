@@ -442,6 +442,31 @@ impl TensorRtBackend {
         downstream_capacity + max_batch.max(1) + 1
     }
 
+    fn supports_runtime_batching(
+        input_batch_dim: Option<i64>,
+        output_batch_dim: Option<i64>,
+    ) -> bool {
+        input_batch_dim.is_none() && output_batch_dim.is_none()
+    }
+
+    fn is_transformer_family_model(model_path: &std::path::Path) -> bool {
+        let stem = model_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let patterns = [
+            "dat",
+            "hat",
+            "swin",
+            "grl",
+            "nomos",
+            "realwebphoto",
+            "apisr",
+        ];
+        patterns.iter().any(|pattern| stem.contains(pattern))
+    }
+
     fn release_state_resources(&self, state: InferenceState) {
         let InferenceState {
             session,
@@ -720,6 +745,15 @@ impl TensorRtBackend {
         }
 
         let input_channels = input_dims[1].unwrap_or(3) as u32;
+        let dynamic_batch_axes = Self::supports_runtime_batching(input_dims[0], output_dims[0]);
+        let transformer_family = Self::is_transformer_family_model(model_path);
+        let supports_runtime_batching = dynamic_batch_axes && !transformer_family;
+        if dynamic_batch_axes && transformer_family {
+            warn!(
+                model = %model_path.display(),
+                "Model looks transformer-based; disabling batched inference until batch stability is validated"
+            );
+        }
 
         let scale = match (input_dims[2], input_dims[3], output_dims[2], output_dims[3]) {
             (Some(ih), Some(iw), Some(oh), Some(ow)) if ih > 0 && iw > 0 && oh > 0 && ow > 0 => {
@@ -771,6 +805,7 @@ impl TensorRtBackend {
             input_channels,
             input_format: tensor_pixel_format(input_elem_type)?,
             output_format: tensor_pixel_format(output_elem_type)?,
+            supports_runtime_batching,
             min_input_hw,
             max_input_hw,
         })
@@ -1071,6 +1106,7 @@ impl UpscaleBackend for TensorRtBackend {
             scale = metadata.scale,
             input = %metadata.input_name,
             output = %metadata.output_name,
+            supports_runtime_batching = metadata.supports_runtime_batching,
             ring_size = self.ring_size,
             min_ring_slots = self.min_ring_slots,
             precision = ?self.precision_policy,
@@ -1214,6 +1250,18 @@ impl UpscaleBackend for TensorRtBackend {
         }
 
         let meta = self.meta.get().ok_or(EngineError::NotInitialized)?;
+        if !meta.supports_runtime_batching {
+            warn!(
+                model = %meta.name,
+                requested_batch = inputs.len(),
+                "Model does not advertise runtime batch support; falling back to sequential execution"
+            );
+            let mut outputs = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                outputs.push(self.process(input.clone()).await?);
+            }
+            return Ok(outputs);
+        }
         let mut guard = self.state.lock().await;
         self.ctx.device().bind_to_thread().map_err(|e| {
             EngineError::ModelMetadata(format!("bind_to_thread (backend process_batch): {:?}", e))
@@ -1373,6 +1421,27 @@ mod tests {
     fn required_ring_slots_scales_with_batch_size() {
         assert_eq!(TensorRtBackend::required_ring_slots(4, 1), 6);
         assert_eq!(TensorRtBackend::required_ring_slots(4, 4), 9);
+    }
+
+    #[test]
+    fn runtime_batching_requires_dynamic_batch_axes() {
+        assert!(TensorRtBackend::supports_runtime_batching(None, None));
+        assert!(!TensorRtBackend::supports_runtime_batching(Some(1), None));
+        assert!(!TensorRtBackend::supports_runtime_batching(None, Some(1)));
+        assert!(!TensorRtBackend::supports_runtime_batching(Some(1), Some(1)));
+    }
+
+    #[test]
+    fn transformer_family_detection_matches_current_models() {
+        assert!(TensorRtBackend::is_transformer_family_model(Path::new(
+            "weights/4xNomos2_hq_dat2_fp32.onnx"
+        )));
+        assert!(TensorRtBackend::is_transformer_family_model(Path::new(
+            "weights/4x_APISR_GRL_GAN_generator_fp16.fp16.onnx"
+        )));
+        assert!(!TensorRtBackend::is_transformer_family_model(Path::new(
+            "weights/2x_SPAN_soft.onnx"
+        )));
     }
 
     #[test]

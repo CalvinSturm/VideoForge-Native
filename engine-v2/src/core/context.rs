@@ -551,9 +551,11 @@ pub struct PerfProfiler {
     /// Inference time (μs).
     pub inference_gpu_us: AtomicU64,
     pub inference_count: AtomicU64,
+    pub inference_frames: AtomicU64,
     /// Postprocess kernel time (μs).
     pub postprocess_gpu_us: AtomicU64,
     pub postprocess_count: AtomicU64,
+    pub postprocess_frames: AtomicU64,
     /// Encode time (μs).
     pub encode_gpu_us: AtomicU64,
     pub encode_count: AtomicU64,
@@ -571,8 +573,10 @@ impl PerfProfiler {
             preprocess_count: AtomicU64::new(0),
             inference_gpu_us: AtomicU64::new(0),
             inference_count: AtomicU64::new(0),
+            inference_frames: AtomicU64::new(0),
             postprocess_gpu_us: AtomicU64::new(0),
             postprocess_count: AtomicU64::new(0),
+            postprocess_frames: AtomicU64::new(0),
             encode_gpu_us: AtomicU64::new(0),
             encode_count: AtomicU64::new(0),
             launch_overhead_us: AtomicU64::new(0),
@@ -584,6 +588,12 @@ impl PerfProfiler {
     /// Record a stage timing sample.
     #[inline]
     pub fn record_stage(&self, stage: PerfStage, elapsed_us: u64) {
+        self.record_stage_frames(stage, elapsed_us, 1);
+    }
+
+    /// Record a stage timing sample and the number of frames covered by it.
+    #[inline]
+    pub fn record_stage_frames(&self, stage: PerfStage, elapsed_us: u64, frames: u64) {
         let (acc, cnt) = match stage {
             PerfStage::Preprocess => (&self.preprocess_gpu_us, &self.preprocess_count),
             PerfStage::Inference => (&self.inference_gpu_us, &self.inference_count),
@@ -592,6 +602,15 @@ impl PerfProfiler {
         };
         acc.fetch_add(elapsed_us, Ordering::Relaxed);
         cnt.fetch_add(1, Ordering::Relaxed);
+        match stage {
+            PerfStage::Inference => {
+                self.inference_frames.fetch_add(frames, Ordering::Relaxed);
+            }
+            PerfStage::Postprocess => {
+                self.postprocess_frames.fetch_add(frames, Ordering::Relaxed);
+            }
+            PerfStage::Preprocess | PerfStage::Encode => {}
+        }
     }
 
     /// Record kernel launch overhead.
@@ -620,10 +639,29 @@ impl PerfProfiler {
 
     /// Report profiling results.
     pub fn report(&self) {
+        let inference_dispatches = self.inference_count.load(Ordering::Relaxed);
+        let inference_frames = self.inference_frames.load(Ordering::Relaxed);
+        let postprocess_dispatches = self.postprocess_count.load(Ordering::Relaxed);
+        let postprocess_frames = self.postprocess_frames.load(Ordering::Relaxed);
         info!(
             preprocess_avg_us = Self::avg(&self.preprocess_gpu_us, &self.preprocess_count),
-            inference_avg_us = Self::avg(&self.inference_gpu_us, &self.inference_count),
-            postprocess_avg_us = Self::avg(&self.postprocess_gpu_us, &self.postprocess_count),
+            inference_dispatch_avg_us = Self::avg(&self.inference_gpu_us, &self.inference_count),
+            inference_frame_equiv_us = if inference_frames > 0 {
+                self.inference_gpu_us.load(Ordering::Relaxed) / inference_frames
+            } else {
+                0
+            },
+            inference_dispatches,
+            inference_frames,
+            postprocess_dispatch_avg_us =
+                Self::avg(&self.postprocess_gpu_us, &self.postprocess_count),
+            postprocess_frame_equiv_us = if postprocess_frames > 0 {
+                self.postprocess_gpu_us.load(Ordering::Relaxed) / postprocess_frames
+            } else {
+                0
+            },
+            postprocess_dispatches,
+            postprocess_frames,
             encode_avg_us = Self::avg(&self.encode_gpu_us, &self.encode_count),
             launch_overhead_avg_us =
                 Self::avg(&self.launch_overhead_us, &self.launch_overhead_count),
@@ -638,8 +676,10 @@ impl PerfProfiler {
         self.preprocess_count.store(0, Ordering::Relaxed);
         self.inference_gpu_us.store(0, Ordering::Relaxed);
         self.inference_count.store(0, Ordering::Relaxed);
+        self.inference_frames.store(0, Ordering::Relaxed);
         self.postprocess_gpu_us.store(0, Ordering::Relaxed);
         self.postprocess_count.store(0, Ordering::Relaxed);
+        self.postprocess_frames.store(0, Ordering::Relaxed);
         self.encode_gpu_us.store(0, Ordering::Relaxed);
         self.encode_count.store(0, Ordering::Relaxed);
         self.launch_overhead_us.store(0, Ordering::Relaxed);
