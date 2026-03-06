@@ -1,6 +1,12 @@
 import { useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { Job, RavePolicy, RaveCommandJson, ModelInfo } from "../types";
+import type {
+    Job,
+    RavePolicy,
+    RaveCommandJson,
+    NativeUpscaleResultJson,
+    ModelInfo
+} from "../types";
 import type { useVideoState } from "./useVideoState";
 import type { useRaveIntegration } from "./useRaveIntegration";
 import { useJobStore } from "../Store/useJobStore";
@@ -86,6 +92,11 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
             let policy: RavePolicy | undefined;
             let hostCopyAuditEnabled: boolean | undefined;
             let hostCopyAuditDisableReason: string | null | undefined;
+            let nativeEngine: string | undefined;
+            let encoderMode: string | undefined;
+            let encoderDetail: string | null | undefined;
+            let framesProcessed: number | undefined;
+            let audioPreserved: boolean | undefined;
             const canUseNative = upscaleConfig.useNativeEngine && video.mode === 'video';
 
             if (canUseNative) {
@@ -107,15 +118,27 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
                         }
                     }
 
-                    const raveResult = await invoke<RaveCommandJson>("rave_upscale", {
-                        args: rave.buildRaveUpscaleArgs({ input: video.inputPath, output: resolvedOutputPath, modelPath: info.path, maxBatch: upscaleConfig.maxBatch, architectureClass: upscaleConfig.architectureClass }),
-                        strictAudit: true, mockRun: false, uiOptIn: true
+                    const nativeResult = await invoke<NativeUpscaleResultJson>("upscale_request_native", {
+                        inputPath: video.inputPath,
+                        outputPath: resolvedOutputPath,
+                        modelPath: info.path,
+                        scale: activeScale,
+                        precision: "fp32",
+                        audio: true,
+                        maxBatch: upscaleConfig.maxBatch
                     });
-                    if (!raveResult.output || typeof raveResult.output !== "string") throw new Error("rave_upscale did not return a valid output path");
-                    resultPath = raveResult.output;
-                    policy = raveResult.policy;
-                    hostCopyAuditEnabled = raveResult.host_copy_audit_enabled;
-                    hostCopyAuditDisableReason = raveResult.host_copy_audit_disable_reason;
+                    if (!nativeResult.output_path || typeof nativeResult.output_path !== "string") throw new Error("upscale_request_native did not return a valid output path");
+                    resultPath = nativeResult.output_path;
+                    nativeEngine = nativeResult.engine;
+                    encoderMode = nativeResult.encoder_mode;
+                    encoderDetail = nativeResult.encoder_detail ?? null;
+                    framesProcessed = nativeResult.frames_processed;
+                    audioPreserved = nativeResult.audio_preserved;
+                    setLogs(prev => [
+                        ...prev,
+                        `[NATIVE] engine=${nativeResult.engine} encoder_mode=${nativeResult.encoder_mode} frames=${nativeResult.frames_processed}`
+                            + (nativeResult.encoder_detail ? ` detail=${nativeResult.encoder_detail}` : "")
+                    ]);
                 } else {
                     addToast(`Native engine requires an ONNX model. "${selectedModel}" is PyTorch-only — using Python pipeline.`, "warning");
                     resultPath = await invoke<string>("upscale_request", upscalePayload);
@@ -129,7 +152,12 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
                 ...newJob, status: 'done', progress: 100, outputPath: resultPath, eta: 0, completedAt: Date.now(),
                 ...(policy ? { policy } : {}),
                 ...(typeof hostCopyAuditEnabled === "boolean" ? { hostCopyAuditEnabled } : {}),
-                ...(hostCopyAuditDisableReason !== undefined ? { hostCopyAuditDisableReason } : {})
+                ...(hostCopyAuditDisableReason !== undefined ? { hostCopyAuditDisableReason } : {}),
+                ...(nativeEngine ? { nativeEngine } : {}),
+                ...(encoderMode ? { encoderMode } : {}),
+                ...(encoderDetail !== undefined ? { encoderDetail } : {}),
+                ...(typeof framesProcessed === "number" ? { framesProcessed } : {}),
+                ...(typeof audioPreserved === "boolean" ? { audioPreserved } : {})
             };
             setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
             setActiveJob(finishedJob);

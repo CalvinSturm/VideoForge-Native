@@ -10,6 +10,23 @@ export interface RavePolicy {
   ort_reexec_gate?: boolean;
 }
 
+export interface RaveCommandJson {
+  output?: string;
+  policy?: RavePolicy;
+  host_copy_audit_enabled?: boolean;
+  host_copy_audit_disable_reason?: string | null;
+  [key: string]: unknown;
+}
+
+export interface NativeUpscaleResultJson {
+  output_path: string;
+  engine: string;
+  encoder_mode: string;
+  encoder_detail?: string | null;
+  frames_processed: number;
+  audio_preserved: boolean;
+}
+
 export interface ColorSettings {
   brightness: number;  // -1.0 to 1.0 (0 = no change)
   contrast: number;    // -1.0 to 1.0 (0 = no change)
@@ -48,6 +65,11 @@ export interface Job {
   policy?: RavePolicy;
   hostCopyAuditEnabled?: boolean;
   hostCopyAuditDisableReason?: string | null;
+  nativeEngine?: string;
+  encoderMode?: string;
+  encoderDetail?: string | null;
+  framesProcessed?: number;
+  audioPreserved?: boolean;
 }
 
 export interface Toast {

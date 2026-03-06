@@ -38,6 +38,15 @@ const formatPolicySummary = (job: Job): string | null => {
   return parts.length > 0 ? parts.join(" | ") : null;
 };
 
+const formatNativeSummary = (job: Job): string[] => {
+  const parts: string[] = [];
+  if (job.nativeEngine) parts.push(`engine=${job.nativeEngine}`);
+  if (job.encoderMode) parts.push(`encoder_mode=${job.encoderMode}`);
+  if (typeof job.framesProcessed === 'number') parts.push(`frames=${job.framesProcessed}`);
+  if (typeof job.audioPreserved === 'boolean') parts.push(`audio_preserved=${job.audioPreserved}`);
+  return parts;
+};
+
 const extractErrorCategory = (job: Job): string | null => {
   if (job.errorCategory) return job.errorCategory;
   if (!job.statusMessage) return null;
@@ -312,6 +321,7 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
             const etaText = isRunning ? formatEta(job.eta) : null;
             const filename = job.command.replace(/^(Upscale|Transcode|Export Edited|PREVIEW SAMPLE):\s*/i, "");
             const policySummary = formatPolicySummary(job);
+            const nativeSummary = formatNativeSummary(job);
             const errorCategory = extractErrorCategory(job);
 
             const elapsedMs = job.startedAt
@@ -474,7 +484,7 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
                 </div>
 
                 {/* Error message */}
-                {isComplete && (job.policy || typeof job.hostCopyAuditEnabled === 'boolean') && (
+                {isComplete && (job.policy || typeof job.hostCopyAuditEnabled === 'boolean' || nativeSummary.length > 0 || job.encoderDetail) && (
                   <div style={{
                     fontSize: '9px',
                     color: 'var(--text-muted)',
@@ -485,6 +495,8 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
                     wordBreak: 'break-word',
                     lineHeight: 1.45
                   }}>
+                    {nativeSummary.map((line) => <div key={line}>{line}</div>)}
+                    {job.encoderDetail && <div>encoder_detail={job.encoderDetail}</div>}
                     {policySummary && <div>{policySummary}</div>}
                     {typeof job.hostCopyAuditEnabled === 'boolean' && (
                       <div>

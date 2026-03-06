@@ -25,7 +25,16 @@ import { TitleBar } from "./components/TitleBar";
 import { PanelHeader } from "./components/PanelHeader";
 import { EmptyState } from "./components/EmptyState";
 
-import type { Toast, UpscaleMode, Job, VideoState, EditState, RavePolicy } from './types';
+import type {
+  Toast,
+  UpscaleMode,
+  Job,
+  VideoState,
+  EditState,
+  RavePolicy,
+  RaveCommandJson,
+  NativeUpscaleResultJson
+} from './types';
 
 interface ModelInfo {
   id: string;
@@ -33,14 +42,6 @@ interface ModelInfo {
   filename: string;
   format: string;  // "onnx" | "pytorch"
   path: string;
-}
-
-interface RaveCommandJson {
-  output?: string;
-  policy?: RavePolicy;
-  host_copy_audit_enabled?: boolean;
-  host_copy_audit_disable_reason?: string | null;
-  [key: string]: unknown;
 }
 
 interface RaveErrorPayload {
@@ -518,10 +519,14 @@ const App: React.FC = () => {
       let policy: RavePolicy | undefined;
       let hostCopyAuditEnabled: boolean | undefined;
       let hostCopyAuditDisableReason: string | null | undefined;
+      let nativeEngine: string | undefined;
+      let encoderMode: string | undefined;
+      let encoderDetail: string | null | undefined;
+      let framesProcessed: number | undefined;
+      let audioPreserved: boolean | undefined;
       const canUseNative = upscaleConfig.useNativeEngine && mode === 'video';
       if (canUseNative) {
         if (info?.format === "onnx") {
-          // Route native-video path through rave-cli JSON contract.
           const resolvedOutputPath = outputPath?.trim() ? outputPath : defaultRaveOutputPath(inputPath);
           if (showTechSpecs) {
             try {
@@ -544,24 +549,29 @@ const App: React.FC = () => {
             }
           }
 
-          const raveResult = await invoke<RaveCommandJson>("rave_upscale", {
-            args: buildRaveUpscaleArgs({
-              input: inputPath,
-              output: resolvedOutputPath,
-              modelPath: info.path,
-              architectureClass: upscaleConfig.architectureClass
-            }),
-            strictAudit: true,
-            mockRun: false,
-            uiOptIn: true
+          const nativeResult = await invoke<NativeUpscaleResultJson>("upscale_request_native", {
+            inputPath,
+            outputPath: resolvedOutputPath,
+            modelPath: info.path,
+            scale: activeScale,
+            precision: "fp32",
+            audio: true,
+            maxBatch: upscaleConfig.maxBatch
           });
-          if (!raveResult.output || typeof raveResult.output !== "string") {
-            throw new Error("rave_upscale did not return a valid output path");
+          if (!nativeResult.output_path || typeof nativeResult.output_path !== "string") {
+            throw new Error("upscale_request_native did not return a valid output path");
           }
-          resultPath = raveResult.output;
-          policy = raveResult.policy;
-          hostCopyAuditEnabled = raveResult.host_copy_audit_enabled;
-          hostCopyAuditDisableReason = raveResult.host_copy_audit_disable_reason;
+          resultPath = nativeResult.output_path;
+          nativeEngine = nativeResult.engine;
+          encoderMode = nativeResult.encoder_mode;
+          encoderDetail = nativeResult.encoder_detail ?? null;
+          framesProcessed = nativeResult.frames_processed;
+          audioPreserved = nativeResult.audio_preserved;
+          setLogs(prev => [
+            ...prev,
+            `[NATIVE] engine=${nativeResult.engine} encoder_mode=${nativeResult.encoder_mode} frames=${nativeResult.frames_processed}`
+              + (nativeResult.encoder_detail ? ` detail=${nativeResult.encoder_detail}` : "")
+          ]);
         } else {
           // Native engine selected but current model is not ONNX — fall back.
           addToast(
@@ -583,7 +593,12 @@ const App: React.FC = () => {
         completedAt: Date.now(),
         ...(policy ? { policy } : {}),
         ...(typeof hostCopyAuditEnabled === "boolean" ? { hostCopyAuditEnabled } : {}),
-        ...(hostCopyAuditDisableReason !== undefined ? { hostCopyAuditDisableReason } : {})
+        ...(hostCopyAuditDisableReason !== undefined ? { hostCopyAuditDisableReason } : {}),
+        ...(nativeEngine ? { nativeEngine } : {}),
+        ...(encoderMode ? { encoderMode } : {}),
+        ...(encoderDetail !== undefined ? { encoderDetail } : {}),
+        ...(typeof framesProcessed === "number" ? { framesProcessed } : {}),
+        ...(typeof audioPreserved === "boolean" ? { audioPreserved } : {})
       };
       setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
       setActiveJob(finishedJob);
