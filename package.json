@@ -4,7 +4,9 @@
   "private": true,
   "scripts": {
     "dev": "npx --prefix ui tauri dev",
+    "dev:native": "npx --prefix ui tauri dev --features native_engine",
     "build": "npx --prefix ui tauri build",
+    "build:native": "npx --prefix ui tauri build --features native_engine",
     "ui-install": "npm install --prefix ui",
     "tauri": "npx --prefix ui tauri"
   },

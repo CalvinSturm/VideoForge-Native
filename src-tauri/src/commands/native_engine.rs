@@ -309,6 +309,7 @@ async fn run_native_via_rave_cli(
     precision: String,
     _preserve_audio: bool,
     max_batch: u32,
+    encoder_detail: Option<String>,
 ) -> Result<NativeUpscaleResult, String> {
     let make_err =
         |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
@@ -375,10 +376,23 @@ async fn run_native_via_rave_cli(
         output_path: output,
         engine: "native_via_rave_cli".to_string(),
         encoder_mode: "rave_cli".to_string(),
-        encoder_detail: None,
+        encoder_detail,
         frames_processed: 0,
         audio_preserved: true,
     })
+}
+
+#[cfg(feature = "native_engine")]
+fn decode_native_error(err_json: &str) -> Option<NativeUpscaleError> {
+    serde_json::from_str(err_json).ok()
+}
+
+#[cfg(feature = "native_engine")]
+fn should_fallback_to_rave_cli(err: &NativeUpscaleError) -> bool {
+    matches!(err.code.as_str(), "ENCODER_INIT" | "PIPELINE")
+        && (err.message.contains("NVENC")
+            || err.message.contains("nvEnc")
+            || err.message.contains("Software fallback"))
 }
 
 // =============================================================================
@@ -451,16 +465,45 @@ pub async fn upscale_request_native(
         let max_batch = max_batch.unwrap_or(1);
 
         if native_engine_direct_enabled() {
-            run_native_pipeline(
-                input_path,
-                output_path,
-                model_path,
+            let direct_result = run_native_pipeline(
+                input_path.clone(),
+                output_path.clone(),
+                model_path.clone(),
                 scale,
-                precision,
+                precision.clone(),
                 audio,
                 max_batch,
             )
-            .await
+            .await;
+
+            match direct_result {
+                Ok(result) => Ok(result),
+                Err(err_json) => {
+                    let Some(err) = decode_native_error(&err_json) else {
+                        return Err(err_json);
+                    };
+                    if should_fallback_to_rave_cli(&err) {
+                        tracing::warn!(
+                            code = %err.code,
+                            message = %err.message,
+                            "Direct native path failed; falling back to CLI-backed native path"
+                        );
+                        run_native_via_rave_cli(
+                            input_path,
+                            output_path,
+                            model_path,
+                            scale,
+                            precision,
+                            audio,
+                            max_batch,
+                            Some(format!("direct_native_failed: {}: {}", err.code, err.message)),
+                        )
+                        .await
+                    } else {
+                        Err(err_json)
+                    }
+                }
+            }
         } else {
             run_native_via_rave_cli(
                 input_path,
@@ -470,6 +513,7 @@ pub async fn upscale_request_native(
                 precision,
                 audio,
                 max_batch,
+                None,
             )
             .await
         }
@@ -1316,23 +1360,11 @@ impl NativeVideoEncoderWrapper {
                 tracing::warn!(
                     error = %err,
                     output = %fallback.output_path.display(),
-                    "NVENC init failed; falling back to software bitstream encoder"
+                    "NVENC init failed; refusing in-process software fallback"
                 );
-                Ok(Self {
-                    inner: Some(NativeVideoEncoder::Software(SoftwareBitstreamEncoder::new(
-                        fallback.ctx.clone(),
-                        &fallback.ffmpeg_cmd,
-                        &fallback.output_path,
-                        fallback.enc_config.width,
-                        fallback.enc_config.height,
-                        fallback.enc_config.fps_num,
-                        fallback.enc_config.fps_den,
-                    )?)),
-                    fallback,
-                    frames_encoded: 0,
-                    mode: NativeEncoderModeHandle::new(NativeEncoderModeHandle::SOFTWARE),
-                    detail,
-                })
+                Err(videoforge_engine::error::EngineError::Encode(format!(
+                    "NVENC init failed for direct native path: {err}"
+                )))
             }
         }
     }
@@ -1379,24 +1411,13 @@ impl videoforge_engine::engine::pipeline::FrameEncoder for NativeVideoEncoderWra
                     tracing::warn!(
                         error = %err,
                         output = %self.fallback.output_path.display(),
-                        "NVENC encode failed; switching to software bitstream encoder"
+                        "NVENC encode failed before first frame; refusing in-process software fallback"
                     );
                     self.detail.set(format!("nvenc_first_frame_encode_failed: {err}"));
                     drop(enc);
-                    let mut software = SoftwareBitstreamEncoder::new(
-                        self.fallback.ctx.clone(),
-                        &self.fallback.ffmpeg_cmd,
-                        &self.fallback.output_path,
-                        self.fallback.enc_config.width,
-                        self.fallback.enc_config.height,
-                        self.fallback.enc_config.fps_num,
-                        self.fallback.enc_config.fps_den,
-                    )?;
-                    software.encode(frame)?;
-                    self.frames_encoded += 1;
-                    self.mode.set(NativeEncoderModeHandle::SOFTWARE);
-                    self.inner = Some(NativeVideoEncoder::Software(software));
-                    Ok(())
+                    Err(videoforge_engine::error::EngineError::Encode(format!(
+                        "NVENC first-frame encode failed for direct native path: {err}"
+                    )))
                 }
             },
             NativeVideoEncoder::Software(mut enc) => {
