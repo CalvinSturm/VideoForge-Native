@@ -260,6 +260,7 @@
 - Follow-up:
   - both major temp-file boundaries have now been removed from the direct native path, but the preferred long-term contract still needs to be formalized: streamed FFmpeg demux/mux around `engine-v2` vs a tighter native-only container/output path
   - direct NVENC registration now works on this runtime, so the main remaining native-engine unknowns are profiler/overlap fidelity and whether further host-boundary simplification is worth the risk
+  - known-bad transformer export `weights/4xNomos2_hq_dat2_fp32.fp16.onnx` is now filtered from normal model discovery, and explicit native use of that file returns an `Invalid ONNX artifact` error instead of a generic backend-init failure
   - the current mux-format fallback is intentionally conservative; if the runtime later selects H.264 more often, the sink should receive codec information directly from the encoder instead of inferring it from packets
   - benchmark/probe steps should not be run in parallel when validating streamed output files, because probing can race the still-running benchmark process and report a false missing-file result
 

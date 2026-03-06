@@ -85,6 +85,16 @@ fn is_weight_file(name: &str) -> bool {
         || lower.ends_with(".onnx")
 }
 
+/// Return a reason for weights we intentionally hide from normal discovery.
+fn excluded_weight_reason(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        // Known-bad FP16 export: ORT rejects it during model load because the
+        // graph mixes float and float16 tensor types inconsistently.
+        "4xnomos2_hq_dat2_fp32.fp16.onnx" => Some("invalid_onnx_graph"),
+        _ => None,
+    }
+}
+
 pub fn list_models() -> Vec<ModelInfo> {
     let mut models = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
@@ -165,6 +175,10 @@ fn process_weight_file(
     filename: &str,
     seen_ids: &HashSet<String>,
 ) -> Option<ModelInfo> {
+    if excluded_weight_reason(filename).is_some() {
+        return None;
+    }
+
     let id = strip_weight_ext(filename);
     if id.is_empty() {
         return None;
@@ -195,4 +209,33 @@ fn process_weight_file(
         format,
         path: full_path.to_string_lossy().to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_known_bad_onnx_export() {
+        let seen = HashSet::new();
+        let model = process_weight_file(
+            std::path::Path::new("weights/4xNomos2_hq_dat2_fp32.fp16.onnx"),
+            "4xNomos2_hq_dat2_fp32.fp16.onnx",
+            &seen,
+        );
+        assert!(model.is_none());
+    }
+
+    #[test]
+    fn keeps_valid_fp32_transformer_export() {
+        let seen = HashSet::new();
+        let model = process_weight_file(
+            std::path::Path::new("weights/4xNomos2_hq_dat2_fp32.onnx"),
+            "4xNomos2_hq_dat2_fp32.onnx",
+            &seen,
+        )
+        .expect("valid FP32 export should remain discoverable");
+        assert_eq!(model.scale, 4);
+        assert_eq!(model.format, "onnx");
+    }
 }

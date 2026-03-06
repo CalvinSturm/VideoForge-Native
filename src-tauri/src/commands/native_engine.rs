@@ -371,6 +371,21 @@ impl NativeUpscaleError {
 }
 
 #[cfg(feature = "native_engine")]
+fn classify_backend_init_error(model_path: &str, err: &str) -> String {
+    if err.contains("Load model from")
+        && err.contains("Type Error:")
+        && (err.contains("tensor(float16)") || err.contains("tensor(float)"))
+    {
+        return format!(
+            "Invalid ONNX artifact: {model_path} failed ORT model validation due to inconsistent tensor types. \
+This is usually a broken or incompatible export, not a native runtime failure. Original error: {err}"
+        );
+    }
+
+    format!("TensorRT backend init failed: {err}")
+}
+
+#[cfg(feature = "native_engine")]
 fn native_engine_runtime_enabled() -> bool {
     match std::env::var("VIDEOFORGE_ENABLE_NATIVE_ENGINE") {
         Ok(v) => matches!(
@@ -821,12 +836,10 @@ async fn run_engine_pipeline(
         },
     );
     let backend = Arc::new(backend);
-    backend.initialize().await.map_err(|e| {
-        make_err(
-            "BACKEND_INIT",
-            &format!("TensorRT backend init failed: {}", e),
-        )
-    })?;
+    backend
+        .initialize()
+        .await
+        .map_err(|e| make_err("BACKEND_INIT", &classify_backend_init_error(&model_path, &e.to_string())))?;
 
     // ── Step 4: Compile kernels ───────────────────────────────────────────────
     let kernels = PreprocessKernels::compile(ctx.device())
