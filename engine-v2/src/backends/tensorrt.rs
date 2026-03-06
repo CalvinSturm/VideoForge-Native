@@ -240,6 +240,7 @@ impl OutputRing {
         in_w: u32,
         in_h: u32,
         scale: u32,
+        output_format: PixelFormat,
         count: usize,
         min_slots: usize,
     ) -> Result<Self> {
@@ -257,7 +258,7 @@ impl OutputRing {
 
         let out_w = (in_w * scale) as usize;
         let out_h = (in_h * scale) as usize;
-        let slot_bytes = 3 * out_w * out_h * std::mem::size_of::<f32>();
+        let slot_bytes = 3 * out_w * out_h * output_format.element_bytes();
 
         let slots = (0..count)
             .map(|_| ctx.alloc(slot_bytes).map(Arc::new))
@@ -325,7 +326,14 @@ impl OutputRing {
     }
 
     /// Reallocate all slots.  All must have `strong_count == 1`.
-    pub fn reallocate(&mut self, ctx: &GpuContext, in_w: u32, in_h: u32, scale: u32) -> Result<()> {
+    pub fn reallocate(
+        &mut self,
+        ctx: &GpuContext,
+        in_w: u32,
+        in_h: u32,
+        scale: u32,
+        output_format: PixelFormat,
+    ) -> Result<()> {
         for (i, slot) in self.slots.iter().enumerate() {
             let sc = Arc::strong_count(slot);
             if sc != 1 {
@@ -344,7 +352,7 @@ impl OutputRing {
         let count = self.slots.len();
         let out_w = (in_w * scale) as usize;
         let out_h = (in_h * scale) as usize;
-        let slot_bytes = 3 * out_w * out_h * std::mem::size_of::<f32>();
+        let slot_bytes = 3 * out_w * out_h * output_format.element_bytes();
 
         self.slots = (0..count)
             .map(|_| ctx.alloc(slot_bytes).map(Arc::new))
@@ -390,6 +398,17 @@ fn ort_element_type(format: PixelFormat) -> TensorElementType {
     }
 }
 
+fn tensor_pixel_format(elem_type: TensorElementType) -> Result<PixelFormat> {
+    match elem_type {
+        TensorElementType::Float32 => Ok(PixelFormat::RgbPlanarF32),
+        TensorElementType::Float16 => Ok(PixelFormat::RgbPlanarF16),
+        other => Err(EngineError::ModelMetadata(format!(
+            "Unsupported tensor element type for GPU RGB pipeline: {:?}",
+            other
+        ))),
+    }
+}
+
 // ─── Backend ─────────────────────────────────────────────────────────────────
 
 pub struct TensorRtBackend {
@@ -413,7 +432,7 @@ impl TensorRtBackend {
     fn sample_output_bytes(meta: &ModelMetadata, input: &GpuTexture) -> usize {
         let out_w = input.width * meta.scale;
         let out_h = input.height * meta.scale;
-        3 * (out_w as usize) * (out_h as usize) * input.format.element_bytes()
+        3 * (out_w as usize) * (out_h as usize) * meta.output_format.element_bytes()
     }
 
     fn copy_dense_texture_batch(
@@ -620,11 +639,15 @@ impl TensorRtBackend {
 
         // In ORT 2.0-rc.11, ValueType::Tensor uses `shape: Shape` (SmallVec<[i64;4]>)
         // where -1 means dynamic. We convert to Vec<Option<i64>> for downstream use.
-        let input_dims: Vec<Option<i64>> = match input_info.dtype() {
-            ort::value::ValueType::Tensor { ty: _, shape, .. } => shape
-                .iter()
-                .map(|&d| if d < 0 { None } else { Some(d) })
-                .collect(),
+        let (input_elem_type, input_dims): (TensorElementType, Vec<Option<i64>>) =
+            match input_info.dtype() {
+                ort::value::ValueType::Tensor { ty, shape, .. } => (
+                    *ty,
+                    shape
+                        .iter()
+                        .map(|&d| if d < 0 { None } else { Some(d) })
+                        .collect(),
+                ),
             other => {
                 return Err(EngineError::ModelMetadata(format!(
                     "Expected tensor input, got {:?}",
@@ -633,11 +656,15 @@ impl TensorRtBackend {
             }
         };
 
-        let output_dims: Vec<Option<i64>> = match output_info.dtype() {
-            ort::value::ValueType::Tensor { ty: _, shape, .. } => shape
-                .iter()
-                .map(|&d| if d < 0 { None } else { Some(d) })
-                .collect(),
+        let (output_elem_type, output_dims): (TensorElementType, Vec<Option<i64>>) =
+            match output_info.dtype() {
+                ort::value::ValueType::Tensor { ty, shape, .. } => (
+                    *ty,
+                    shape
+                        .iter()
+                        .map(|&d| if d < 0 { None } else { Some(d) })
+                        .collect(),
+                ),
             other => {
                 return Err(EngineError::ModelMetadata(format!(
                     "Expected tensor output, got {:?}",
@@ -704,6 +731,8 @@ impl TensorRtBackend {
             input_name,
             output_name,
             input_channels,
+            input_format: tensor_pixel_format(input_elem_type)?,
+            output_format: tensor_pixel_format(output_elem_type)?,
             min_input_hw,
             max_input_hw,
         })
@@ -769,11 +798,19 @@ impl TensorRtBackend {
         let input_shape: Vec<i64> = vec![1, meta.input_channels as i64, in_h, in_w];
         let output_shape: Vec<i64> = vec![1, meta.input_channels as i64, out_h, out_w];
 
-        // Resolve element type from pixel format (F16 or F32).
-        let elem_type = ort_element_type(input.format);
-        let elem_bytes = input.format.element_bytes();
+        if input.format != meta.input_format {
+            return Err(EngineError::FormatMismatch {
+                expected: meta.input_format,
+                actual: input.format,
+            });
+        }
 
-        let expected = (output_shape.iter().product::<i64>() as usize) * elem_bytes;
+        let input_elem_type = ort_element_type(meta.input_format);
+        let output_elem_type = ort_element_type(meta.output_format);
+        let input_elem_bytes = meta.input_format.element_bytes();
+        let output_elem_bytes = meta.output_format.element_bytes();
+
+        let expected = (output_shape.iter().product::<i64>() as usize) * output_elem_bytes;
         if output_bytes < expected {
             return Err(EngineError::BufferTooSmall {
                 need: expected,
@@ -781,7 +818,7 @@ impl TensorRtBackend {
             });
         }
 
-        let input_bytes = (input_shape.iter().product::<i64>() as usize) * elem_bytes;
+        let input_bytes = (input_shape.iter().product::<i64>() as usize) * input_elem_bytes;
         let input_src_ptr = input.device_ptr();
 
         // Wrap pre-existing CUDA buffers as ORT tensors (zero-copy).
@@ -791,7 +828,7 @@ impl TensorRtBackend {
                 input_src_ptr as *mut std::ffi::c_void,
                 input_bytes,
                 input_shape.as_slice(),
-                elem_type,
+                input_elem_type,
             )?
         };
         let output_tensor = unsafe {
@@ -800,7 +837,7 @@ impl TensorRtBackend {
                 output_ptr as *mut std::ffi::c_void,
                 output_bytes,
                 output_shape.as_slice(),
-                elem_type,
+                output_elem_type,
             )?
         };
 
@@ -856,7 +893,15 @@ impl TensorRtBackend {
             out_w as i64,
         ];
 
-        let elem_type = ort_element_type(input_format);
+        if input_format != meta.input_format {
+            return Err(EngineError::FormatMismatch {
+                expected: meta.input_format,
+                actual: input_format,
+            });
+        }
+
+        let input_elem_type = ort_element_type(meta.input_format);
+        let output_elem_type = ort_element_type(meta.output_format);
 
         let input_tensor = unsafe {
             create_tensor_from_device_memory(
@@ -864,7 +909,7 @@ impl TensorRtBackend {
                 input_ptr as *mut std::ffi::c_void,
                 input_bytes,
                 input_shape.as_slice(),
-                elem_type,
+                input_elem_type,
             )?
         };
         let output_tensor = unsafe {
@@ -873,7 +918,7 @@ impl TensorRtBackend {
                 output_ptr as *mut std::ffi::c_void,
                 output_bytes,
                 output_shape.as_slice(),
-                elem_type,
+                output_elem_type,
             )?
         };
 
@@ -1007,18 +1052,13 @@ impl UpscaleBackend for TensorRtBackend {
     }
 
     async fn process(&self, input: GpuTexture) -> Result<GpuTexture> {
-        // Accept both F32 and F16 planar RGB.
-        match input.format {
-            PixelFormat::RgbPlanarF32 | PixelFormat::RgbPlanarF16 => {}
-            other => {
-                return Err(EngineError::FormatMismatch {
-                    expected: PixelFormat::RgbPlanarF32,
-                    actual: other,
-                });
-            }
-        }
-
         let meta = self.meta.get().ok_or(EngineError::NotInitialized)?;
+        if input.format != meta.input_format {
+            return Err(EngineError::FormatMismatch {
+                expected: meta.input_format,
+                actual: input.format,
+            });
+        }
         let mut guard = self.state.lock().await;
         self.ctx
             .device()
@@ -1031,7 +1071,13 @@ impl UpscaleBackend for TensorRtBackend {
             Some(ring) if ring.needs_realloc(input.width, input.height) => {
                 debug!(old = ?ring.alloc_dims, new_w = input.width, new_h = input.height,
                        "Reallocating output ring");
-                ring.reallocate(&self.ctx, input.width, input.height, meta.scale)?;
+                ring.reallocate(
+                    &self.ctx,
+                    input.width,
+                    input.height,
+                    meta.scale,
+                    meta.output_format,
+                )?;
             }
             None => {
                 debug!(
@@ -1045,6 +1091,7 @@ impl UpscaleBackend for TensorRtBackend {
                     input.width,
                     input.height,
                     meta.scale,
+                    meta.output_format,
                     self.ring_size,
                     self.min_ring_slots,
                 )?);
@@ -1094,14 +1141,14 @@ impl UpscaleBackend for TensorRtBackend {
 
         let out_w = input.width * meta.scale;
         let out_h = input.height * meta.scale;
-        let elem_bytes = input.format.element_bytes();
+        let elem_bytes = meta.output_format.element_bytes();
 
         Ok(GpuTexture {
             data: output_arc,
             width: out_w,
             height: out_h,
             pitch: (out_w as usize) * elem_bytes,
-            format: input.format, // Preserve F32 or F16
+            format: meta.output_format,
         })
     }
 
@@ -1143,7 +1190,13 @@ impl UpscaleBackend for TensorRtBackend {
                     new_h = first.height,
                     "Reallocating output ring for batch"
                 );
-                ring.reallocate(&self.ctx, first.width, first.height, meta.scale)?;
+                ring.reallocate(
+                    &self.ctx,
+                    first.width,
+                    first.height,
+                    meta.scale,
+                    meta.output_format,
+                )?;
             }
             None => {
                 debug!(
@@ -1157,6 +1210,7 @@ impl UpscaleBackend for TensorRtBackend {
                     first.width,
                     first.height,
                     meta.scale,
+                    meta.output_format,
                     self.ring_size,
                     self.min_ring_slots,
                 )?);
@@ -1166,7 +1220,8 @@ impl UpscaleBackend for TensorRtBackend {
 
         let sample_input_bytes = first.byte_size();
         let sample_output_bytes = Self::sample_output_bytes(meta, first);
-        let elem_bytes = first.format.element_bytes();
+        let input_elem_bytes = first.format.element_bytes();
+        let output_elem_bytes = meta.output_format.element_bytes();
         let batch_len = inputs.len();
 
         #[cfg(feature = "debug-alloc")]
@@ -1194,7 +1249,7 @@ impl UpscaleBackend for TensorRtBackend {
                 dst_ptr,
                 input.width,
                 input.height,
-                elem_bytes,
+                input_elem_bytes,
             )?;
         }
 
@@ -1217,7 +1272,7 @@ impl UpscaleBackend for TensorRtBackend {
         for (i, output_arc) in output_arcs.iter().enumerate() {
             let src_ptr = batch_output_ptr + (i * sample_output_bytes) as u64;
             let dst_ptr = *output_arc.device_ptr() as u64;
-            Self::copy_dense_texture_batch(src_ptr, dst_ptr, out_w, out_h, elem_bytes)?;
+            Self::copy_dense_texture_batch(src_ptr, dst_ptr, out_w, out_h, output_elem_bytes)?;
         }
 
         let elapsed_us = t_start.elapsed().as_micros() as u64;
@@ -1239,8 +1294,8 @@ impl UpscaleBackend for TensorRtBackend {
                 data: output_arc,
                 width: out_w,
                 height: out_h,
-                pitch: (out_w as usize) * elem_bytes,
-                format: first.format,
+                pitch: (out_w as usize) * output_elem_bytes,
+                format: meta.output_format,
             })
             .collect())
     }

@@ -883,10 +883,13 @@ async fn run_engine_pipeline(
 
     // ── Step 5: Create decoder with FileBitstreamSource ───────────────────────
     tracing::info!(path = %input_stream.display(), "Creating NVDEC decoder");
-    let model_prec = if precision == "fp16" {
-        ModelPrecision::F16
-    } else {
-        ModelPrecision::F32
+    let model_prec = match backend
+        .metadata()
+        .map_err(|e| make_err("BACKEND_INIT", &format!("Model metadata unavailable: {}", e)))?
+        .input_format
+    {
+        videoforge_engine::core::types::PixelFormat::RgbPlanarF16 => ModelPrecision::F16,
+        _ => ModelPrecision::F32,
     };
     let source = FileBitstreamSource::new(&input_stream).map_err(|e| {
         make_err(

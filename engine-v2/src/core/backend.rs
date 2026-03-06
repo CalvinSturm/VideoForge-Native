@@ -20,7 +20,7 @@
 
 use async_trait::async_trait;
 
-use crate::core::types::GpuTexture;
+use crate::core::types::{GpuTexture, PixelFormat};
 use crate::error::Result;
 
 /// Metadata extracted from an ONNX model's input/output tensor descriptors.
@@ -44,6 +44,12 @@ pub struct ModelMetadata {
 
     /// Input channels (almost always 3 for RGB).
     pub input_channels: u32,
+
+    /// Expected input tensor storage type from the ONNX graph.
+    pub input_format: PixelFormat,
+
+    /// Output tensor storage type from the ONNX graph.
+    pub output_format: PixelFormat,
 
     /// Minimum supported input spatial dimensions.
     /// Models with dynamic axes report `(1, 1)`.
@@ -74,13 +80,13 @@ pub trait UpscaleBackend: Send + Sync {
     ///
     /// # Input contract
     ///
-    /// - `input.format` must be [`PixelFormat::RgbPlanarF32`].
+    /// - `input.format` must match `ModelMetadata::input_format`.
     /// - `input.data` must reside on the same CUDA device as the backend.
     /// - Spatial dimensions must be within `ModelMetadata::{min,max}_input_hw`.
     ///
     /// # Output contract
     ///
-    /// - Returned `GpuTexture` has format [`PixelFormat::RgbPlanarF32`].
+    /// - Returned `GpuTexture` has format `ModelMetadata::output_format`.
     /// - Spatial dimensions are `(input.width × scale, input.height × scale)`.
     /// - Data resides on the same device, same CUDA context.
     /// - The output buffer is owned by the backend and reused across calls;

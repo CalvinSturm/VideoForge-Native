@@ -42,6 +42,14 @@ function getScaleFromModel(modelId?: string): number {
     return match?.[1] ? parseInt(match[1], 10) : 4;
 }
 
+function inferNativePrecision(modelPath: string): "fp16" | "fp32" {
+    const lower = modelPath.toLowerCase();
+    if (lower.includes("_fp16") || lower.includes("-fp16") || lower.includes("half")) {
+        return "fp16";
+    }
+    return "fp32";
+}
+
 export function useUpscaleJob(opts: UseUpscaleJobOptions) {
     const {
         video, model, modelInfoMap, showTechSpecs, rave,
@@ -123,7 +131,7 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
                         outputPath: resolvedOutputPath,
                         modelPath: info.path,
                         scale: activeScale,
-                        precision: "fp32",
+                        precision: inferNativePrecision(info.path),
                         audio: true,
                         maxBatch: upscaleConfig.maxBatch
                     });

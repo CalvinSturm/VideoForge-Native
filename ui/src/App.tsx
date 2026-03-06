@@ -199,6 +199,14 @@ const App: React.FC = () => {
     return match?.[1] ? parseInt(match[1], 10) : 4;
   };
 
+  const inferNativePrecision = (modelPath: string): "fp16" | "fp32" => {
+    const lower = modelPath.toLowerCase();
+    if (lower.includes("_fp16") || lower.includes("-fp16") || lower.includes("half")) {
+      return "fp16";
+    }
+    return "fp32";
+  };
+
   // --- Keybinds ---
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -554,7 +562,7 @@ const App: React.FC = () => {
             outputPath: resolvedOutputPath,
             modelPath: info.path,
             scale: activeScale,
-            precision: "fp32",
+            precision: inferNativePrecision(info.path),
             audio: true,
             maxBatch: upscaleConfig.maxBatch
           });
