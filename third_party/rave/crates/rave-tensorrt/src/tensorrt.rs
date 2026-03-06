@@ -474,6 +474,10 @@ pub struct TensorRtBackend {
     min_ring_slots: usize,
     meta: OnceLock<ModelMetadata>,
     selected_provider: OnceLock<String>,
+    /// `true` when the ONNX model has dynamic spatial axes (transformer).
+    /// Set during `initialize()` — controls whether inference uses
+    /// host round-trip (`session.run()`) vs IO binding.
+    has_dynamic_spatial: std::sync::atomic::AtomicBool,
     state: Mutex<Option<InferenceState>>,
     /// Atomic inference latency and frame count metrics.
     pub inference_metrics: InferenceMetrics,
@@ -579,6 +583,7 @@ impl TensorRtBackend {
             min_ring_slots,
             meta: OnceLock::new(),
             selected_provider: OnceLock::new(),
+            has_dynamic_spatial: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(None),
             inference_metrics: InferenceMetrics::new(),
             precision_policy,
@@ -1154,14 +1159,91 @@ Ensure ORT_DYLIB_PATH/ORT_LIB_LOCATION points to a valid ORT cache dir.",
             .map_err(Into::into)
     }
 
+    /// Resolve the actual model path for CUDA EP.
+    ///
+    /// When `precision_policy` is `Fp16`, checks for a pre-converted
+    /// `.fp16.onnx` model alongside the original.  Pre-converted models
+    /// have FP16 internal ops (via `onnxconverter-common`) but keep FP32
+    /// IO, so the pipeline needs no changes.
+    ///
+    /// TRT EP does NOT use this — it converts precision internally via
+    /// `with_fp16(true)`.
+    fn resolve_fp16_model_path(&self) -> std::path::PathBuf {
+        if !matches!(self.precision_policy, PrecisionPolicy::Fp16) {
+            return self.model_path.clone();
+        }
+
+        // Transformer models (dynamic spatial axes): skip FP16 variant.
+        // CUDA EP crashes on FP16 Cast nodes in attention/layer-norm graphs.
+        // FP32 model + TF32 Tensor Core math still gives ~2× speedup.
+        if self.has_dynamic_spatial.load(std::sync::atomic::Ordering::Relaxed) {
+            info!(
+                path = %self.model_path.display(),
+                "Transformer model — skipping FP16 ONNX variant \
+                 (CUDA EP incompatible with FP16 Cast nodes). \
+                 Using FP32 model with TF32 acceleration."
+            );
+            return self.model_path.clone();
+        }
+
+        // model.onnx → model.fp16.onnx
+        let fp16_path = self.model_path.with_extension("fp16.onnx");
+        if fp16_path.exists() {
+            info!(
+                path = %fp16_path.display(),
+                "Using pre-converted FP16 ONNX model for CUDA EP"
+            );
+            return fp16_path;
+        }
+
+        info!(
+            fp16_path = %fp16_path.display(),
+            model_path = %self.model_path.display(),
+            "No FP16 model found — using FP32 model with TF32 acceleration. \
+             Run `python scripts/convert_fp16.py {:?}` to create one for ~2× speedup.",
+            self.model_path,
+        );
+        self.model_path.clone()
+    }
+
     fn build_cuda_session(&self) -> Result<Session> {
         Self::preload_cuda_runtime_libs();
         Self::preload_ort_provider_pair(OrtProviderKind::Cuda)?;
-        let cuda_ep = CUDAExecutionProvider::default().with_device_id(self.device_id);
+
+        // Start with device ID and max cuDNN workspace (lets cuDNN pick the
+        // fastest conv algorithm — default in modern ORT, explicit for clarity).
+        let mut cuda_ep = CUDAExecutionProvider::default()
+            .with_device_id(self.device_id)
+            .with_conv_max_workspace(true);
+
+        match &self.precision_policy {
+            PrecisionPolicy::Fp32 => {
+                info!("CUDA EP precision: FP32 (TF32=off)");
+            }
+            PrecisionPolicy::Fp16 => {
+                // TF32: reduced-precision Tensor Core math (~2× on Ampere+).
+                // Equivalent to Python's allow_tf32=True + cudnn.allow_tf32=True.
+                //
+                // NOTE: with_prefer_nhwc() is NOT used — it conflicts with our
+                // IO binding which pre-allocates output buffers in NCHW layout.
+                cuda_ep = cuda_ep.with_tf32(true);
+                info!("CUDA EP precision: FP16 mode → TF32=on, max_workspace=on");
+            }
+            PrecisionPolicy::Int8 { .. } => {
+                // INT8 calibration is TRT-only; for CUDA EP we apply the same
+                // Tensor Core optimizations as FP16.
+                cuda_ep = cuda_ep.with_tf32(true);
+                info!("CUDA EP precision: INT8 requested (TRT-only) → TF32=on");
+            }
+        }
+
+        // Auto-detect FP16 model: model.fp16.onnx alongside model.onnx.
+        let model_path = self.resolve_fp16_model_path();
+
         Session::builder()?
             .with_execution_providers([cuda_ep.build().error_on_failure()])?
             .with_intra_threads(1)?
-            .commit_from_file(&self.model_path)
+            .commit_from_file(&model_path)
             .map_err(Into::into)
     }
 
@@ -1214,6 +1296,102 @@ Ensure ORT_DYLIB_PATH/ORT_LIB_LOCATION points to a valid ORT cache dir.",
             }
             rave_core::host_copy_violation!("inference", "{message}");
         }
+        Ok(())
+    }
+
+    /// CPU round-trip inference for CUDA EP sessions.
+    ///
+    /// CUDA EP with IO binding can crash for transformer models because ORT
+    /// may route attention/layer-norm ops to CPU internally, causing a mismatch
+    /// with pre-allocated GPU output buffers.
+    ///
+    /// This path copies the input tile to host, runs `session.run()` (letting
+    /// ORT handle all EP-side transfers), then copies the host output back to
+    /// the pre-allocated ring slot.  Slower than IO binding by ~1 D2H+H2D
+    /// round-trip per tile, but stable for all transformer architectures.
+    fn run_session_cpu_roundtrip(
+        session: &mut Session,
+        meta: &ModelMetadata,
+        input: &GpuTexture,
+        output_ptr: u64,
+        output_bytes: usize,
+    ) -> Result<()> {
+        let in_w = input.width as usize;
+        let in_h = input.height as usize;
+        let num_f32 = 3 * in_w * in_h;
+
+        // 1. D2H: synchronously copy GPU input to host as f32.
+        let mut host_input = vec![0.0f32; num_f32];
+        // SAFETY: input.data is a 3×W×H f32 GPU buffer allocated by crop_tile;
+        // host_input has matching element count; copy is synchronous.
+        unsafe {
+            cudarc::driver::result::memcpy_dtoh_sync(
+                &mut host_input,
+                input.device_ptr() as cudarc::driver::sys::CUdeviceptr,
+            )
+            .map_err(|e| EngineError::Inference(format!("D2H input copy: {e}")))?;
+        }
+
+        // Diagnostic: check if crop_tile produced zeros.
+        let input_nonzero = host_input.iter().filter(|&&v| v != 0.0).count();
+        let input_sum: f64 = host_input.iter().map(|&v| v as f64).sum();
+        warn!(
+            in_w,
+            in_h,
+            num_f32,
+            input_nonzero,
+            input_sum,
+            input_buf_bytes = input.data.len(),
+            "cpu_roundtrip: D2H input stats"
+        );
+
+        // 2. Build ORT input tensor [1, C, H, W] on host.
+        let shape = vec![1i64, meta.input_channels as i64, in_h as i64, in_w as i64];
+        let tensor = ort::value::Tensor::<f32>::from_array((shape, host_input))
+            .map_err(|e| EngineError::Inference(format!("create input tensor: {e}")))?;
+
+        // 3. Run session — ORT manages EP-side memory transfers internally.
+        let inputs = ort::inputs![meta.input_name.as_str() => tensor];
+        let outputs = session
+            .run(inputs)
+            .map_err(|e| EngineError::Inference(e.to_string()))?;
+
+        // 4. Extract host output slice.
+        let (out_shape, host_output) = outputs[meta.output_name.as_str()]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| EngineError::Inference(format!("extract output: {e}")))?;
+
+        // Diagnostic: check if ORT output is zeros.
+        let output_nonzero = host_output.iter().filter(|&&v| v != 0.0).count();
+        let output_sum: f64 = host_output.iter().map(|&v| v as f64).sum();
+        warn!(
+            output_len = host_output.len(),
+            output_shape = ?out_shape,
+            output_nonzero,
+            output_sum,
+            output_ring_bytes = output_bytes,
+            "cpu_roundtrip: ORT output stats"
+        );
+
+        let need_bytes = host_output.len() * std::mem::size_of::<f32>();
+        if output_bytes < need_bytes {
+            return Err(EngineError::BufferTooSmall {
+                need: need_bytes,
+                have: output_bytes,
+            });
+        }
+
+        // 5. H2D: copy output to pre-allocated ring slot.
+        // SAFETY: output_ptr is a valid CUDA device pointer (ring slot, at least
+        // output_bytes); host_output is a valid host slice.
+        unsafe {
+            cudarc::driver::result::memcpy_htod_sync(
+                output_ptr as cudarc::driver::sys::CUdeviceptr,
+                host_output,
+            )
+            .map_err(|e| EngineError::Inference(format!("H2D output copy: {e}")))?;
+        }
+
         Ok(())
     }
 
@@ -1660,7 +1838,10 @@ impl UpscaleBackend for TensorRtBackend {
         // with pre-allocated GPU output buffers breaks when ORT partitions
         // the graph and falls back to CPU for unsupported nodes.
         // CUDA EP handles all ops natively on the GPU.
-        if ep_mode == OrtEpMode::Auto && self.probe_has_dynamic_spatial() {
+        let is_dynamic = self.probe_has_dynamic_spatial();
+        self.has_dynamic_spatial.store(is_dynamic, std::sync::atomic::Ordering::Relaxed);
+
+        if ep_mode == OrtEpMode::Auto && is_dynamic {
             info!(
                 path = %self.model_path.display(),
                 "Dynamic spatial axes detected (transformer model) — \
@@ -1788,16 +1969,39 @@ impl UpscaleBackend for TensorRtBackend {
         // ── Inference with latency measurement ──
         let t_start = std::time::Instant::now();
 
-        let mem_info = self.mem_info()?;
-        Self::run_io_bound(
-            &mut state.session,
-            meta,
-            &input,
-            output_ptr,
-            output_bytes,
-            &self.ctx,
-            &mem_info,
-        )?;
+        // Transformer models on CUDA EP cannot use IO binding — ORT may route
+        // attention/layer-norm ops through CPU, breaking the pre-allocated GPU
+        // output buffer.  Use host round-trip (`session.run()`) only for these.
+        // CNN/GAN models work fine with IO binding on both TRT EP and CUDA EP.
+        let is_transformer_cuda = self
+            .has_dynamic_spatial
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self
+                .selected_provider
+                .get()
+                .map(|p| p == "CUDAExecutionProvider")
+                .unwrap_or(false);
+
+        if is_transformer_cuda {
+            Self::run_session_cpu_roundtrip(
+                &mut state.session,
+                meta,
+                &input,
+                output_ptr,
+                output_bytes,
+            )?;
+        } else {
+            let mem_info = self.mem_info()?;
+            Self::run_io_bound(
+                &mut state.session,
+                meta,
+                &input,
+                output_ptr,
+                output_bytes,
+                &self.ctx,
+                &mem_info,
+            )?;
+        }
 
         let elapsed_us = t_start.elapsed().as_micros() as u64;
         self.inference_metrics.record(elapsed_us);
