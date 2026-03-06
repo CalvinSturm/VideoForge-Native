@@ -29,7 +29,7 @@ use std::path::PathBuf;
 #[cfg(feature = "native_engine")]
 use std::sync::Arc;
 #[cfg(feature = "native_engine")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 #[cfg(feature = "native_engine")]
 use std::sync::OnceLock;
 
@@ -254,6 +254,7 @@ fn stderr_tail(bytes: &[u8], lines: usize) -> String {
 pub struct NativeUpscaleResult {
     pub output_path: String,
     pub engine: String,
+    pub encoder_mode: String,
     pub frames_processed: u64,
     pub audio_preserved: bool,
 }
@@ -370,6 +371,7 @@ async fn run_native_via_rave_cli(
     Ok(NativeUpscaleResult {
         output_path: output,
         engine: "native_via_rave_cli".to_string(),
+        encoder_mode: "rave_cli".to_string(),
         frames_processed: 0,
         audio_preserved: true,
     })
@@ -786,6 +788,7 @@ async fn run_engine_pipeline(
         engine_output.clone(),
     )
     .map_err(|e| make_err("ENCODER_INIT", &format!("Encoder init failed: {}", e)))?;
+    let encoder_mode = encoder.mode_handle();
 
     // ── Step 7: Run the pipeline ──────────────────────────────────────────────
     let config = PipelineConfig {
@@ -806,7 +809,12 @@ async fn run_engine_pipeline(
         .metrics()
         .frames_encoded
         .load(std::sync::atomic::Ordering::Relaxed);
-    tracing::info!(frames_encoded = frames, "engine-v2 pipeline complete");
+    let encoder_mode = encoder_mode.as_str().to_string();
+    tracing::info!(
+        frames_encoded = frames,
+        encoder_mode = %encoder_mode,
+        "engine-v2 pipeline complete"
+    );
 
     // ── Step 8: FFmpeg mux video + audio ──────────────────────────────────────
     tracing::info!(
@@ -889,6 +897,7 @@ async fn run_engine_pipeline(
     Ok(NativeUpscaleResult {
         output_path: final_output,
         engine: "native_v2".to_string(),
+        encoder_mode,
         frames_processed: frames,
         audio_preserved: preserve_audio,
     })
@@ -1206,6 +1215,32 @@ enum NativeVideoEncoder {
 }
 
 #[cfg(feature = "native_engine")]
+#[derive(Clone)]
+struct NativeEncoderModeHandle(Arc<AtomicU8>);
+
+#[cfg(feature = "native_engine")]
+impl NativeEncoderModeHandle {
+    const NVENC: u8 = 1;
+    const SOFTWARE: u8 = 2;
+
+    fn new(initial: u8) -> Self {
+        Self(Arc::new(AtomicU8::new(initial)))
+    }
+
+    fn set(&self, mode: u8) {
+        self.0.store(mode, Ordering::Relaxed);
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self.0.load(Ordering::Relaxed) {
+            Self::NVENC => "nvenc",
+            Self::SOFTWARE => "software",
+            _ => "unknown",
+        }
+    }
+}
+
+#[cfg(feature = "native_engine")]
 struct NativeVideoEncoderConfig {
     ctx: Arc<videoforge_engine::core::context::GpuContext>,
     ffmpeg_cmd: String,
@@ -1218,6 +1253,7 @@ struct NativeVideoEncoderWrapper {
     inner: Option<NativeVideoEncoder>,
     fallback: NativeVideoEncoderConfig,
     frames_encoded: u64,
+    mode: NativeEncoderModeHandle,
 }
 
 #[cfg(feature = "native_engine")]
@@ -1241,6 +1277,7 @@ impl NativeVideoEncoderWrapper {
                 inner: Some(NativeVideoEncoder::Nvenc(enc)),
                 fallback,
                 frames_encoded: 0,
+                mode: NativeEncoderModeHandle::new(NativeEncoderModeHandle::NVENC),
             }),
             Err(err) => {
                 tracing::warn!(
@@ -1260,9 +1297,14 @@ impl NativeVideoEncoderWrapper {
                     )?)),
                     fallback,
                     frames_encoded: 0,
+                    mode: NativeEncoderModeHandle::new(NativeEncoderModeHandle::SOFTWARE),
                 })
             }
         }
+    }
+
+    fn mode_handle(&self) -> NativeEncoderModeHandle {
+        self.mode.clone()
     }
 }
 
@@ -1307,6 +1349,7 @@ impl videoforge_engine::engine::pipeline::FrameEncoder for NativeVideoEncoderWra
                     )?;
                     software.encode(frame)?;
                     self.frames_encoded += 1;
+                    self.mode.set(NativeEncoderModeHandle::SOFTWARE);
                     self.inner = Some(NativeVideoEncoder::Software(software));
                     Ok(())
                 }

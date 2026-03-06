@@ -1,9 +1,9 @@
 param(
   [Parameter(Mandatory = $true)]
-  [string]$Input,
+  [string]$InputPath,
 
   [Parameter(Mandatory = $true)]
-  [string]$Onnx,
+  [string]$OnnxPath,
 
   [int]$Scale = 2,
   [ValidateSet("fp32", "fp16", "deterministic")]
@@ -26,8 +26,8 @@ if ($Runs -lt 1) {
   throw "Runs must be >= 1."
 }
 
-Require-Path -Path $Input -Label "Input video"
-Require-Path -Path $Onnx -Label "ONNX model"
+Require-Path -Path $InputPath -Label "Input video"
+Require-Path -Path $OnnxPath -Label "ONNX model"
 Require-Path -Path $SmokeExe -Label "smoke.exe"
 
 $ffprobeOk = $false
@@ -39,10 +39,10 @@ if (-not $ffprobeOk) {
   throw "ffprobe not found in PATH."
 }
 
-$frameCountRaw = & ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=noprint_wrappers=1:nokey=1 "$Input"
+$frameCountRaw = & ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=noprint_wrappers=1:nokey=1 "$InputPath"
 $frameCount = 0
 if (-not [int]::TryParse(($frameCountRaw | Select-Object -First 1).Trim(), [ref]$frameCount) -or $frameCount -le 0) {
-  throw "Could not determine frame count for input: $Input"
+  throw "Could not determine frame count for input: $InputPath"
 }
 
 $outDir = Split-Path -Parent $OutJson
@@ -51,22 +51,36 @@ if ($outDir -and -not (Test-Path $outDir)) {
 }
 
 $runRows = @()
+$encoderModes = @()
 for ($i = 1; $i -le $Runs; $i++) {
   Write-Host "Run $i/$Runs ..."
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  & $SmokeExe --e2e-native --native-direct --input "$Input" --e2e-onnx "$Onnx" --e2e-scale $Scale --precision $Precision --keep-temp
+  $smokeOutput = & $SmokeExe --e2e-native --native-direct --input "$InputPath" --e2e-onnx "$OnnxPath" --e2e-scale $Scale --precision $Precision --keep-temp 2>&1
   $exitCode = $LASTEXITCODE
   $sw.Stop()
+  $smokeOutput | ForEach-Object { Write-Host $_ }
 
   $secs = [Math]::Max($sw.Elapsed.TotalSeconds, 0.001)
   $fps = $frameCount / $secs
   $ok = ($exitCode -eq 0)
+  $encoderMode = "unknown"
+  foreach ($line in $smokeOutput) {
+    if ($line -match 'encoder_mode=([A-Za-z0-9_:-]+)') {
+      $encoderMode = $matches[1]
+      break
+    }
+    if ($line -match 'encoder mode:\s*([A-Za-z0-9_:-]+)') {
+      $encoderMode = $matches[1]
+    }
+  }
+  $encoderModes += $encoderMode
 
   $runRows += [ordered]@{
     run = $i
     exit_code = $exitCode
     elapsed_sec = [Math]::Round($secs, 3)
     fps = [Math]::Round($fps, 3)
+    encoder_mode = $encoderMode
     pass = $ok
   }
 
@@ -84,17 +98,19 @@ $medianFps = if (($fpsValues.Count % 2) -eq 1) {
 }
 
 $pass = ($medianFps -ge $MinMedianFps)
+$uniqueEncoderModes = @($encoderModes | Sort-Object -Unique)
 
 $report = [ordered]@{
   generated_at_utc = (Get-Date).ToUniversalTime().ToString("o")
-  input = (Resolve-Path $Input).Path
-  onnx = (Resolve-Path $Onnx).Path
+  input = (Resolve-Path $InputPath).Path
+  onnx = (Resolve-Path $OnnxPath).Path
   scale = $Scale
   precision = $Precision
   frames = $frameCount
   runs = $Runs
   min_median_fps = $MinMedianFps
   median_fps = [Math]::Round($medianFps, 3)
+  encoder_modes = $uniqueEncoderModes
   pass = $pass
   results = $runRows
 }

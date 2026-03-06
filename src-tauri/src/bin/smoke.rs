@@ -848,8 +848,13 @@ async fn check_e2e_native(
     check(
         "Native pipeline completed",
         true,
-        &format!("frames={}", report.frames_processed),
+        &format!(
+            "frames={} encoder_mode={}",
+            report.frames_processed, report.encoder_mode
+        ),
     );
+    println!("  → encoder mode: {}", report.encoder_mode);
+    println!("  encoder_mode={}", report.encoder_mode);
     let actual_out = &report.output_path;
 
     // C) Validate output
