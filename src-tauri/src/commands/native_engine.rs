@@ -225,6 +225,79 @@ fn configure_native_runtime_env() -> String {
 }
 
 #[cfg(feature = "native_engine")]
+fn probe_video_coded_geometry(path: &str) -> Result<(usize, usize, f64, f64, u64), String> {
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,coded_width,coded_height,r_frame_rate",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            path,
+        ])
+        .output()
+        .map_err(|e| format!("ffprobe launch failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffprobe failed: {stderr}"));
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("ffprobe JSON parse failed: {e}"))?;
+    let stream = json
+        .get("streams")
+        .and_then(|s| s.get(0))
+        .ok_or_else(|| "No video stream found".to_string())?;
+
+    let display_width = stream.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let display_height = stream.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let coded_width = stream
+        .get("coded_width")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(display_width as u64) as usize;
+    let coded_height = stream
+        .get("coded_height")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(display_height as u64) as usize;
+
+    let fps_str = stream
+        .get("r_frame_rate")
+        .and_then(|v| v.as_str())
+        .unwrap_or("30/1");
+    let fps = if let Some((num, den)) = fps_str.split_once('/') {
+        let num = num.parse::<f64>().unwrap_or(30.0);
+        let den = den.parse::<f64>().unwrap_or(1.0);
+        if den == 0.0 { 30.0 } else { num / den }
+    } else {
+        fps_str.parse::<f64>().unwrap_or(30.0)
+    };
+
+    let duration = json
+        .get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(|d| d.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let total_frames = (duration * fps).round() as u64;
+
+    tracing::info!(
+        display_w = display_width,
+        display_h = display_height,
+        coded_w = coded_width,
+        coded_h = coded_height,
+        "Resolved native coded geometry"
+    );
+
+    Ok((coded_width, coded_height, duration, fps, total_frames))
+}
+
+#[cfg(feature = "native_engine")]
 static NATIVE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "native_engine")]
@@ -750,8 +823,8 @@ async fn run_engine_pipeline(
     // encoder_nv12_pitch and encoder width/height must be set before
     // UpscalePipeline::new() — the pipeline asserts pitch > 0.
     tracing::info!(path = %original_input, "Probing input video dimensions");
-    let (input_w, input_h, _duration, fps, _) = crate::video_pipeline::probe_video(&original_input)
-        .map_err(|e| make_err("PROBE_FAILED", &format!("ffprobe probe failed: {}", e)))?;
+    let (input_w, input_h, _duration, fps, _) = probe_video_coded_geometry(&original_input)
+        .map_err(|e| make_err("PROBE_FAILED", &e))?;
     let output_w = input_w.saturating_mul(scale as usize);
     let output_h = input_h.saturating_mul(scale as usize);
     // NV12 row stride must be 256-byte aligned (NVENC hardware requirement).
