@@ -1,0 +1,63 @@
+{
+  "generated_at_utc": "2026-03-06T11:06:33.8311609Z",
+  "input": "C:\\Users\\Calvin\\Desktop\\VideoForge1\\test_input.mp4",
+  "onnx": "C:\\Users\\Calvin\\Desktop\\VideoForge1\\weights\\2x_SPAN_soft.onnx",
+  "scale": 2,
+  "precision": "fp32",
+  "frames": 150,
+  "runs": 5,
+  "min_median_fps": 1.0,
+  "median_fps": 13.504,
+  "encoder_modes": [
+    "nvenc"
+  ],
+  "encoder_details": [],
+  "pass": true,
+  "results": [
+    {
+      "run": 1,
+      "exit_code": 0,
+      "elapsed_sec": 12.924,
+      "fps": 11.606,
+      "encoder_mode": "nvenc",
+      "encoder_detail": null,
+      "pass": true
+    },
+    {
+      "run": 2,
+      "exit_code": 0,
+      "elapsed_sec": 11.257,
+      "fps": 13.325,
+      "encoder_mode": "nvenc",
+      "encoder_detail": null,
+      "pass": true
+    },
+    {
+      "run": 3,
+      "exit_code": 0,
+      "elapsed_sec": 11.108,
+      "fps": 13.504,
+      "encoder_mode": "nvenc",
+      "encoder_detail": null,
+      "pass": true
+    },
+    {
+      "run": 4,
+      "exit_code": 0,
+      "elapsed_sec": 10.7,
+      "fps": 14.019,
+      "encoder_mode": "nvenc",
+      "encoder_detail": null,
+      "pass": true
+    },
+    {
+      "run": 5,
+      "exit_code": 0,
+      "elapsed_sec": 10.617,
+      "fps": 14.128,
+      "encoder_mode": "nvenc",
+      "encoder_detail": null,
+      "pass": true
+    }
+  ]
+}
