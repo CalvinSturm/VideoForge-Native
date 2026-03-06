@@ -301,6 +301,23 @@ fn native_engine_direct_enabled() -> bool {
 }
 
 #[cfg(feature = "native_engine")]
+fn infer_model_scale(model_path: &str) -> Option<u32> {
+    let stem = Path::new(model_path)
+        .file_stem()
+        .and_then(|s| s.to_str())?
+        .to_ascii_lowercase();
+
+    for scale in [8u32, 4, 3, 2] {
+        let prefix = format!("{scale}x");
+        if stem.starts_with(&prefix) {
+            return Some(scale);
+        }
+    }
+
+    None
+}
+
+#[cfg(feature = "native_engine")]
 async fn run_native_via_rave_cli(
     input_path: String,
     output_path: String,
@@ -463,13 +480,22 @@ pub async fn upscale_request_native(
         let precision = precision.unwrap_or_else(|| "fp32".to_string());
         let audio = audio.unwrap_or(true);
         let max_batch = max_batch.unwrap_or(1);
+        let effective_scale = infer_model_scale(&model_path).unwrap_or(scale);
+        if effective_scale != scale {
+            tracing::warn!(
+                requested_scale = scale,
+                inferred_scale = effective_scale,
+                model = %model_path,
+                "Requested native scale does not match model filename; overriding to inferred model scale"
+            );
+        }
 
         if native_engine_direct_enabled() {
             let direct_result = run_native_pipeline(
                 input_path.clone(),
                 output_path.clone(),
                 model_path.clone(),
-                scale,
+                effective_scale,
                 precision.clone(),
                 audio,
                 max_batch,
@@ -492,7 +518,7 @@ pub async fn upscale_request_native(
                             input_path,
                             output_path,
                             model_path,
-                            scale,
+                            effective_scale,
                             precision,
                             audio,
                             max_batch,
@@ -509,7 +535,7 @@ pub async fn upscale_request_native(
                 input_path,
                 output_path,
                 model_path,
-                scale,
+                effective_scale,
                 precision,
                 audio,
                 max_batch,
