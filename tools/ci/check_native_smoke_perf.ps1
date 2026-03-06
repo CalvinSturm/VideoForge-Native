@@ -52,6 +52,7 @@ if ($outDir -and -not (Test-Path $outDir)) {
 
 $runRows = @()
 $encoderModes = @()
+$encoderDetails = @()
 for ($i = 1; $i -le $Runs; $i++) {
   Write-Host "Run $i/$Runs ..."
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -64,16 +65,27 @@ for ($i = 1; $i -le $Runs; $i++) {
   $fps = $frameCount / $secs
   $ok = ($exitCode -eq 0)
   $encoderMode = "unknown"
+  $encoderDetail = $null
   foreach ($line in $smokeOutput) {
     if ($line -match 'encoder_mode=([A-Za-z0-9_:-]+)') {
       $encoderMode = $matches[1]
-      break
+      continue
     }
     if ($line -match 'encoder mode:\s*([A-Za-z0-9_:-]+)') {
       $encoderMode = $matches[1]
     }
+    if ($line -match 'encoder_detail=(.+)$') {
+      $encoderDetail = $matches[1].Trim()
+      continue
+    }
+    if ($line -match 'encoder detail:\s*(.+)$') {
+      $encoderDetail = $matches[1].Trim()
+    }
   }
   $encoderModes += $encoderMode
+  if ($encoderDetail) {
+    $encoderDetails += $encoderDetail
+  }
 
   $runRows += [ordered]@{
     run = $i
@@ -81,6 +93,7 @@ for ($i = 1; $i -le $Runs; $i++) {
     elapsed_sec = [Math]::Round($secs, 3)
     fps = [Math]::Round($fps, 3)
     encoder_mode = $encoderMode
+    encoder_detail = $encoderDetail
     pass = $ok
   }
 
@@ -99,6 +112,7 @@ $medianFps = if (($fpsValues.Count % 2) -eq 1) {
 
 $pass = ($medianFps -ge $MinMedianFps)
 $uniqueEncoderModes = @($encoderModes | Sort-Object -Unique)
+$uniqueEncoderDetails = @($encoderDetails | Sort-Object -Unique)
 
 $report = [ordered]@{
   generated_at_utc = (Get-Date).ToUniversalTime().ToString("o")
@@ -111,6 +125,7 @@ $report = [ordered]@{
   min_median_fps = $MinMedianFps
   median_fps = [Math]::Round($medianFps, 3)
   encoder_modes = $uniqueEncoderModes
+  encoder_details = $uniqueEncoderDetails
   pass = $pass
   results = $runRows
 }

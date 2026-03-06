@@ -849,11 +849,17 @@ async fn check_e2e_native(
         "Native pipeline completed",
         true,
         &format!(
-            "frames={} encoder_mode={}",
-            report.frames_processed, report.encoder_mode
+            "frames={} encoder_mode={} encoder_detail={}",
+            report.frames_processed,
+            report.encoder_mode,
+            report.encoder_detail.as_deref().unwrap_or("none")
         ),
     );
     println!("  → encoder mode: {}", report.encoder_mode);
+    if let Some(detail) = &report.encoder_detail {
+        println!("  → encoder detail: {}", detail);
+        println!("  encoder_detail={}", detail);
+    }
     println!("  encoder_mode={}", report.encoder_mode);
     let actual_out = &report.output_path;
 

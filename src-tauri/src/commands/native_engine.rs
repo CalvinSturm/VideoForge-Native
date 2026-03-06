@@ -31,6 +31,8 @@ use std::sync::Arc;
 #[cfg(feature = "native_engine")]
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 #[cfg(feature = "native_engine")]
+use std::sync::Mutex;
+#[cfg(feature = "native_engine")]
 use std::sync::OnceLock;
 
 #[cfg(all(feature = "native_engine", windows))]
@@ -255,6 +257,7 @@ pub struct NativeUpscaleResult {
     pub output_path: String,
     pub engine: String,
     pub encoder_mode: String,
+    pub encoder_detail: Option<String>,
     pub frames_processed: u64,
     pub audio_preserved: bool,
 }
@@ -372,6 +375,7 @@ async fn run_native_via_rave_cli(
         output_path: output,
         engine: "native_via_rave_cli".to_string(),
         encoder_mode: "rave_cli".to_string(),
+        encoder_detail: None,
         frames_processed: 0,
         audio_preserved: true,
     })
@@ -789,6 +793,7 @@ async fn run_engine_pipeline(
     )
     .map_err(|e| make_err("ENCODER_INIT", &format!("Encoder init failed: {}", e)))?;
     let encoder_mode = encoder.mode_handle();
+    let encoder_detail = encoder.detail_handle();
 
     // ── Step 7: Run the pipeline ──────────────────────────────────────────────
     let config = PipelineConfig {
@@ -810,9 +815,11 @@ async fn run_engine_pipeline(
         .frames_encoded
         .load(std::sync::atomic::Ordering::Relaxed);
     let encoder_mode = encoder_mode.as_str().to_string();
+    let encoder_detail = encoder_detail.get();
     tracing::info!(
         frames_encoded = frames,
         encoder_mode = %encoder_mode,
+        encoder_detail = encoder_detail.as_deref().unwrap_or("none"),
         "engine-v2 pipeline complete"
     );
 
@@ -898,6 +905,7 @@ async fn run_engine_pipeline(
         output_path: final_output,
         engine: "native_v2".to_string(),
         encoder_mode,
+        encoder_detail,
         frames_processed: frames,
         audio_preserved: preserve_audio,
     })
@@ -1241,6 +1249,25 @@ impl NativeEncoderModeHandle {
 }
 
 #[cfg(feature = "native_engine")]
+#[derive(Clone, Default)]
+struct NativeEncoderDetailHandle(Arc<Mutex<Option<String>>>);
+
+#[cfg(feature = "native_engine")]
+impl NativeEncoderDetailHandle {
+    fn set(&self, detail: impl Into<String>) {
+        let mut slot = self.0.lock().expect("encoder detail mutex poisoned");
+        *slot = Some(detail.into());
+    }
+
+    fn get(&self) -> Option<String> {
+        self.0
+            .lock()
+            .expect("encoder detail mutex poisoned")
+            .clone()
+    }
+}
+
+#[cfg(feature = "native_engine")]
 struct NativeVideoEncoderConfig {
     ctx: Arc<videoforge_engine::core::context::GpuContext>,
     ffmpeg_cmd: String,
@@ -1254,6 +1281,7 @@ struct NativeVideoEncoderWrapper {
     fallback: NativeVideoEncoderConfig,
     frames_encoded: u64,
     mode: NativeEncoderModeHandle,
+    detail: NativeEncoderDetailHandle,
 }
 
 #[cfg(feature = "native_engine")]
@@ -1272,14 +1300,17 @@ impl NativeVideoEncoderWrapper {
             output_path,
             enc_config: config.clone(),
         };
+        let detail = NativeEncoderDetailHandle::default();
         match videoforge_engine::codecs::nvenc::NvEncoder::new(cuda_ctx, sink, config) {
             Ok(enc) => Ok(Self {
                 inner: Some(NativeVideoEncoder::Nvenc(enc)),
                 fallback,
                 frames_encoded: 0,
                 mode: NativeEncoderModeHandle::new(NativeEncoderModeHandle::NVENC),
+                detail,
             }),
             Err(err) => {
+                detail.set(format!("nvenc_init_failed: {err}"));
                 tracing::warn!(
                     error = %err,
                     output = %fallback.output_path.display(),
@@ -1298,6 +1329,7 @@ impl NativeVideoEncoderWrapper {
                     fallback,
                     frames_encoded: 0,
                     mode: NativeEncoderModeHandle::new(NativeEncoderModeHandle::SOFTWARE),
+                    detail,
                 })
             }
         }
@@ -1305,6 +1337,10 @@ impl NativeVideoEncoderWrapper {
 
     fn mode_handle(&self) -> NativeEncoderModeHandle {
         self.mode.clone()
+    }
+
+    fn detail_handle(&self) -> NativeEncoderDetailHandle {
+        self.detail.clone()
     }
 }
 
@@ -1337,6 +1373,7 @@ impl videoforge_engine::engine::pipeline::FrameEncoder for NativeVideoEncoderWra
                         output = %self.fallback.output_path.display(),
                         "NVENC encode failed; switching to software bitstream encoder"
                     );
+                    self.detail.set(format!("nvenc_first_frame_encode_failed: {err}"));
                     drop(enc);
                     let mut software = SoftwareBitstreamEncoder::new(
                         self.fallback.ctx.clone(),
