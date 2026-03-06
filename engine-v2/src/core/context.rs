@@ -126,6 +126,9 @@ pub struct GpuContext {
     /// Queue depth tracker for backpressure observability.
     pub queue_depth: QueueDepthTracker,
 
+    /// Decode-to-consumer overlap telemetry.
+    pub overlap_timer: StreamOverlapTimer,
+
     /// VRAM limit (bytes). 0 = unlimited.
     vram_limit: AtomicUsize,
 }
@@ -158,6 +161,7 @@ impl GpuContext {
             alloc_policy: AllocPolicy::new(),
             profiler: PerfProfiler::new(),
             queue_depth: QueueDepthTracker::new(),
+            overlap_timer: StreamOverlapTimer::new()?,
             vram_limit: AtomicUsize::new(0),
         }))
     }
@@ -271,12 +275,14 @@ impl GpuContext {
     }
 
     /// Synchronize a specific stream, blocking until all enqueued work completes.
-    pub fn sync_stream(_stream: &CudaStream) -> Result<()> {
-        // cudarc 0.12 CudaStream has no public synchronize() method.
-        // Use device-level sync as an equivalent full-device flush.
-        // For callers that hold a GpuContext, prefer sync_all().
-        // This is a no-op here; callers that need precise stream sync
-        // must use the device directly.
+    pub fn sync_stream(stream: &CudaStream) -> Result<()> {
+        let raw_stream = crate::codecs::nvdec::get_raw_stream(stream);
+        unsafe {
+            crate::codecs::sys::check_cu(
+                crate::codecs::sys::cuStreamSynchronize(raw_stream),
+                "cuStreamSynchronize",
+            )?;
+        }
         Ok(())
     }
 
@@ -307,6 +313,17 @@ impl GpuContext {
 
         // Report profiler stats.
         self.profiler.report();
+
+        let overlap = self.overlap_timer.report();
+        info!(
+            overlap_samples = overlap.sample_count,
+            overlap_avg_gap_ms = overlap.avg_gap_ms,
+            overlap_min_gap_ms = overlap.min_gap_ms,
+            overlap_max_gap_ms = overlap.max_gap_ms,
+            overlap_count = overlap.overlap_count,
+            overlap_pct = overlap.overlap_pct,
+            "Stream overlap report"
+        );
     }
 
     /// Set a VRAM usage cap (bytes).  0 = unlimited.
@@ -731,13 +748,15 @@ impl StreamOverlapTimer {
         }
     }
 
-    /// Record inference-start event on the inference stream.
-    pub fn mark_inference_start(&self, stream: &CudaStream) -> Result<()> {
+    /// Record consumer-start event on the downstream stream.
+    ///
+    /// For PR 1 this is used for preprocess-stream overlap measurement.
+    pub fn mark_preprocess_start(&self, stream: &CudaStream) -> Result<()> {
         let raw = crate::codecs::nvdec::get_raw_stream(stream);
         unsafe {
             crate::codecs::sys::check_cu(
                 crate::codecs::sys::cuEventRecord(self.inference_start, raw),
-                "overlap infer_start record",
+                "overlap consumer_start record",
             )
         }
     }
@@ -755,6 +774,10 @@ impl StreamOverlapTimer {
             ) -> crate::codecs::sys::CUresult;
         }
         unsafe {
+            crate::codecs::sys::check_cu(
+                crate::codecs::sys::cuEventSynchronize(self.inference_start),
+                "overlap end synchronize",
+            )?;
             crate::codecs::sys::check_cu(
                 cuEventElapsedTime(&mut ms, self.decode_done, self.inference_start),
                 "overlap elapsed",

@@ -419,6 +419,36 @@ pub struct TensorRtBackend {
 }
 
 impl TensorRtBackend {
+    fn infer_scale_from_model_path(model_path: &std::path::Path) -> Option<u32> {
+        let stem = model_path.file_stem()?.to_str()?.to_ascii_lowercase();
+
+        for scale in [2u32, 3, 4, 8] {
+            let patterns = [
+                format!("_x{scale}"),
+                format!("x{scale}plus"),
+                format!("_{scale}x"),
+                format!("{scale}x_"),
+                format!("{scale}x-"),
+            ];
+            if patterns.iter().any(|pattern| stem.contains(pattern)) {
+                return Some(scale);
+            }
+        }
+
+        let bytes = stem.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b'x' {
+            return match bytes[0] {
+                b'2' => Some(2),
+                b'3' => Some(3),
+                b'4' => Some(4),
+                b'8' => Some(8),
+                _ => None,
+            };
+        }
+
+        None
+    }
+
     /// Create a new backend instance.
     ///
     /// # Parameters
@@ -500,7 +530,7 @@ impl TensorRtBackend {
             .map(|r| r.metrics.snapshot())
     }
 
-    fn extract_metadata(session: &Session) -> Result<ModelMetadata> {
+    fn extract_metadata(session: &Session, model_path: &std::path::Path) -> Result<ModelMetadata> {
         let inputs = session.inputs();
         let outputs = session.outputs();
 
@@ -554,10 +584,29 @@ impl TensorRtBackend {
         let input_channels = input_dims[1].unwrap_or(3) as u32;
 
         let scale = match (input_dims[2], input_dims[3], output_dims[2], output_dims[3]) {
-            (Some(ih), _, Some(oh), _) if ih > 0 && oh > 0 => (oh / ih) as u32,
+            (Some(ih), Some(iw), Some(oh), Some(ow)) if ih > 0 && iw > 0 && oh > 0 && ow > 0 => {
+                let scale_h = oh / ih;
+                let scale_w = ow / iw;
+                if scale_h <= 0 || scale_w <= 0 || scale_h != scale_w {
+                    return Err(EngineError::ModelMetadata(format!(
+                        "Unsupported output/input shape ratio: input={input_dims:?} output={output_dims:?}"
+                    )));
+                }
+                scale_h as u32
+            }
             _ => {
-                warn!("Dynamic spatial axes — defaulting to scale=2");
-                2
+                let inferred = Self::infer_scale_from_model_path(model_path).ok_or_else(|| {
+                    EngineError::ModelMetadata(format!(
+                        "Dynamic spatial axes require an explicit scale hint in the model filename: {}",
+                        model_path.display()
+                    ))
+                })?;
+                warn!(
+                    model = %model_path.display(),
+                    scale = inferred,
+                    "Dynamic spatial axes — inferred scale from model filename"
+                );
+                inferred
             }
         };
 
@@ -801,7 +850,7 @@ impl UpscaleBackend for TensorRtBackend {
         // If we reach here, session creation respected provider policy.
         Self::validate_providers(&session)?;
 
-        let metadata = Self::extract_metadata(&session)?;
+        let metadata = Self::extract_metadata(&session, &self.model_path)?;
         info!(
             name = %metadata.name,
             scale = metadata.scale,
@@ -838,6 +887,10 @@ impl UpscaleBackend for TensorRtBackend {
 
         let meta = self.meta.get().ok_or(EngineError::NotInitialized)?;
         let mut guard = self.state.lock().await;
+        self.ctx
+            .device()
+            .bind_to_thread()
+            .map_err(|e| EngineError::ModelMetadata(format!("bind_to_thread (backend process): {:?}", e)))?;
         let state = guard.as_mut().ok_or(EngineError::NotInitialized)?;
 
         // Lazy ring init / realloc.
@@ -969,6 +1022,36 @@ impl UpscaleBackend for TensorRtBackend {
 
     fn metadata(&self) -> Result<&ModelMetadata> {
         self.meta.get().ok_or(EngineError::NotInitialized)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TensorRtBackend;
+    use std::path::Path;
+
+    #[test]
+    fn infer_scale_from_model_path_recognizes_common_patterns() {
+        assert_eq!(
+            TensorRtBackend::infer_scale_from_model_path(Path::new("weights/rcan_4x.onnx")),
+            Some(4)
+        );
+        assert_eq!(
+            TensorRtBackend::infer_scale_from_model_path(Path::new("weights/2x_SPAN_soft.onnx")),
+            Some(2)
+        );
+        assert_eq!(
+            TensorRtBackend::infer_scale_from_model_path(Path::new("weights/RealESRGAN_x4plus.onnx")),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn infer_scale_from_model_path_returns_none_for_unknown_names() {
+        assert_eq!(
+            TensorRtBackend::infer_scale_from_model_path(Path::new("weights/custom_model.onnx")),
+            None
+        );
     }
 }
 

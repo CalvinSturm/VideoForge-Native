@@ -57,6 +57,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+use cudarc::driver::CudaStream;
+
 use crate::core::backend::UpscaleBackend;
 use crate::core::context::{GpuContext, PerfStage};
 use crate::core::kernels::{ModelPrecision, PreprocessKernels, PreprocessPipeline};
@@ -80,13 +82,153 @@ fn format_panic(payload: Box<dyn std::any::Any + Send>) -> String {
 
 /// Video frame decoder producing GPU-resident NV12 frames.
 pub trait FrameDecoder: Send + 'static {
-    fn decode_next(&mut self) -> Result<Option<FrameEnvelope>>;
+    fn decode_next(&mut self) -> Result<Option<DecodedFrameEnvelope>>;
 }
 
 /// Video frame encoder consuming GPU-resident NV12 frames.
 pub trait FrameEncoder: Send + 'static {
     fn encode(&mut self, frame: FrameEnvelope) -> Result<()>;
     fn flush(&mut self) -> Result<()>;
+}
+
+/// Owned CUDA event representing completion of GPU work for one frame.
+///
+/// The event is destroyed on drop. Downstream stages can wait on it from
+/// another CUDA stream or synchronize on the CPU for APIs that do not expose
+/// stream-aware submission.
+#[derive(Clone, Debug)]
+pub struct StreamReadyEvent(std::sync::Arc<StreamReadyEventInner>);
+
+#[derive(Debug)]
+struct StreamReadyEventInner(crate::codecs::sys::CUevent);
+
+// SAFETY: StreamReadyEventInner wraps a CUDA event handle whose lifetime is
+// managed via Arc. It is only used for driver calls that take an immutable
+// handle (`query`, `synchronize`, `wait`) and is destroyed exactly once on
+// final drop. The CUDA driver permits these handle operations across threads.
+unsafe impl Send for StreamReadyEventInner {}
+unsafe impl Sync for StreamReadyEventInner {}
+
+impl StreamReadyEvent {
+    pub fn from_raw(event: crate::codecs::sys::CUevent) -> Self {
+        Self(std::sync::Arc::new(StreamReadyEventInner(event)))
+    }
+
+    pub fn record(stream: &CudaStream, context: &str) -> Result<Self> {
+        let mut event: crate::codecs::sys::CUevent = std::ptr::null_mut();
+        unsafe {
+            crate::codecs::sys::check_cu(
+                crate::codecs::sys::cuEventCreate(
+                    &mut event,
+                    crate::codecs::sys::CU_EVENT_DISABLE_TIMING,
+                ),
+                &format!("cuEventCreate ({context})"),
+            )?;
+            crate::codecs::sys::check_cu(
+                crate::codecs::sys::cuEventRecord(event, crate::codecs::nvdec::get_raw_stream(stream)),
+                &format!("cuEventRecord ({context})"),
+            )?;
+        }
+        Ok(Self::from_raw(event))
+    }
+
+    pub fn wait(&self, target_stream: &CudaStream) -> Result<()> {
+        crate::codecs::nvdec::wait_for_event(target_stream, self.raw())
+    }
+
+    pub fn query_complete(&self) -> Result<bool> {
+        let rc = unsafe { crate::codecs::sys::cuEventQuery(self.raw()) };
+        match rc {
+            crate::codecs::sys::CUDA_SUCCESS => Ok(true),
+            crate::codecs::sys::CUDA_ERROR_NOT_READY => Ok(false),
+            other => Err(crate::error::EngineError::Decode(format!(
+                "cuEventQuery (decode_ready): CUDA error code {other}"
+            ))),
+        }
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        unsafe {
+            crate::codecs::sys::check_cu(
+                crate::codecs::sys::cuEventSynchronize(self.raw()),
+                "cuEventSynchronize (decode_ready)",
+            )
+        }
+    }
+
+    pub fn raw(&self) -> crate::codecs::sys::CUevent {
+        self.0.0
+    }
+}
+
+impl Drop for StreamReadyEventInner {
+    fn drop(&mut self) {
+        unsafe {
+            crate::codecs::sys::cuEventDestroy_v2(self.0);
+        }
+    }
+}
+
+/// Decoded frame plus any dependency needed before preprocess can read it.
+#[derive(Debug)]
+pub struct DecodedFrameEnvelope {
+    pub frame: FrameEnvelope,
+    pub decode_ready: Option<StreamReadyEvent>,
+}
+
+impl DecodedFrameEnvelope {
+    pub fn new(frame: FrameEnvelope, decode_ready: Option<StreamReadyEvent>) -> Self {
+        Self { frame, decode_ready }
+    }
+
+    pub fn without_event(frame: FrameEnvelope) -> Self {
+        Self {
+            frame,
+            decode_ready: None,
+        }
+    }
+
+    pub fn into_parts(self) -> (FrameEnvelope, Option<StreamReadyEvent>) {
+        (self.frame, self.decode_ready)
+    }
+}
+
+#[derive(Debug)]
+struct PreprocessedFrameEnvelope {
+    frame: FrameEnvelope,
+    preprocess_ready: Option<StreamReadyEvent>,
+}
+
+impl PreprocessedFrameEnvelope {
+    fn new(frame: FrameEnvelope, preprocess_ready: Option<StreamReadyEvent>) -> Self {
+        Self {
+            frame,
+            preprocess_ready,
+        }
+    }
+
+    fn into_parts(self) -> (FrameEnvelope, Option<StreamReadyEvent>) {
+        (self.frame, self.preprocess_ready)
+    }
+}
+
+#[derive(Debug)]
+struct UpscaledFrameEnvelope {
+    frame: FrameEnvelope,
+    postprocess_ready: Option<StreamReadyEvent>,
+}
+
+impl UpscaledFrameEnvelope {
+    fn new(frame: FrameEnvelope, postprocess_ready: Option<StreamReadyEvent>) -> Self {
+        Self {
+            frame,
+            postprocess_ready,
+        }
+    }
+
+    fn into_parts(self) -> (FrameEnvelope, Option<StreamReadyEvent>) {
+        (self.frame, self.postprocess_ready)
+    }
 }
 
 // ─── Metrics ────────────────────────────────────────────────────────────────
@@ -242,11 +384,12 @@ impl UpscalePipeline {
         B: UpscaleBackend + 'static,
         E: FrameEncoder,
     {
-        let (tx_decoded, rx_decoded) = mpsc::channel::<FrameEnvelope>(self.config.decoded_capacity);
+        let (tx_decoded, rx_decoded) =
+            mpsc::channel::<DecodedFrameEnvelope>(self.config.decoded_capacity);
         let (tx_preprocessed, rx_preprocessed) =
-            mpsc::channel::<FrameEnvelope>(self.config.preprocessed_capacity);
+            mpsc::channel::<PreprocessedFrameEnvelope>(self.config.preprocessed_capacity);
         let (tx_upscaled, rx_upscaled) =
-            mpsc::channel::<FrameEnvelope>(self.config.upscaled_capacity);
+            mpsc::channel::<UpscaledFrameEnvelope>(self.config.upscaled_capacity);
 
         let cancel = self.cancel.clone();
         let ctx = self.ctx.clone();
@@ -871,11 +1014,11 @@ impl AuditSuite {
 /// Stage 1 — Decode.
 ///
 /// Runs on a blocking thread (NVDEC may DMA-block).
-/// Produces NV12 `FrameEnvelope` at decoder cadence.
+/// Produces decoded frames at decoder cadence.
 /// `blocking_send` propagates backpressure from downstream.
 fn decode_stage<D: FrameDecoder>(
     decoder: &mut D,
-    tx: &mpsc::Sender<FrameEnvelope>,
+    tx: &mpsc::Sender<DecodedFrameEnvelope>,
     cancel: &CancellationToken,
     metrics: &PipelineMetrics,
     queue: &crate::core::context::QueueDepthTracker,
@@ -891,7 +1034,8 @@ fn decode_stage<D: FrameDecoder>(
         }
         debug!("PIPELINE-BND: decode_stage calling decode_next");
         match decoder.decode_next()? {
-            Some(frame) => {
+            Some(decoded) => {
+                let frame = &decoded.frame;
                 info!(
                     thread = ?std::thread::current().id(),
                     frame_index = frame.frame_index,
@@ -900,7 +1044,7 @@ fn decode_stage<D: FrameDecoder>(
                 );
                 debug_assert_eq!(frame.texture.format, PixelFormat::Nv12);
                 queue.decode.fetch_add(1, Ordering::Relaxed);
-                if tx.blocking_send(frame).is_err() {
+                if tx.blocking_send(decoded).is_err() {
                     debug!("Decode: downstream closed");
                     queue.decode.fetch_sub(1, Ordering::Relaxed);
                     return Ok(());
@@ -926,8 +1070,8 @@ fn decode_stage<D: FrameDecoder>(
 ///
 /// Recycles consumed NV12 buffers for VRAM accounting accuracy.
 async fn preprocess_stage(
-    mut rx: mpsc::Receiver<FrameEnvelope>,
-    tx: &mpsc::Sender<FrameEnvelope>,
+    mut rx: mpsc::Receiver<DecodedFrameEnvelope>,
+    tx: &mpsc::Sender<PreprocessedFrameEnvelope>,
     kernels: &PreprocessKernels,
     ctx: &GpuContext,
     precision: ModelPrecision,
@@ -942,7 +1086,7 @@ async fn preprocess_stage(
     );
 
     loop {
-        let frame = tokio::select! {
+        let decoded = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 debug!("Preprocess cancelled");
@@ -965,12 +1109,42 @@ async fn preprocess_stage(
             break;
         }
 
+        ctx.device().bind_to_thread().map_err(|e| {
+            EngineError::DimensionMismatch(format!("bind_to_thread (preprocess): {:?}", e))
+        })?;
+
+        let (frame, decode_ready) = decoded.into_parts();
+        info!(
+            frame_index = frame.frame_index,
+            pts = frame.pts,
+            has_decode_ready = decode_ready.is_some(),
+            "PIPELINE-BND: preprocess_stage received frame"
+        );
+        if let Some(event) = decode_ready {
+            event.wait(&ctx.preprocess_stream)?;
+        }
+        info!(
+            frame_index = frame.frame_index,
+            "PIPELINE-BND: preprocess_stage decode dependency satisfied"
+        );
+        if profiler_ctx.is_some() && frame.frame_index % 60 == 0 {
+            ctx.overlap_timer.mark_preprocess_start(&ctx.preprocess_stream)?;
+            let _ = ctx.overlap_timer.sample();
+        }
+
         let t_start = Instant::now();
 
         let model_input = preprocess.prepare(&frame.texture, ctx, &ctx.preprocess_stream)?;
-
-        // Stream sync before releasing NV12 buffer — ensures kernel completed.
-        GpuContext::sync_stream(&ctx.preprocess_stream)?;
+        info!(
+            frame_index = frame.frame_index,
+            out_width = model_input.texture.width,
+            out_height = model_input.texture.height,
+            out_pitch = model_input.texture.pitch,
+            out_format = ?model_input.texture.format,
+            "PIPELINE-BND: preprocess_stage prepare complete"
+        );
+        let preprocess_ready =
+            Some(StreamReadyEvent::record(&ctx.preprocess_stream, "preprocess_ready")?);
 
         let elapsed_us = t_start.elapsed().as_micros() as u64;
         metrics
@@ -994,12 +1168,17 @@ async fn preprocess_stage(
             pts: frame.pts,
             is_keyframe: frame.is_keyframe,
         };
+        let out = PreprocessedFrameEnvelope::new(out, preprocess_ready);
 
         if tx.send(out).await.is_err() {
             debug!("Preprocess: downstream closed");
             ctx.queue_depth.preprocess.fetch_sub(1, Ordering::Relaxed);
             return Err(EngineError::ChannelClosed);
         }
+        info!(
+            frame_index = frame.frame_index,
+            "PIPELINE-BND: preprocess_stage sent frame"
+        );
         metrics.frames_preprocessed.fetch_add(1, Ordering::Release);
         // Preprocess queue decrement happens when next stage receives?
         // No, `tx.send` pushes it to channel. Channel is technically "inference input queue".
@@ -1027,8 +1206,8 @@ async fn preprocess_stage(
 ///
 /// Recycles consumed RGB buffers for VRAM accounting.
 async fn inference_stage<B: UpscaleBackend>(
-    mut rx: mpsc::Receiver<FrameEnvelope>,
-    tx: &mpsc::Sender<FrameEnvelope>,
+    mut rx: mpsc::Receiver<PreprocessedFrameEnvelope>,
+    tx: &mpsc::Sender<UpscaledFrameEnvelope>,
     backend: &B,
     kernels: &PreprocessKernels,
     ctx: &GpuContext,
@@ -1098,8 +1277,8 @@ async fn inference_stage<B: UpscaleBackend>(
             ModelPrecision::F32 => PixelFormat::RgbPlanarF32,
             ModelPrecision::F16 => PixelFormat::RgbPlanarF16,
         };
-        for frame in &batch {
-            debug_assert_eq!(frame.texture.format, expected_format);
+        for envelope in &batch {
+            debug_assert_eq!(envelope.frame.texture.format, expected_format);
             ctx.queue_depth.preprocess.fetch_sub(1, Ordering::Relaxed);
             ctx.queue_depth.inference.fetch_add(1, Ordering::Relaxed);
         }
@@ -1111,16 +1290,42 @@ async fn inference_stage<B: UpscaleBackend>(
             break;
         }
 
+        ctx.device().bind_to_thread().map_err(|e| {
+            EngineError::DimensionMismatch(format!("bind_to_thread (inference): {:?}", e))
+        })?;
+
         let mut metas = Vec::with_capacity(batch.len());
         let mut inputs = Vec::with_capacity(batch.len());
-        for frame in batch {
+        for envelope in batch {
+            let (frame, preprocess_ready) = envelope.into_parts();
+            info!(
+                frame_index = frame.frame_index,
+                pts = frame.pts,
+                has_preprocess_ready = preprocess_ready.is_some(),
+                "PIPELINE-BND: inference_stage received frame"
+            );
+            if let Some(event) = preprocess_ready {
+                event.wait(&ctx.inference_stream)?;
+            }
+            info!(
+                frame_index = frame.frame_index,
+                "PIPELINE-BND: inference_stage preprocess dependency satisfied"
+            );
             metas.push((frame.frame_index, frame.pts, frame.is_keyframe));
             inputs.push(frame.texture);
         }
 
         // ── Inference ──
         let t_infer = Instant::now();
+        info!(
+            batch_size = inputs.len(),
+            "PIPELINE-BND: inference_stage calling backend.process_batch"
+        );
         let upscaled_rgbs = backend.process_batch(inputs.clone()).await?;
+        info!(
+            batch_size = upscaled_rgbs.len(),
+            "PIPELINE-BND: inference_stage backend.process_batch complete"
+        );
         let infer_us = t_infer.elapsed().as_micros() as u64;
         metrics
             .inference_total_us
@@ -1137,6 +1342,10 @@ async fn inference_stage<B: UpscaleBackend>(
                 ctx.recycle(slice);
             }
         }
+
+        ctx.device().bind_to_thread().map_err(|e| {
+            EngineError::DimensionMismatch(format!("bind_to_thread (inference post): {:?}", e))
+        })?;
 
         if upscaled_rgbs.len() != metas.len() {
             ctx.queue_depth
@@ -1155,8 +1364,25 @@ async fn inference_stage<B: UpscaleBackend>(
         for (upscaled_rgb, (frame_index, pts, is_keyframe)) in
             upscaled_rgbs.into_iter().zip(metas.iter().copied())
         {
+            info!(
+                frame_index,
+                pts,
+                rgb_width = upscaled_rgb.width,
+                rgb_height = upscaled_rgb.height,
+                rgb_pitch = upscaled_rgb.pitch,
+                rgb_format = ?upscaled_rgb.format,
+                "PIPELINE-BND: inference_stage postprocess input"
+            );
             let upscaled_nv12 =
                 preprocess.postprocess(upscaled_rgb, encoder_pitch, ctx, &ctx.inference_stream)?;
+            info!(
+                frame_index,
+                pts,
+                nv12_width = upscaled_nv12.width,
+                nv12_height = upscaled_nv12.height,
+                nv12_pitch = upscaled_nv12.pitch,
+                "PIPELINE-BND: inference_stage postprocess complete"
+            );
             envelopes.push(FrameEnvelope {
                 texture: upscaled_nv12,
                 frame_index,
@@ -1165,7 +1391,8 @@ async fn inference_stage<B: UpscaleBackend>(
             });
         }
 
-        GpuContext::sync_stream(&ctx.inference_stream)?;
+        let postprocess_ready =
+            Some(StreamReadyEvent::record(&ctx.inference_stream, "postprocess_ready")?);
         let post_us = t_post.elapsed().as_micros() as u64;
         metrics
             .postprocess_total_us
@@ -1178,13 +1405,25 @@ async fn inference_stage<B: UpscaleBackend>(
             pctx.profiler.record_frame_latency(infer_us + post_us);
         }
 
-        let mut pending = envelopes.len();
-        for envelope in envelopes {
-            if tx.send(envelope).await.is_err() {
+        let total_envelopes = envelopes.len();
+        let mut pending = total_envelopes;
+        let mut postprocess_ready = postprocess_ready;
+        for frame in envelopes {
+            let frame_index = frame.frame_index;
+            let ready = if pending == total_envelopes {
+                postprocess_ready.take()
+            } else {
+                None
+            };
+            if tx.send(UpscaledFrameEnvelope::new(frame, ready)).await.is_err() {
                 debug!("Inference: downstream closed");
                 ctx.queue_depth.inference.fetch_sub(pending, Ordering::Relaxed);
                 return Err(EngineError::ChannelClosed);
             }
+            info!(
+                frame_index,
+                "PIPELINE-BND: inference_stage sent frame"
+            );
             pending -= 1;
             metrics.frames_inferred.fetch_add(1, Ordering::Release);
             ctx.queue_depth.inference.fetch_sub(1, Ordering::Relaxed);
@@ -1204,7 +1443,7 @@ async fn inference_stage<B: UpscaleBackend>(
 /// Always calls `flush()` before returning — even on cancellation — to ensure
 /// all NVENC packets are committed to disk.
 fn encode_stage<E: FrameEncoder>(
-    mut rx: mpsc::Receiver<FrameEnvelope>,
+    mut rx: mpsc::Receiver<UpscaledFrameEnvelope>,
     encoder: &mut E,
     cancel: &CancellationToken,
     metrics: &PipelineMetrics,
@@ -1222,7 +1461,21 @@ fn encode_stage<E: FrameEncoder>(
         }
         debug!("PIPELINE-BND: encode_stage waiting for frame");
         match rx.blocking_recv() {
-            Some(frame) => {
+            Some(envelope) => {
+                let (frame, postprocess_ready) = envelope.into_parts();
+                info!(
+                    frame_index = frame.frame_index,
+                    pts = frame.pts,
+                    has_postprocess_ready = postprocess_ready.is_some(),
+                    "PIPELINE-BND: encode_stage received frame"
+                );
+                if let Some(event) = postprocess_ready {
+                    event.synchronize()?;
+                }
+                info!(
+                    frame_index = frame.frame_index,
+                    "PIPELINE-BND: encode_stage postprocess dependency satisfied"
+                );
                 debug_assert_eq!(frame.texture.format, PixelFormat::Nv12);
                 info!(
                     thread = ?std::thread::current().id(),
@@ -1277,7 +1530,7 @@ impl MockDecoder {
 }
 
 impl FrameDecoder for MockDecoder {
-    fn decode_next(&mut self) -> Result<Option<FrameEnvelope>> {
+    fn decode_next(&mut self) -> Result<Option<DecodedFrameEnvelope>> {
         if self.remaining == 0 {
             return Ok(None);
         }
@@ -1304,7 +1557,7 @@ impl FrameDecoder for MockDecoder {
             is_keyframe: self.idx % 30 == 0,
         };
         self.idx += 1;
-        Ok(Some(envelope))
+        Ok(Some(DecodedFrameEnvelope::without_event(envelope)))
     }
 }
 

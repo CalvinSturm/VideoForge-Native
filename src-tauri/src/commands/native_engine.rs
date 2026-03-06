@@ -252,6 +252,17 @@ fn native_engine_runtime_enabled() -> bool {
 }
 
 #[cfg(feature = "native_engine")]
+fn native_engine_direct_enabled() -> bool {
+    match std::env::var("VIDEOFORGE_NATIVE_ENGINE_DIRECT") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+#[cfg(feature = "native_engine")]
 async fn run_native_via_rave_cli(
     input_path: String,
     output_path: String,
@@ -395,16 +406,33 @@ pub async fn upscale_request_native(
             .unwrap());
         }
 
-        run_native_via_rave_cli(
-            input_path,
-            output_path,
-            model_path,
-            scale,
-            precision.unwrap_or_else(|| "fp32".to_string()),
-            audio.unwrap_or(true),
-            max_batch.unwrap_or(1),
-        )
-        .await
+        let precision = precision.unwrap_or_else(|| "fp32".to_string());
+        let audio = audio.unwrap_or(true);
+        let max_batch = max_batch.unwrap_or(1);
+
+        if native_engine_direct_enabled() {
+            run_native_pipeline(
+                input_path,
+                output_path,
+                model_path,
+                scale,
+                precision,
+                audio,
+                max_batch,
+            )
+            .await
+        } else {
+            run_native_via_rave_cli(
+                input_path,
+                output_path,
+                model_path,
+                scale,
+                precision,
+                audio,
+                max_batch,
+            )
+            .await
+        }
     }
 }
 
@@ -781,25 +809,45 @@ async fn run_engine_pipeline(
         final_output.clone(),
     ]);
 
-    let mux_status = Command::new(&ffmpeg_cmd)
+    let mux_output = Command::new(&ffmpeg_cmd)
         .args(&mux_args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .await
         .map_err(|e| make_err("FFMPEG_MUX_SPAWN", &e.to_string()))?;
 
-    // Clean up temp files regardless of mux result.
-    let _ = std::fs::remove_file(&input_stream);
-    let _ = std::fs::remove_file(&engine_output);
-
-    if !mux_status.success() {
+    if !mux_output.status.success() {
+        let stderr = String::from_utf8_lossy(&mux_output.stderr);
+        let stderr_tail = stderr
+            .lines()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        tracing::error!(
+            status = ?mux_output.status.code(),
+            input_stream = %input_stream.display(),
+            engine_output = %engine_output.display(),
+            final_output = %final_output,
+            stderr = %stderr_tail,
+            "FFmpeg mux step failed"
+        );
         return Err(make_err(
             "MUX_FAILED",
-            "FFmpeg mux step failed. The native engine output exists but was not muxed. \
-             See docs/NATIVE_ENGINE_MVP.md for the 'audio_only_video' workaround.",
+            &format!(
+                "FFmpeg mux step failed. Temporary files were preserved for inspection. stderr:\n{}",
+                stderr_tail
+            ),
         ));
     }
+
+    // Clean up temp files after a successful mux.
+    let _ = std::fs::remove_file(&input_stream);
+    let _ = std::fs::remove_file(&engine_output);
 
     tracing::info!(output = %final_output, "Native engine upscale complete");
 

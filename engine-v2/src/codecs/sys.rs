@@ -25,6 +25,7 @@ use std::os::raw::{c_int, c_short, c_uint, c_ulong, c_ulonglong};
 /// CUDA result code.
 pub type CUresult = c_int;
 pub const CUDA_SUCCESS: CUresult = 0;
+pub const CUDA_ERROR_NOT_READY: CUresult = 600;
 
 /// CUDA device pointer (64-bit).
 pub type CUdeviceptr = c_ulonglong;
@@ -569,6 +570,9 @@ unsafe extern "C" {
     pub fn cuEventCreate(phEvent: *mut CUevent, Flags: c_uint) -> CUresult;
     pub fn cuEventDestroy_v2(hEvent: CUevent) -> CUresult;
     pub fn cuEventRecord(hEvent: CUevent, hStream: CUstream) -> CUresult;
+    pub fn cuEventQuery(hEvent: CUevent) -> CUresult;
+    pub fn cuEventSynchronize(hEvent: CUevent) -> CUresult;
+    pub fn cuStreamSynchronize(hStream: CUstream) -> CUresult;
     pub fn cuStreamWaitEvent(hStream: CUstream, hEvent: CUevent, Flags: c_uint) -> CUresult;
 }
 
