@@ -39,6 +39,13 @@ This single fix covers **every caller** across the pipeline.
 
 Rewrote `tiled_inference` to process one tile fully (crop→infer→place→drop) before starting the next. Fixes OutputRing contention when total tiles exceeds `ring_size=8`.
 
+### 4. CPU roundtrip for transformer + CUDA EP (`run_session_cpu_roundtrip`)
+
+`run_io_bound` (IO binding with pre-allocated GPU output) fails for transformer
+models on CUDA EP — ORT may route attention/layer-norm to CPU, breaking the
+pre-allocated output buffer.  `run_session_cpu_roundtrip` avoids this by
+using `session.run()` with host tensors: D2H input → session.run() → H2D output.
+
 ## Files Changed
 
 | File | Change |
@@ -46,6 +53,7 @@ Rewrote `tiled_inference` to process one tile fully (crop→infer→place→drop
 | [context.rs](file:///c:/Users/Calvin/Desktop/VideoForge1/third_party/rave/crates/rave-core/src/context.rs) | `synchronize()` after `alloc_zeros` in pool miss |
 | [kernels.rs](file:///c:/Users/Calvin/Desktop/VideoForge1/third_party/rave/crates/rave-cuda/src/kernels.rs) | `synchronize()` after `alloc_zeros` in `crop_tile` |
 | [pipeline.rs](file:///c:/Users/Calvin/Desktop/VideoForge1/third_party/rave/crates/rave-pipeline/src/pipeline.rs) | Serialized tile processing, input keepalive |
+| [tensorrt.rs](file:///c:/Users/Calvin/Desktop/VideoForge1/third_party/rave/crates/rave-tensorrt/src/tensorrt.rs) | CPU roundtrip for transformer + CUDA EP |
 
 ## Debugging Journey (15 attempts)
 

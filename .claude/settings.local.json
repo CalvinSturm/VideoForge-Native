@@ -20,7 +20,13 @@
       "Bash(cat:*)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "Bash(node:*)",
+      "Bash(\"$USERPROFILE/.cargo/bin/cargo\" build:*)",
+      "Bash(where cargo)",
+      "Read(//c/Users/Calvin/.cargo/bin/**)",
+      "Read(//c/Users/Calvin/Desktop/VideoForge1/third_party/rave/$USERPROFILE/.cargo/**)",
+      "Bash(/c/Users/Calvin/.cargo/bin/cargo.exe build:*)"
     ]
   }
 }

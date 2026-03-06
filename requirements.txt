@@ -1,10 +1,18 @@
-torch==2.0.1+cu117
-torchvision==0.15.2+cu117
-torchaudio==2.0.2+cu117
+# Install torch separately with the CUDA index URL:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision
+torchaudio
 
-basicsr
-realesrgan
+# Model loading
 spandrel
 
-numpy<2
-pillow<10
+# ONNX inference + FP16 conversion
+onnxruntime-gpu
+onnx
+onnxconverter-common
+
+# Image I/O
+opencv-python
+numpy
+pillow

@@ -32,7 +32,7 @@ const ARCHITECTURE_PATTERNS: ArchitecturePattern[] = [
     // IMPORTANT: Must be checked before GAN — model names like "Swin_2SR_..._BSRGAN"
     // contain GAN-family training method names but are transformer architectures.
     {
-        pattern: /(swin[-_]?ir|swin[-_]?2?sr|hat|ipt|edt|dat|ffhq[-_]?dat|faceup)/i,
+        pattern: /(swin[-_]?ir|swin[-_]?2?sr|hat|ipt|edt|dat|ffhq[-_]?dat|faceup|realweb|lmlt)/i,
         class: 'Transformer',
         label: 'Transformer',
         icon: '🔀',

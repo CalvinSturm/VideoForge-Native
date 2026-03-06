@@ -16,18 +16,20 @@
 
 | Feature | Python Engine | Native Engine |
 |---|---|---|
-| **Tiled inference** | ✅ Yes | ❌ None |
-| **Tile size (CNN)** | 512px | N/A (full-frame) |
-| **Tile size (transformer)** | 256px | N/A (full-frame) |
-| **Tile padding** | 32px reflect | N/A |
+| **Tiled inference** | ✅ Yes | ✅ Yes |
+| **Tile size (CNN)** | 512px | Configurable (`--tile-size`) |
+| **Tile size (transformer)** | 256px | Configurable (`--tile-size`) |
+| **Tile padding** | 32px reflect | Configurable (`--tile-pad`) |
 | **Transformer detection** | `_TRANSFORMER_KEYS = {"dat", "swin", "hat", "realweb", "omnisr", "lmlt"}` | Dynamic spatial axis probe (NCHW shape check) |
-| **Tile merge** | Seamless crop-and-place | N/A |
+| **Tile merge** | Seamless crop-and-place | CUDA `crop_tile` / `place_tile` kernels |
+| **Serialization** | Sequential tile loop | Serialized crop→infer→place→drop with `synchronize()` barriers |
 
 ### Key files
 
 - Python: [shm_worker.py](file:///c:/Users/Calvin/Desktop/VideoForge1/python/shm_worker.py#L1119-L1232) — `process_image_tile()`
 - Python: [model_manager.py](file:///c:/Users/Calvin/Desktop/VideoForge1/python/model_manager.py#L644-L647) — `_TRANSFORMER_KEYS` and `preferred_tile_size`
-- Native: No tiling code exists anywhere in `rave-pipeline` or `rave-tensorrt`
+- Native: [pipeline.rs](file:///c:/Users/Calvin/Desktop/VideoForge1/third_party/rave/crates/rave-pipeline/src/pipeline.rs#L1736-L1837) — `tiled_inference()`
+- Native: [kernels.rs](file:///c:/Users/Calvin/Desktop/VideoForge1/third_party/rave/crates/rave-cuda/src/kernels.rs#L247-L330) — `crop_tile_planar_f32`, `place_tile_planar_f32` CUDA kernels
 
 ---
 
@@ -35,10 +37,11 @@
 
 | Feature | Python Engine | Native Engine |
 |---|---|---|
-| **FP16 support** | ✅ `torch.autocast("cuda", dtype=torch.float16)` | ⚠️ Partial — TRT EP `with_fp16(true)` only |
-| **Precision modes** | `fp32`, `fp16`, `deterministic` | `Fp32`, `Fp16`, `Int8` (TRT-only) |
-| **CUDA EP FP16** | Via PyTorch autocast | ❌ Not configured (CUDA EP always FP32) |
-| **Runtime configurable** | ✅ `--precision` CLI flag | Via `PrecisionPolicy` enum (TRT EP only) |
+| **FP16 support** | ✅ `torch.autocast("cuda", dtype=torch.float16)` | ✅ TRT EP `with_fp16(true)` + CUDA EP FP16 model auto-detect |
+| **Precision modes** | `fp32`, `fp16`, `deterministic` | `Fp32`, `Fp16`, `Int8` (TRT-only for INT8) |
+| **CUDA EP optimization** | Via PyTorch autocast | ✅ TF32 + max workspace + FP16 model auto-detect (`.fp16.onnx`) |
+| **FP16 model conversion** | N/A (uses torch.autocast) | ✅ `python scripts/convert_fp16.py model.onnx` |
+| **Runtime configurable** | ✅ `--precision` CLI flag | ✅ Via `PrecisionPolicy` enum (drives both TRT + CUDA EP) |
 
 ### Key files
 
@@ -90,11 +93,11 @@
 | Feature | Python Engine | Native Engine |
 |---|---|---|
 | **Architecture detection** | ✅ `_TRANSFORMER_KEYS` + state-dict patterns | ✅ Dynamic spatial axis probe |
-| **Adapted tile size** | ✅ 256px for transformers | ❌ Full-frame only |
+| **Adapted tile size** | ✅ 256px for transformers | ✅ Configurable via `--tile-size` |
 | **ORT CUDA EP probe** | ✅ 20s deadlock timeout with dummy input | ❌ No deadlock detection |
 | **EP fallback** | CUDA EP → CPU EP (if CUDA hangs) | TRT EP → CUDA EP (if TRT build fails) |
 | **Window padding** | ✅ Adapters: `SwinIRAdapter`, `HATAdapter`, `DATAdapter` | ❌ No adapter system |
-| **Speed (DAT2 @ 406×470)** | ~1-3s/frame (256px tiles × FP16) | ~35s/frame (full-frame × FP32) |
+| **Speed (DAT2 @ 406×470)** | ~1-3s/frame (256px tiles × FP16) | ⏳ Untested with tiling (was ~35s full-frame × FP32) |
 
 ### Python's ONNX deadlock probe
 
@@ -106,21 +109,20 @@
 
 | Recommendation | Python Engine | Native Engine | Impact |
 |---|---|---|---|
-| **1. Tiled inference** | ✅ Already implemented | ❌ **Missing** | **10-50× speedup** for transformers |
-| **2. FP16 precision** | ✅ Already implemented | ⚠️ TRT-only, not CUDA EP | **2× speedup** + half VRAM |
-| **3. Simpler session.run()** | ✅ Uses `session.run()` (ONNX path) | ❌ Uses IO binding (crash-prone) | **Fixes crash** after N frames |
+| ~~**1. Tiled inference**~~ | ✅ Already implemented | ✅ **Done** (`pipeline.rs` + CUDA kernels) | ~~10-50× speedup~~ |
+| ~~**2. CUDA EP + FP16 model**~~ | ✅ Already implemented | ✅ **Done** (TF32 + FP16 auto-detect + conversion script) | ~~~2× speedup~~ |
+| ~~**3. Simpler session.run()**~~ | ✅ Uses `session.run()` (ONNX path) | ✅ **Done** (`run_session_cpu_roundtrip()` for CUDA EP) | ~~**Fixes crash** after N frames~~ |
 | **4. OOM recovery** | ✅ Catches + falls back | ❌ Process crash | **Fixes exit code 1** |
-| **5. CUDA EP FP16 config** | ✅ Via `torch.autocast` | ❌ Not configured | **2× speedup** on CUDA EP |
+| **5. Deadlock-safe ONNX probe** | ✅ 20s timeout thread | ❌ No timeout | **Prevents hangs** on some transformers |
 
 ---
 
 ## Summary
 
-The Python engine is **production-hardened for transformer models** with tiling, FP16, deadlock probes, and OOM recovery. The native engine is **optimized for CNN models** with zero-copy GPU pipeline and TRT EP acceleration, but lacks every transformer optimization the Python engine has.
+The Python engine is **production-hardened for transformer models** with tiling, FP16, deadlock probes, and OOM recovery. The native engine now has **tiled inference**, **FP16-optimized CUDA EP** (TF32 + FP16 model auto-detection + conversion script), a zero-copy GPU pipeline with TRT EP acceleration, and **host round-trip inference for CUDA EP** (fixes transformer model crashes). Still lacks OOM recovery and deadlock detection.
 
-To make the native engine viable for transformers, implement (in priority order):
+Remaining work to reach parity (in priority order):
 
-1. **Tiled inference** in `rave-pipeline` (biggest impact)
-2. **FP16 for CUDA EP** in `tensorrt.rs`
-3. **OOM-safe session.run() fallback** as alternative to IO binding
-4. **Deadlock-safe ONNX probe** (20s timeout, like Python)
+1. ~~**Offline ONNX FP16 model conversion**~~ — **Done** (`scripts/convert_fp16.py` + auto-detection)
+2. ~~**OOM-safe `session.run()` fallback**~~ — **Done** (`run_session_cpu_roundtrip()` dispatched for CUDA EP sessions)
+3. **Deadlock-safe ONNX probe** (20s timeout, like Python)
