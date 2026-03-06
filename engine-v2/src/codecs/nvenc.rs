@@ -216,6 +216,10 @@ fn guid_eq(a: GUID, b: GUID) -> bool {
     a.Data1 == b.Data1 && a.Data2 == b.Data2 && a.Data3 == b.Data3 && a.Data4 == b.Data4
 }
 
+fn register_resource_version_candidates() -> [u32; 4] {
+    [4, 3, 2, 1]
+}
+
 fn preset_attempts() -> [PresetAttempt; 6] {
     [
         PresetAttempt {
@@ -841,24 +845,59 @@ impl NvEncoder {
             .nvEncRegisterResource
             .ok_or_else(|| EngineError::Encode("nvEncRegisterResource not found".into()))?;
 
-        let mut reg: NV_ENC_REGISTER_RESOURCE = unsafe { std::mem::zeroed() };
-        reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
-        reg.width = width;
-        reg.height = height;
-        reg.pitch = pitch;
-        reg.resourceToRegister = dev_ptr as *mut c_void;
-        reg.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
-        reg.version = self.struct_version(1);
+        let mut last_status: Option<NVENCSTATUS> = None;
+        for struct_ver in register_resource_version_candidates() {
+            let mut reg: NV_ENC_REGISTER_RESOURCE = unsafe { std::mem::zeroed() };
+            reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
+            reg.width = width;
+            reg.height = height;
+            reg.pitch = pitch;
+            reg.resourceToRegister = dev_ptr as *mut c_void;
+            reg.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
+            reg.version = self.struct_version(struct_ver);
 
-        // SAFETY: reg is fully initialized. NVENC validates the device pointer.
-        unsafe {
-            check_nvenc(reg_fn(self.encoder, &mut reg), "nvEncRegisterResource")?;
+            let status = unsafe { reg_fn(self.encoder, &mut reg) };
+            if status == NV_ENC_SUCCESS {
+                let handle = reg.registeredResource;
+                self.reg_cache.insert(dev_ptr, handle);
+                debug!(dev_ptr, struct_ver, "NVENC resource registered");
+                return Ok(handle);
+            }
+
+            last_status = Some(status);
+            if status == NV_ENC_ERR_INVALID_VERSION || status == NV_ENC_ERR_UNSUPPORTED_PARAM {
+                info!(
+                    status = status as i32,
+                    struct_ver,
+                    dev_ptr = %format_args!("{:#x}", dev_ptr),
+                    pitch,
+                    width,
+                    height,
+                    "nvEncRegisterResource retryable status"
+                );
+                continue;
+            }
+
+            if status == NV_ENC_ERR_INVALID_PARAM && struct_ver != 1 {
+                info!(
+                    status = status as i32,
+                    struct_ver,
+                    dev_ptr = %format_args!("{:#x}", dev_ptr),
+                    pitch,
+                    width,
+                    height,
+                    "nvEncRegisterResource invalid-param retry while probing struct version"
+                );
+                continue;
+            }
+
+            return check_nvenc(status, "nvEncRegisterResource").map(|_| unreachable!());
         }
 
-        let handle = reg.registeredResource;
-        self.reg_cache.insert(dev_ptr, handle);
-        debug!(dev_ptr, "NVENC resource registered");
-        Ok(handle)
+        Err(EngineError::Encode(format!(
+            "nvEncRegisterResource: all probed struct versions failed (last status {})",
+            last_status.map(|s| s as i32).unwrap_or(-1)
+        )))
     }
 
     /// Encode a single frame from a registered CUDA resource.
@@ -889,7 +928,9 @@ impl NvEncoder {
                     Ok(h) => h,
                     Err(EngineError::Encode(msg))
                         if msg.contains("NV_ENC_ERR_INVALID_PARAM")
+                            || msg.contains("NV_ENC_ERR_RESOURCE_REGISTER_FAILED")
                             || msg.contains("last status 8")
+                            || msg.contains("last status 23")
                             || msg.contains("all probed struct versions failed") =>
                     {
                         warn!(
