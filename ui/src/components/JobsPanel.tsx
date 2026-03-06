@@ -38,13 +38,39 @@ const formatPolicySummary = (job: Job): string | null => {
   return parts.length > 0 ? parts.join(" | ") : null;
 };
 
-const formatNativeSummary = (job: Job): string[] => {
-  const parts: string[] = [];
-  if (job.nativeEngine) parts.push(`engine=${job.nativeEngine}`);
-  if (job.encoderMode) parts.push(`encoder_mode=${job.encoderMode}`);
-  if (typeof job.framesProcessed === 'number') parts.push(`frames=${job.framesProcessed}`);
-  if (typeof job.audioPreserved === 'boolean') parts.push(`audio_preserved=${job.audioPreserved}`);
-  return parts;
+const formatLabel = (value: string) =>
+  value
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+
+const describeEncoderMode = (mode?: string): { label: string; tone: string; detail: string } | null => {
+  if (!mode) return null;
+  switch (mode) {
+    case "nvenc":
+      return {
+        label: "NVENC Active",
+        tone: "#10b981",
+        detail: "Hardware encode path stayed active for this job."
+      };
+    case "nvenc_legacy_staging":
+      return {
+        label: "NVENC Legacy Staging",
+        tone: "#f59e0b",
+        detail: "Hardware encode recovered through the compatibility staging path."
+      };
+    case "software":
+      return {
+        label: "Software Encode",
+        tone: "#ef4444",
+        detail: "Hardware encode was unavailable and the job completed on the software path."
+      };
+    default:
+      return {
+        label: formatLabel(mode),
+        tone: "var(--text-secondary)",
+        detail: "Encoder mode reported by the native backend."
+      };
+  }
 };
 
 const extractErrorCategory = (job: Job): string | null => {
@@ -484,7 +510,7 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
                 </div>
 
                 {/* Error message */}
-                {isComplete && (job.policy || typeof job.hostCopyAuditEnabled === 'boolean' || nativeSummary.length > 0 || job.encoderDetail) && (
+                {isComplete && (job.policy || typeof job.hostCopyAuditEnabled === 'boolean' || job.nativeEngine || job.encoderMode || job.encoderDetail) && (
                   <div style={{
                     fontSize: '9px',
                     color: 'var(--text-muted)',
@@ -495,8 +521,107 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
                     wordBreak: 'break-word',
                     lineHeight: 1.45
                   }}>
-                    {nativeSummary.map((line) => <div key={line}>{line}</div>)}
-                    {job.encoderDetail && <div>encoder_detail={job.encoderDetail}</div>}
+                    {(job.nativeEngine || job.encoderMode || job.encoderDetail) && (() => {
+                      const encoderState = describeEncoderMode(job.encoderMode);
+                      return (
+                        <div style={{
+                          marginBottom: policySummary || typeof job.hostCopyAuditEnabled === 'boolean' ? '8px' : 0,
+                          padding: '7px 8px',
+                          borderRadius: '4px',
+                          border: '1px solid rgba(255,255,255,0.08)',
+                          background: 'rgba(0,0,0,0.18)'
+                        }}>
+                          <div style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            gap: '8px',
+                            marginBottom: '5px'
+                          }}>
+                            <span style={{
+                              fontSize: '8px',
+                              letterSpacing: '0.08em',
+                              textTransform: 'uppercase',
+                              color: 'var(--text-secondary)',
+                              fontWeight: 700
+                            }}>
+                              Native Runtime
+                            </span>
+                            {encoderState && (
+                              <span style={{
+                                fontSize: '8px',
+                                fontWeight: 700,
+                                padding: '2px 6px',
+                                borderRadius: '999px',
+                                border: `1px solid ${encoderState.tone}33`,
+                                color: encoderState.tone,
+                                background: `${encoderState.tone}14`,
+                                letterSpacing: '0.04em'
+                              }}>
+                                {encoderState.label}
+                              </span>
+                            )}
+                          </div>
+                          <div style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fit, minmax(110px, 1fr))',
+                            gap: '6px 10px'
+                          }}>
+                            {job.nativeEngine && (
+                              <div>
+                                <div style={{ fontSize: '8px', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                                  Engine
+                                </div>
+                                <div style={{ color: 'var(--text-primary)' }}>{formatLabel(job.nativeEngine)}</div>
+                              </div>
+                            )}
+                            {job.encoderMode && (
+                              <div>
+                                <div style={{ fontSize: '8px', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                                  Encoder
+                                </div>
+                                <div style={{ color: 'var(--text-primary)' }}>{formatLabel(job.encoderMode)}</div>
+                              </div>
+                            )}
+                            {typeof job.framesProcessed === 'number' && (
+                              <div>
+                                <div style={{ fontSize: '8px', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                                  Frames
+                                </div>
+                                <div style={{ color: 'var(--text-primary)' }}>{job.framesProcessed.toLocaleString()}</div>
+                              </div>
+                            )}
+                            {typeof job.audioPreserved === 'boolean' && (
+                              <div>
+                                <div style={{ fontSize: '8px', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                                  Audio
+                                </div>
+                                <div style={{ color: 'var(--text-primary)' }}>{job.audioPreserved ? 'Preserved' : 'Dropped'}</div>
+                              </div>
+                            )}
+                          </div>
+                          {encoderState && (
+                            <div style={{
+                              marginTop: '6px',
+                              color: 'var(--text-secondary)',
+                              lineHeight: 1.4
+                            }}>
+                              {encoderState.detail}
+                            </div>
+                          )}
+                          {job.encoderDetail && (
+                            <div style={{
+                              marginTop: '6px',
+                              paddingTop: '6px',
+                              borderTop: '1px dashed rgba(255,255,255,0.08)',
+                              color: 'var(--text-secondary)'
+                            }}>
+                              detail: {job.encoderDetail}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
                     {policySummary && <div>{policySummary}</div>}
                     {typeof job.hostCopyAuditEnabled === 'boolean' && (
                       <div>

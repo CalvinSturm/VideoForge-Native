@@ -51,7 +51,6 @@ export interface Job {
   command: string;
   status: JobStatus;
   progress: number; // Percentage 0-100
-  framesProcessed?: number;
   totalFrames?: number;
   statusMessage: string;
   paused: boolean;
