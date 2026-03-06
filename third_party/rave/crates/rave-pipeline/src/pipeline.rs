@@ -1786,11 +1786,15 @@ async fn tiled_inference<B: UpscaleBackend>(
             let tile_input = kernels.crop_tile(
                 input, crop_x, crop_y, crop_w, crop_h, ctx, &ctx.inference_stream,
             )?;
+            // Sync all streams: ensures crop kernel on inference_stream AND
+            // any pending alloc_zeros on the null stream are fully complete
+            // before the D2H copy inside process().
+            GpuContext::sync_stream(&ctx.inference_stream)?;
             ctx.device().synchronize()?;
 
             // Keep tile input alive across inference — ORT's TensorRT EP may
             // still read from the buffer after process() returns.
-            let _input_keepalive = tile_input.data.clone();
+            let input_keepalive = tile_input.data.clone();
 
             // ── Infer ──
             let tile_output = backend.process(tile_input).await?;
@@ -1815,12 +1819,18 @@ async fn tiled_inference<B: UpscaleBackend>(
                 valid_h,
                 &ctx.inference_stream,
             )?;
-            // Sync before tile_output drops — cuMemFreeAsync on the default
-            // stream would free the buffer while place on inference_stream
-            // is still reading it.
+            // Sync before recycling — ensures place_tile on inference_stream
+            // has finished reading from tile_output.
+            GpuContext::sync_stream(&ctx.inference_stream)?;
             ctx.device().synchronize()?;
 
-            // tile_output and _input_keepalive drop here → ring slot freed.
+            // Recycle the crop buffer to the pool instead of letting
+            // CudaSlice::drop call cuMemFreeAsync (which races with the
+            // next tile's alloc_zeros on the same virtual address).
+            drop(tile_output); // ring slot freed
+            if let Ok(buf) = Arc::try_unwrap(input_keepalive) {
+                ctx.recycle(buf);
+            }
         }
     }
 

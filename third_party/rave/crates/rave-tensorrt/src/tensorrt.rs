@@ -1322,8 +1322,6 @@ Ensure ORT_DYLIB_PATH/ORT_LIB_LOCATION points to a valid ORT cache dir.",
 
         // 1. D2H: synchronously copy GPU input to host as f32.
         let mut host_input = vec![0.0f32; num_f32];
-        // SAFETY: input.data is a 3×W×H f32 GPU buffer allocated by crop_tile;
-        // host_input has matching element count; copy is synchronous.
         unsafe {
             cudarc::driver::result::memcpy_dtoh_sync(
                 &mut host_input,
@@ -1331,19 +1329,6 @@ Ensure ORT_DYLIB_PATH/ORT_LIB_LOCATION points to a valid ORT cache dir.",
             )
             .map_err(|e| EngineError::Inference(format!("D2H input copy: {e}")))?;
         }
-
-        // Diagnostic: check if crop_tile produced zeros.
-        let input_nonzero = host_input.iter().filter(|&&v| v != 0.0).count();
-        let input_sum: f64 = host_input.iter().map(|&v| v as f64).sum();
-        warn!(
-            in_w,
-            in_h,
-            num_f32,
-            input_nonzero,
-            input_sum,
-            input_buf_bytes = input.data.len(),
-            "cpu_roundtrip: D2H input stats"
-        );
 
         // 2. Build ORT input tensor [1, C, H, W] on host.
         let shape = vec![1i64, meta.input_channels as i64, in_h as i64, in_w as i64];
@@ -1357,21 +1342,9 @@ Ensure ORT_DYLIB_PATH/ORT_LIB_LOCATION points to a valid ORT cache dir.",
             .map_err(|e| EngineError::Inference(e.to_string()))?;
 
         // 4. Extract host output slice.
-        let (out_shape, host_output) = outputs[meta.output_name.as_str()]
+        let (_out_shape, host_output) = outputs[meta.output_name.as_str()]
             .try_extract_tensor::<f32>()
             .map_err(|e| EngineError::Inference(format!("extract output: {e}")))?;
-
-        // Diagnostic: check if ORT output is zeros.
-        let output_nonzero = host_output.iter().filter(|&&v| v != 0.0).count();
-        let output_sum: f64 = host_output.iter().map(|&v| v as f64).sum();
-        warn!(
-            output_len = host_output.len(),
-            output_shape = ?out_shape,
-            output_nonzero,
-            output_sum,
-            output_ring_bytes = output_bytes,
-            "cpu_roundtrip: ORT output stats"
-        );
 
         let need_bytes = host_output.len() * std::mem::size_of::<f32>();
         if output_bytes < need_bytes {
@@ -1382,8 +1355,6 @@ Ensure ORT_DYLIB_PATH/ORT_LIB_LOCATION points to a valid ORT cache dir.",
         }
 
         // 5. H2D: copy output to pre-allocated ring slot.
-        // SAFETY: output_ptr is a valid CUDA device pointer (ring slot, at least
-        // output_bytes); host_output is a valid host slice.
         unsafe {
             cudarc::driver::result::memcpy_htod_sync(
                 output_ptr as cudarc::driver::sys::CUdeviceptr,
