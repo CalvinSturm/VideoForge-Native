@@ -347,7 +347,6 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
             const etaText = isRunning ? formatEta(job.eta) : null;
             const filename = job.command.replace(/^(Upscale|Transcode|Export Edited|PREVIEW SAMPLE):\s*/i, "");
             const policySummary = formatPolicySummary(job);
-            const nativeSummary = formatNativeSummary(job);
             const errorCategory = extractErrorCategory(job);
 
             const elapsedMs = job.startedAt
