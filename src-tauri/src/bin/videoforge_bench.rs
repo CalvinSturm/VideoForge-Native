@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use app_lib::commands::upscale::{run_upscale_job, JobProgress, JobProgressFn, UpscaleJobConfig};
 #[cfg(feature = "native_engine")]
-use app_lib::commands::native_engine::{upscale_request_native, NativeRuntimeOverrides};
+use app_lib::commands::native_engine::{run_native_tool_request, NativeToolRunRequest};
 use app_lib::control::ResearchConfig;
 use app_lib::edit_config::EditConfig;
 use app_lib::models;
@@ -231,10 +231,6 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
             ));
         }
     }
-    let _runtime_env = NativeRuntimeOverrides::native_command(args.native_direct)
-        .with_trt_cache(args.trt_cache, cache_dir)
-        .apply();
-
     for warmup_idx in 0..args.warmup_runs {
         let warmup_output = warmup_output_path(&args.output, warmup_idx + 1);
         emit_json(json!({
@@ -363,15 +359,17 @@ async fn run_native_once(
     onnx_model: &str,
     output_path: &str,
 ) -> Result<app_lib::commands::native_engine::NativeUpscaleResult, String> {
-    upscale_request_native(
-        args.input.clone(),
-        output_path.to_string(),
-        onnx_model.to_string(),
-        args.scale,
-        Some(precision.to_string()),
-        Some(args.preserve_audio),
-        args.max_batch,
-    )
+    run_native_tool_request(NativeToolRunRequest {
+        input_path: args.input.clone(),
+        output_path: output_path.to_string(),
+        model_path: onnx_model.to_string(),
+        scale: args.scale,
+        precision: precision.to_string(),
+        preserve_audio: args.preserve_audio,
+        max_batch: args.max_batch,
+        native_direct: args.native_direct,
+        trt_cache_dir: args.trt_cache.then(default_trt_cache_dir),
+    })
     .await
 }
 

@@ -779,7 +779,7 @@ async fn check_e2e_native(
     native_direct: bool,
     keep_temp: bool,
 ) -> bool {
-    use app_lib::commands::native_engine::{upscale_request_native, NativeRuntimeOverrides};
+    use app_lib::commands::native_engine::{run_native_tool_request, NativeToolRunRequest};
 
     // A) Input prereq checks
     if !std::path::Path::new(input_path).exists() {
@@ -817,16 +817,17 @@ async fn check_e2e_native(
         "default native command path"
     };
     println!("  Running native pipeline via {route_label} (this may take time)...");
-    let _runtime_env = NativeRuntimeOverrides::native_command(native_direct).apply();
-    let result = upscale_request_native(
-        input_path.to_string(),
-        out,
-        model_path.to_string(),
+    let result = run_native_tool_request(NativeToolRunRequest {
+        input_path: input_path.to_string(),
+        output_path: out,
+        model_path: model_path.to_string(),
         scale,
-        Some(precision.to_string()),
-        Some(true), // audio
-        Some(1),    // max_batch
-    )
+        precision: precision.to_string(),
+        preserve_audio: true,
+        max_batch: Some(1),
+        native_direct,
+        trt_cache_dir: None,
+    })
     .await;
 
     let report = match result {

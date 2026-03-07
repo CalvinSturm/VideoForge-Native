@@ -543,9 +543,53 @@ impl Drop for NativeRuntimeEnvGuard {
     }
 }
 
+#[cfg(feature = "native_engine")]
+#[derive(Debug, Clone)]
+pub struct NativeToolRunRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub model_path: String,
+    pub scale: u32,
+    pub precision: String,
+    pub preserve_audio: bool,
+    pub max_batch: Option<u32>,
+    pub native_direct: bool,
+    pub trt_cache_dir: Option<PathBuf>,
+}
+
+#[cfg(feature = "native_engine")]
+impl NativeToolRunRequest {
+    pub fn runtime_overrides(&self) -> NativeRuntimeOverrides {
+        NativeRuntimeOverrides::native_command(self.native_direct).with_trt_cache(
+            self.trt_cache_dir.is_some(),
+            self.trt_cache_dir.clone(),
+        )
+    }
+}
+
+#[cfg(feature = "native_engine")]
+pub async fn run_native_tool_request(
+    request: NativeToolRunRequest,
+) -> Result<NativeUpscaleResult, String> {
+    let _runtime_env = request.runtime_overrides().apply();
+    upscale_request_native(
+        request.input_path,
+        request.output_path,
+        request.model_path,
+        request.scale,
+        Some(request.precision),
+        Some(request.preserve_audio),
+        request.max_batch,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{NativeRuntimeOverrides, NativeVideoOutputProfile, NativeVideoSourceProfile};
+    use super::{
+        NativeRuntimeOverrides, NativeToolRunRequest, NativeVideoOutputProfile,
+        NativeVideoSourceProfile,
+    };
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
 
@@ -615,6 +659,40 @@ mod tests {
         assert_eq!(output.fps_num, 23_976);
         assert_eq!(output.fps_den, 1000);
         assert_eq!(output.frame_rate_arg(), "23976/1000");
+    }
+
+    #[cfg(feature = "native_engine")]
+    #[test]
+    fn tool_request_runtime_overrides_follow_cache_presence() {
+        let _guard = env_test_lock().lock().expect("env test lock");
+        let req = NativeToolRunRequest {
+            input_path: "in.mp4".to_string(),
+            output_path: "out.mp4".to_string(),
+            model_path: "model.onnx".to_string(),
+            scale: 2,
+            precision: "fp16".to_string(),
+            preserve_audio: true,
+            max_batch: Some(4),
+            native_direct: true,
+            trt_cache_dir: Some(PathBuf::from("cache-dir")),
+        };
+
+        {
+            let _runtime = req.runtime_overrides().apply();
+            assert_eq!(
+                std::env::var("VIDEOFORGE_ENABLE_NATIVE_ENGINE").as_deref(),
+                Ok("1")
+            );
+            assert_eq!(
+                std::env::var("VIDEOFORGE_NATIVE_ENGINE_DIRECT").as_deref(),
+                Ok("1")
+            );
+            assert_eq!(
+                std::env::var("VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE").as_deref(),
+                Ok("1")
+            );
+            assert_eq!(std::env::var("VIDEOFORGE_TRT_CACHE_DIR").as_deref(), Ok("cache-dir"));
+        }
     }
 }
 
