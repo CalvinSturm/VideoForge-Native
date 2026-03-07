@@ -224,7 +224,19 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
         .as_ref()
         .unwrap_or_else(|| emit_error_and_exit("Native benchmarking requires --onnx-model <path>."));
 
-    let cache_dir = args.trt_cache.then(default_trt_cache_dir);
+    let base_request = NativeToolRunRequest::new(
+        args.input.clone(),
+        onnx_model.to_string(),
+        args.scale,
+        precision.to_string(),
+    )
+    .with_preserve_audio(args.preserve_audio)
+    .with_max_batch(args.max_batch)
+    .with_native_direct(args.native_direct)
+    .with_default_benchmark_trt_cache(args.trt_cache)
+    .with_output_path(args.output.clone());
+
+    let cache_dir = base_request.trt_cache_dir.clone();
     if let Some(cache_dir) = &cache_dir {
         if let Err(err) = std::fs::create_dir_all(cache_dir) {
             emit_error_and_exit(&format!(
@@ -234,7 +246,7 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
         }
     }
     for warmup_idx in 0..args.warmup_runs {
-        let warmup_output = warmup_output_path(&args.output, warmup_idx + 1);
+        let warmup_output = base_request.warmup_output_path(warmup_idx + 1);
         emit_json(json!({
             "event": "warmup_start",
             "index": warmup_idx + 1,
@@ -243,14 +255,10 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
             "trt_cache_enabled": args.trt_cache,
         }));
         let warmup_started = Instant::now();
-        match run_native_once(
-            args,
-            precision,
-            onnx_model,
-            &warmup_output,
+        match run_native_tool_request(
+            base_request.clone().with_output_path(warmup_output.clone()),
         )
-        .await
-        {
+        .await {
             Ok(report) => {
                 let mut payload = native_result_summary_json(&report);
                 payload.insert("event".to_string(), json!("warmup_done"));
@@ -266,7 +274,7 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
         }
     }
 
-    match run_native_once(args, precision, onnx_model, &args.output).await {
+    match run_native_tool_request(base_request).await {
         Ok(report) => {
             let mut payload = native_result_summary_json(&report);
             payload.insert("event".to_string(), json!("done"));
@@ -303,46 +311,6 @@ fn check_command(cmd: &str) -> Result<(), String> {
             "{cmd} returned non-zero status when running '-version'"
         ))
     }
-}
-
-#[cfg(feature = "native_engine")]
-async fn run_native_once(
-    args: &BenchArgs,
-    precision: &str,
-    onnx_model: &str,
-    output_path: &str,
-) -> Result<app_lib::commands::native_engine::NativeUpscaleResult, String> {
-    let request = NativeToolRunRequest::new(
-        args.input.clone(),
-        onnx_model.to_string(),
-        args.scale,
-        precision.to_string(),
-    )
-    .with_output_path(output_path.to_string())
-    .with_preserve_audio(args.preserve_audio)
-    .with_max_batch(args.max_batch)
-    .with_native_direct(args.native_direct)
-    .with_trt_cache_dir(args.trt_cache.then(default_trt_cache_dir));
-    run_native_tool_request(request).await
-}
-
-fn default_trt_cache_dir() -> std::path::PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| std::env::temp_dir())
-        .join("artifacts")
-        .join("benchmarks")
-        .join("trt_cache")
-}
-
-fn warmup_output_path(output: &str, run_idx: u32) -> String {
-    let path = Path::new(output);
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    parent
-        .join(format!("{stem}.warmup{run_idx}.{ext}"))
-        .to_string_lossy()
-        .to_string()
 }
 
 fn parse_total_from_message(message: &str) -> Option<u64> {

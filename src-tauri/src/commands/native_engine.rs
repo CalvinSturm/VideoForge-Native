@@ -608,12 +608,21 @@ impl NativeToolRunRequest {
         self
     }
 
+    pub fn with_default_benchmark_trt_cache(mut self, enabled: bool) -> Self {
+        self.trt_cache_dir = enabled.then(default_native_tool_trt_cache_dir);
+        self
+    }
+
     pub fn route_label(&self) -> &'static str {
         if self.native_direct {
             "direct engine-v2 path"
         } else {
             "default native command path"
         }
+    }
+
+    pub fn warmup_output_path(&self, run_idx: u32) -> String {
+        native_tool_warmup_output_path(&self.output_path, run_idx)
     }
 
     pub fn runtime_overrides(&self) -> NativeRuntimeOverrides {
@@ -639,6 +648,27 @@ pub async fn run_native_tool_request(
         request.max_batch,
     )
     .await
+}
+
+#[cfg(feature = "native_engine")]
+pub fn default_native_tool_trt_cache_dir() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("artifacts")
+        .join("benchmarks")
+        .join("trt_cache")
+}
+
+#[cfg(feature = "native_engine")]
+pub fn native_tool_warmup_output_path(output: &str, run_idx: u32) -> String {
+    let path = Path::new(output);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    parent
+        .join(format!("{stem}.warmup{run_idx}.{ext}"))
+        .to_string_lossy()
+        .to_string()
 }
 
 #[cfg(feature = "native_engine")]
@@ -848,7 +878,7 @@ pub fn native_result_summary_lines(report: &NativeUpscaleResult) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeRuntimeOverrides, NativeToolRunRequest, NativeVideoOutputProfile,
+        default_native_tool_trt_cache_dir, NativeRuntimeOverrides, NativeToolRunRequest, NativeVideoOutputProfile,
         NativeVideoSourceProfile,
     };
     use std::path::PathBuf;
@@ -963,6 +993,19 @@ mod tests {
             .with_optional_output_path(Some("out.mp4".to_string()));
         assert_eq!(cli.output_path, "out.mp4");
         assert_eq!(cli.route_label(), "default native command path");
+    }
+
+    #[cfg(feature = "native_engine")]
+    #[test]
+    fn tool_request_builder_derives_benchmark_cache_and_warmup_output() {
+        let req = NativeToolRunRequest::new("in.mp4", "model.onnx", 2, "fp16")
+            .with_output_path("results/final.mp4")
+            .with_default_benchmark_trt_cache(true);
+        assert_eq!(req.warmup_output_path(2), "results\\final.warmup2.mp4");
+        assert_eq!(
+            req.trt_cache_dir,
+            Some(default_native_tool_trt_cache_dir())
+        );
     }
 }
 
