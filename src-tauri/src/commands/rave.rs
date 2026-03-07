@@ -288,7 +288,22 @@ pub async fn rave_upscale(
     mock_run: Option<bool>,
     ui_opt_in: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    if !ui_opt_in.unwrap_or(false) && !native_engine_runtime_enabled() {
+    run_rave_upscale_command(
+        args,
+        strict_audit.unwrap_or(true),
+        mock_run.unwrap_or(false),
+        ui_opt_in.unwrap_or(false),
+    )
+    .await
+}
+
+pub async fn run_rave_upscale_command(
+    args: Vec<String>,
+    strict_audit: bool,
+    mock_run: bool,
+    ui_opt_in: bool,
+) -> Result<serde_json::Value, String> {
+    if !ui_opt_in && !native_engine_runtime_enabled() {
         return Err(encode_rave_error(
             "native_engine_disabled",
             "Native engine path is disabled by default for stability.",
@@ -304,14 +319,9 @@ pub async fn rave_upscale(
     let root = workspace_root()?;
     let config = RaveCliConfig::from_workspace_root(root);
     let args = ensure_profile_arg(args, &profile);
-    let res = run_upscale(
-        &config,
-        &args,
-        strict_audit.unwrap_or(true),
-        mock_run.unwrap_or(false),
-    )
-    .await
-    .map_err(map_rave_error)?;
+    let res = run_upscale(&config, &args, strict_audit, mock_run)
+        .await
+        .map_err(map_rave_error)?;
 
     Ok(res.json)
 }

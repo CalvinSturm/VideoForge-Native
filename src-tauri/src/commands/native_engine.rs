@@ -343,16 +343,23 @@ fn native_temp_token() -> String {
 
 /// Structured response returned by `upscale_request_native`.
 #[derive(Debug, Serialize, Deserialize)]
+pub struct NativePerfReport {
+    pub frames_processed: u64,
+    pub effective_max_batch: u32,
+    pub trt_cache_enabled: bool,
+    pub trt_cache_dir: Option<String>,
+}
+
+/// Structured response returned by `upscale_request_native`.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NativeUpscaleResult {
     pub output_path: String,
     pub engine: String,
     pub encoder_mode: String,
     pub encoder_detail: Option<String>,
-    pub frames_processed: u64,
-    pub effective_max_batch: u32,
     pub audio_preserved: bool,
-    pub trt_cache_enabled: bool,
-    pub trt_cache_dir: Option<String>,
+    #[serde(flatten)]
+    pub perf: NativePerfReport,
 }
 
 /// Structured error returned by `upscale_request_native`.
@@ -367,6 +374,176 @@ impl NativeUpscaleError {
         Self {
             code: code.to_string(),
             message: message.into(),
+        }
+    }
+}
+
+#[cfg(feature = "native_engine")]
+#[derive(Debug, Clone)]
+struct NativeJobSpec {
+    input_path: String,
+    requested_output_path: String,
+    model_path: String,
+    scale: u32,
+    precision: String,
+    preserve_audio: bool,
+    max_batch: u32,
+    trt_cache_enabled: bool,
+    trt_cache_dir: Option<String>,
+}
+
+#[cfg(feature = "native_engine")]
+impl NativeJobSpec {
+    fn resolve(
+        input_path: String,
+        output_path: String,
+        model_path: String,
+        requested_scale: u32,
+        precision: Option<String>,
+        audio: Option<bool>,
+        requested_max_batch: Option<u32>,
+    ) -> Result<Self, String> {
+        let make_err =
+            |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
+
+        if !Path::new(&model_path).exists() {
+            return Err(make_err(
+                "MODEL_NOT_FOUND",
+                &format!("Model not found: {}", model_path),
+            ));
+        }
+
+        let batch_policy = crate::models::native_batch_policy_for_path(&model_path);
+        let max_batch = requested_max_batch.unwrap_or(batch_policy.default_max_batch);
+        if !(1..=8).contains(&max_batch) {
+            return Err(make_err(
+                "INVALID_BATCH",
+                &format!("Invalid max_batch value '{max_batch}'. Must be in range 1-8."),
+            ));
+        }
+
+        let effective_scale = infer_model_scale(&model_path).unwrap_or(requested_scale);
+        if effective_scale != requested_scale {
+            tracing::warn!(
+                requested_scale,
+                inferred_scale = effective_scale,
+                model = %model_path,
+                "Requested native scale does not match model filename; overriding to inferred model scale"
+            );
+        }
+        if requested_max_batch.is_none() {
+            tracing::info!(
+                model = %model_path,
+                default_max_batch = batch_policy.default_max_batch,
+                max_validated_batch = batch_policy.max_validated_batch,
+                "Applying model-aware native batching default"
+            );
+        } else {
+            tracing::info!(
+                model = %model_path,
+                requested_max_batch = max_batch,
+                default_max_batch = batch_policy.default_max_batch,
+                max_validated_batch = batch_policy.max_validated_batch,
+                "Using explicit native batching override"
+            );
+        }
+
+        let (trt_cache_enabled, trt_cache_dir) = trt_cache_runtime(&model_path);
+
+        Ok(Self {
+            input_path,
+            requested_output_path: output_path,
+            model_path,
+            scale: effective_scale,
+            precision: precision.unwrap_or_else(|| "fp32".to_string()),
+            preserve_audio: audio.unwrap_or(true),
+            max_batch,
+            trt_cache_enabled,
+            trt_cache_dir,
+        })
+    }
+
+    fn resolve_cli_output_path(&self) -> String {
+        if !self.requested_output_path.trim().is_empty() {
+            return self.requested_output_path.clone();
+        }
+
+        let p = Path::new(&self.input_path);
+        let stem = p
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let ext = p
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if ext.is_empty() {
+            format!("{stem}_rave_upscaled.mp4")
+        } else {
+            self.input_path
+                .replace(&format!(".{ext}"), "_rave_upscaled.mp4")
+        }
+    }
+
+    fn resolve_direct_output_path(&self) -> String {
+        if !self.requested_output_path.trim().is_empty() {
+            return self.requested_output_path.clone();
+        }
+
+        let stem = Path::new(&self.input_path)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let dir = Path::new(&self.input_path)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        let file_name = format!("{}_{}_native_upscaled.mp4", stem, native_temp_token());
+        dir.join(file_name).to_string_lossy().to_string()
+    }
+
+    fn build_cli_args(&self, resolved_output: &str) -> Vec<String> {
+        let mut args = vec![
+            "-i".to_string(),
+            self.input_path.clone(),
+            "-m".to_string(),
+            self.model_path.clone(),
+            "-o".to_string(),
+            resolved_output.to_string(),
+            "--precision".to_string(),
+            self.precision.clone(),
+            "--progress".to_string(),
+            "jsonl".to_string(),
+        ];
+        if self.max_batch > 1 {
+            args.push("--max-batch".to_string());
+            args.push(self.max_batch.to_string());
+        }
+        args
+    }
+
+    fn build_result(
+        &self,
+        output_path: String,
+        engine: impl Into<String>,
+        encoder_mode: impl Into<String>,
+        encoder_detail: Option<String>,
+        frames_processed: u64,
+    ) -> NativeUpscaleResult {
+        NativeUpscaleResult {
+            output_path,
+            engine: engine.into(),
+            encoder_mode: encoder_mode.into(),
+            encoder_detail,
+            audio_preserved: self.preserve_audio,
+            perf: NativePerfReport {
+                frames_processed,
+                effective_max_batch: self.max_batch,
+                trt_cache_enabled: self.trt_cache_enabled,
+                trt_cache_dir: self.trt_cache_dir.clone(),
+            },
         }
     }
 }
@@ -447,66 +624,19 @@ fn infer_model_scale(model_path: &str) -> Option<u32> {
 
 #[cfg(feature = "native_engine")]
 async fn run_native_via_rave_cli(
-    input_path: String,
-    output_path: String,
-    model_path: String,
-    _scale: u32,
-    precision: String,
-    preserve_audio: bool,
-    max_batch: u32,
+    job: &NativeJobSpec,
     encoder_detail: Option<String>,
 ) -> Result<NativeUpscaleResult, String> {
     let make_err =
         |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
-
-    if !(1..=8).contains(&max_batch) {
-        return Err(make_err(
-            "INVALID_BATCH",
-            &format!("Invalid max_batch value '{max_batch}'. Must be in range 1-8."),
-        ));
-    }
-
-    let resolved_output = if output_path.trim().is_empty() {
-        let p = Path::new(&input_path);
-        let stem = p
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let ext = p
-            .extension()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        if ext.is_empty() {
-            format!("{stem}_rave_upscaled.mp4")
-        } else {
-            input_path.replace(&format!(".{ext}"), "_rave_upscaled.mp4")
-        }
-    } else {
-        output_path
-    };
-
-    let (trt_cache_enabled, trt_cache_dir) = trt_cache_runtime(&model_path);
-    let mut args = vec![
-        "-i".to_string(),
-        input_path,
-        "-m".to_string(),
-        model_path,
-        "-o".to_string(),
-        resolved_output.clone(),
-        "--precision".to_string(),
-        precision,
-        "--progress".to_string(),
-        "jsonl".to_string(),
-    ];
-    if max_batch > 1 {
-        args.push("--max-batch".to_string());
-        args.push(max_batch.to_string());
-    }
-
-    let res =
-        crate::commands::rave::rave_upscale(args, Some(true), Some(false), Some(true)).await?;
+    let resolved_output = job.resolve_cli_output_path();
+    let res = crate::commands::rave::run_rave_upscale_command(
+        job.build_cli_args(&resolved_output),
+        true,
+        false,
+        true,
+    )
+    .await?;
     let output = res
         .get("output")
         .and_then(|v| v.as_str())
@@ -518,17 +648,13 @@ async fn run_native_via_rave_cli(
         })?
         .to_string();
 
-    Ok(NativeUpscaleResult {
-        output_path: output,
-        engine: "native_via_rave_cli".to_string(),
-        encoder_mode: "rave_cli".to_string(),
+    Ok(job.build_result(
+        output,
+        "native_via_rave_cli",
+        "rave_cli",
         encoder_detail,
-        frames_processed: 0,
-        effective_max_batch: max_batch,
-        audio_preserved: preserve_audio,
-        trt_cache_enabled,
-        trt_cache_dir,
-    })
+        0,
+    ))
 }
 
 #[cfg(feature = "native_engine")]
@@ -609,48 +735,18 @@ pub async fn upscale_request_native(
             .unwrap());
         }
 
-        let precision = precision.unwrap_or_else(|| "fp32".to_string());
-        let audio = audio.unwrap_or(true);
-        let batch_policy = crate::models::native_batch_policy_for_path(&model_path);
-        let requested_max_batch = max_batch;
-        let max_batch = requested_max_batch.unwrap_or(batch_policy.default_max_batch);
-        let effective_scale = infer_model_scale(&model_path).unwrap_or(scale);
-        if effective_scale != scale {
-            tracing::warn!(
-                requested_scale = scale,
-                inferred_scale = effective_scale,
-                model = %model_path,
-                "Requested native scale does not match model filename; overriding to inferred model scale"
-            );
-        }
-        if requested_max_batch.is_none() {
-            tracing::info!(
-                model = %model_path,
-                default_max_batch = batch_policy.default_max_batch,
-                max_validated_batch = batch_policy.max_validated_batch,
-                "Applying model-aware native batching default"
-            );
-        } else {
-            tracing::info!(
-                model = %model_path,
-                requested_max_batch = max_batch,
-                default_max_batch = batch_policy.default_max_batch,
-                max_validated_batch = batch_policy.max_validated_batch,
-                "Using explicit native batching override"
-            );
-        }
+        let job = NativeJobSpec::resolve(
+            input_path,
+            output_path,
+            model_path,
+            scale,
+            precision,
+            audio,
+            max_batch,
+        )?;
 
         if native_engine_direct_enabled() {
-            let direct_result = run_native_pipeline(
-                input_path.clone(),
-                output_path.clone(),
-                model_path.clone(),
-                effective_scale,
-                precision.clone(),
-                audio,
-                max_batch,
-            )
-            .await;
+            let direct_result = run_native_pipeline(job.clone()).await;
 
             match direct_result {
                 Ok(result) => Ok(result),
@@ -665,13 +761,7 @@ pub async fn upscale_request_native(
                             "Direct native path failed; falling back to CLI-backed native path"
                         );
                         run_native_via_rave_cli(
-                            input_path,
-                            output_path,
-                            model_path,
-                            effective_scale,
-                            precision,
-                            audio,
-                            max_batch,
+                            &job,
                             Some(format!("direct_native_failed: {}: {}", err.code, err.message)),
                         )
                         .await
@@ -681,17 +771,7 @@ pub async fn upscale_request_native(
                 }
             }
         } else {
-            run_native_via_rave_cli(
-                input_path,
-                output_path,
-                model_path,
-                effective_scale,
-                precision,
-                audio,
-                max_batch,
-                None,
-            )
-            .await
+            run_native_via_rave_cli(&job, None).await
         }
     }
 }
@@ -702,67 +782,26 @@ pub async fn upscale_request_native(
 
 #[cfg(feature = "native_engine")]
 async fn run_native_pipeline(
-    input_path: String,
-    mut output_path: String,
-    model_path: String,
-    scale: u32,
-    precision: String,
-    preserve_audio: bool,
-    max_batch: u32,
+    job: NativeJobSpec,
 ) -> Result<NativeUpscaleResult, String> {
     use videoforge_engine::codecs::sys::cudaVideoCodec as CudaCodec;
 
-    let make_err =
-        |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
     let ffmpeg_cmd = configure_native_runtime_env();
-
-    if !(1..=8).contains(&max_batch) {
-        return Err(make_err(
-            "INVALID_BATCH",
-            &format!("Invalid max_batch value '{max_batch}'. Must be in range 1-8."),
-        ));
-    }
-
-    // Validate model path.
-    if !Path::new(&model_path).exists() {
-        return Err(make_err(
-            "MODEL_NOT_FOUND",
-            &format!("Model not found: {}", model_path),
-        ));
-    }
-
-    // Generate output path.
-    if output_path.trim().is_empty() {
-        let stem = Path::new(&input_path)
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy();
-        let dir = Path::new(&input_path)
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
-        let file_name = format!("{}_{}_native_upscaled.mp4", stem, native_temp_token());
-        output_path = dir.join(file_name).to_string_lossy().to_string();
-    }
+    let output_path = job.resolve_direct_output_path();
 
     tracing::info!(
-        input = %input_path,
+        input = %job.input_path,
         output = %output_path,
-        model = %model_path,
-        scale,
-        precision = %precision,
-        max_batch,
+        model = %job.model_path,
+        scale = job.scale,
+        precision = %job.precision,
+        max_batch = job.max_batch,
         "Native engine pipeline starting"
     );
 
     run_engine_pipeline(
+        &job,
         output_path,
-        input_path,
-        model_path,
-        scale,
-        precision,
-        preserve_audio,
-        max_batch,
         ffmpeg_cmd,
         CudaCodec::H264,
     )
@@ -772,13 +811,8 @@ async fn run_native_pipeline(
 #[cfg(feature = "native_engine")]
 #[allow(clippy::too_many_arguments)] // TODO(clippy): this pipeline entry mirrors explicit stage inputs; keep stable for now.
 async fn run_engine_pipeline(
+    job: &NativeJobSpec,
     final_output: String,
-    original_input: String,
-    model_path: String,
-    scale: u32,
-    precision: String,
-    preserve_audio: bool,
-    max_batch: u32,
     ffmpeg_cmd: String,
     codec: videoforge_engine::codecs::sys::cudaVideoCodec,
 ) -> Result<NativeUpscaleResult, String> {
@@ -794,13 +828,12 @@ async fn run_engine_pipeline(
 
     let make_err =
         |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
-    let (trt_cache_enabled, trt_cache_dir) = trt_cache_runtime(&model_path);
 
     // ── Step 1.5: Probe input for dimensions ──────────────────────────────────
     // encoder_nv12_pitch and encoder width/height must be set before
     // UpscalePipeline::new() — the pipeline asserts pitch > 0.
-    tracing::info!(path = %original_input, "Probing input video dimensions");
-    let (input_w, input_h, _duration, fps, _, probed_codec) = probe_video_coded_geometry(&original_input)
+    tracing::info!(path = %job.input_path, "Probing input video dimensions");
+    let (input_w, input_h, _duration, fps, _, probed_codec) = probe_video_coded_geometry(&job.input_path)
         .map_err(|e| make_err("PROBE_FAILED", &e))?;
     if probed_codec != codec {
         tracing::warn!(
@@ -809,8 +842,8 @@ async fn run_engine_pipeline(
             "Native codec routing differed from ffprobe result; using probed codec for streamed demux"
         );
     }
-    let output_w = input_w.saturating_mul(scale as usize);
-    let output_h = input_h.saturating_mul(scale as usize);
+    let output_w = input_w.saturating_mul(job.scale as usize);
+    let output_h = input_h.saturating_mul(job.scale as usize);
     // NV12 row stride must be 256-byte aligned (NVENC hardware requirement).
     let encoder_nv12_pitch = output_w.div_ceil(256) * 256;
     // Express fps as a rational with 1000 as denominator — handles 23.976, 29.97, etc.
@@ -833,25 +866,25 @@ async fn run_engine_pipeline(
         .map_err(|e| make_err("GPU_INIT", &format!("GPU context creation failed: {}", e)))?;
 
     // ── Step 3: Load TensorRT backend ─────────────────────────────────────────
-    tracing::info!(model = %model_path, "Loading TensorRT backend");
-    let precision_policy = match precision.as_str() {
+    tracing::info!(model = %job.model_path, "Loading TensorRT backend");
+    let precision_policy = match job.precision.as_str() {
         "fp16" => PrecisionPolicy::Fp16,
         _ => PrecisionPolicy::Fp32,
     };
     let downstream_capacity = 4usize;
-    let ring_size = TensorRtBackend::required_ring_slots(downstream_capacity, max_batch as usize);
+    let ring_size = TensorRtBackend::required_ring_slots(downstream_capacity, job.max_batch as usize);
 
     // TensorRtBackend::new(model_path, ctx, device_id, ring_size, downstream_capacity).
     // Use with_precision to apply the precision policy and keep output slots batch-safe.
     let backend = TensorRtBackend::with_precision(
-        std::path::PathBuf::from(&model_path),
+        std::path::PathBuf::from(&job.model_path),
         ctx.clone(),
         0, // device_id
         ring_size,
         downstream_capacity,
         precision_policy,
         BatchConfig {
-            max_batch: max_batch as usize,
+            max_batch: job.max_batch as usize,
             ..BatchConfig::default()
         },
     );
@@ -859,7 +892,7 @@ async fn run_engine_pipeline(
     backend
         .initialize()
         .await
-        .map_err(|e| make_err("BACKEND_INIT", &classify_backend_init_error(&model_path, &e.to_string())))?;
+        .map_err(|e| make_err("BACKEND_INIT", &classify_backend_init_error(&job.model_path, &e.to_string())))?;
 
     // ── Step 4: Compile kernels ───────────────────────────────────────────────
     let kernels = PreprocessKernels::compile(ctx.device())
@@ -867,7 +900,7 @@ async fn run_engine_pipeline(
     let kernels = Arc::new(kernels);
 
     // ── Step 5: Create decoder with FFmpeg-streamed elementary source ────────
-    tracing::info!(path = %original_input, codec = ?probed_codec, "Creating NVDEC decoder");
+    tracing::info!(path = %job.input_path, codec = ?probed_codec, "Creating NVDEC decoder");
     let model_prec = match backend
         .metadata()
         .map_err(|e| make_err("BACKEND_INIT", &format!("Model metadata unavailable: {}", e)))?
@@ -876,7 +909,7 @@ async fn run_engine_pipeline(
         videoforge_engine::core::types::PixelFormat::RgbPlanarF16 => ModelPrecision::F16,
         _ => ModelPrecision::F32,
     };
-    let source = FfmpegBitstreamSource::spawn(&ffmpeg_cmd, &original_input, probed_codec)
+    let source = FfmpegBitstreamSource::spawn(&ffmpeg_cmd, &job.input_path, probed_codec)
         .map_err(|e| make_err("SOURCE_OPEN", &format!("Cannot stream elementary input: {}", e)))?;
     let decoder = NvDecoder::new(ctx.clone(), Box::new(source), probed_codec)
         .map_err(|e| make_err("DECODER_INIT", &format!("NVDEC decoder init failed: {}", e)))?;
@@ -903,8 +936,8 @@ async fn run_engine_pipeline(
     let sink = StreamingMuxSink::new(
         &ffmpeg_cmd,
         &final_output,
-        &original_input,
-        preserve_audio,
+        &job.input_path,
+        job.preserve_audio,
         mux_codec_hint.clone(),
     )
         .map_err(|e| make_err("SINK_OPEN", &format!("Cannot create mux stream: {}", e)))?;
@@ -938,7 +971,7 @@ async fn run_engine_pipeline(
     let config = PipelineConfig {
         model_precision: model_prec,
         encoder_nv12_pitch,
-        inference_max_batch: max_batch as usize,
+        inference_max_batch: job.max_batch as usize,
         ..PipelineConfig::default()
     };
     let pipeline = UpscalePipeline::new(ctx.clone(), kernels, config);
@@ -981,17 +1014,13 @@ async fn run_engine_pipeline(
 
     tracing::info!(output = %final_output, "Native engine upscale complete");
 
-    Ok(NativeUpscaleResult {
-        output_path: final_output,
-        engine: "native_v2".to_string(),
+    Ok(job.build_result(
+        final_output,
+        "native_v2",
         encoder_mode,
         encoder_detail,
-        frames_processed: frames,
-        effective_max_batch: max_batch,
-        audio_preserved: preserve_audio,
-        trt_cache_enabled,
-        trt_cache_dir,
-    })
+        frames,
+    ))
 }
 
 // =============================================================================

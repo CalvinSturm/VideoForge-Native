@@ -850,7 +850,7 @@ async fn check_e2e_native(
         true,
         &format!(
             "frames={} encoder_mode={} encoder_detail={}",
-            report.frames_processed,
+            report.perf.frames_processed,
             report.encoder_mode,
             report.encoder_detail.as_deref().unwrap_or("none")
         ),
