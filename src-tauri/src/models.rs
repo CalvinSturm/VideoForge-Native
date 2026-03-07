@@ -1,6 +1,30 @@
 use dirs::data_local_dir;
 use std::{collections::HashSet, env, fs, path::PathBuf};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct NativeBatchPolicyInfo {
+    /// Default native batch size when the caller does not request one explicitly.
+    pub default_max_batch: u32,
+    /// Highest currently validated runtime batch size for this model family/file.
+    pub max_validated_batch: u32,
+}
+
+impl NativeBatchPolicyInfo {
+    pub const fn conservative() -> Self {
+        Self {
+            default_max_batch: 1,
+            max_validated_batch: 1,
+        }
+    }
+
+    pub const fn validated(default_max_batch: u32, max_validated_batch: u32) -> Self {
+        Self {
+            default_max_batch,
+            max_validated_batch,
+        }
+    }
+}
+
 /// Represents a discovered model with its identifier and scale factor.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ModelInfo {
@@ -15,6 +39,8 @@ pub struct ModelInfo {
     pub format: String,
     /// Absolute path to the weight file on disk
     pub path: String,
+    /// Native engine batching policy for ONNX models, if applicable.
+    pub native_batch_policy: Option<NativeBatchPolicyInfo>,
 }
 
 /// Strip weight-file extensions from a filename.
@@ -93,6 +119,29 @@ fn excluded_weight_reason(name: &str) -> Option<&'static str> {
         "4xnomos2_hq_dat2_fp32.fp16.onnx" => Some("invalid_onnx_graph"),
         _ => None,
     }
+}
+
+fn native_batch_policy_for_name(name: &str) -> Option<NativeBatchPolicyInfo> {
+    let lower = name.to_ascii_lowercase();
+    if !lower.ends_with(".onnx") {
+        return None;
+    }
+
+    Some(match lower.as_str() {
+        // Warm cached runs show Nomos benefits from a higher native default.
+        "4xnomos2_hq_dat2_fp32.onnx" => NativeBatchPolicyInfo::validated(4, 4),
+        // SPAN batches correctly, but current evidence does not justify a higher default.
+        "2x_span_soft.onnx" => NativeBatchPolicyInfo::validated(1, 4),
+        _ => NativeBatchPolicyInfo::conservative(),
+    })
+}
+
+pub fn native_batch_policy_for_path(model_path: &str) -> NativeBatchPolicyInfo {
+    let file_name = std::path::Path::new(model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(model_path);
+    native_batch_policy_for_name(file_name).unwrap_or_else(NativeBatchPolicyInfo::conservative)
 }
 
 pub fn list_models() -> Vec<ModelInfo> {
@@ -208,6 +257,7 @@ fn process_weight_file(
         filename: filename.to_string(),
         format,
         path: full_path.to_string_lossy().to_string(),
+        native_batch_policy: native_batch_policy_for_name(filename),
     })
 }
 
@@ -237,5 +287,30 @@ mod tests {
         .expect("valid FP32 export should remain discoverable");
         assert_eq!(model.scale, 4);
         assert_eq!(model.format, "onnx");
+        assert_eq!(
+            model.native_batch_policy,
+            Some(NativeBatchPolicyInfo::validated(4, 4))
+        );
+    }
+
+    #[test]
+    fn keeps_span_on_conservative_default_with_validated_runtime_batching() {
+        let seen = HashSet::new();
+        let model = process_weight_file(
+            std::path::Path::new("weights/2x_SPAN_soft.onnx"),
+            "2x_SPAN_soft.onnx",
+            &seen,
+        )
+        .expect("SPAN ONNX should remain discoverable");
+        assert_eq!(
+            model.native_batch_policy,
+            Some(NativeBatchPolicyInfo::validated(1, 4))
+        );
+    }
+
+    #[test]
+    fn unknown_onnx_defaults_to_conservative_native_policy() {
+        let policy = native_batch_policy_for_path("weights/custom_model.onnx");
+        assert_eq!(policy, NativeBatchPolicyInfo::conservative());
     }
 }

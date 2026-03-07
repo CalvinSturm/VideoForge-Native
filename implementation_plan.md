@@ -195,6 +195,14 @@
     - same model with TRT cache enabled, first cache-populating run: `elapsed_ms=80196`
     - same model with TRT cache enabled, second warm run: `elapsed_ms=1043`, `inference_dispatch_avg_us=7509`, `inference_frame_equiv_us=1969`
   - `videoforge_bench` now supports native warm benchmarking directly via `--trt-cache --warmup-runs <n>`, so future comparisons can exclude one-time TensorRT cold-start compilation noise without manual env-var setup
+  - warm cached native matrix was rerun with `--trt-cache --warmup-runs 1`:
+    - `SPAN fp16 batch=1`: `elapsed_ms=1477`, `inference_frame_equiv_us=2057`, `encode_avg_us=1790`
+    - `SPAN fp16 batch=4`: `elapsed_ms=1513`, `inference_frame_equiv_us=1913`, `inference_dispatch_avg_us=7295`, `encode_avg_us=2048`
+    - `Nomos fp32 batch=1`: `elapsed_ms=151886`, `inference_frame_equiv_us=362094`, `encode_avg_us=37746`
+    - `Nomos fp32 batch=4`: `elapsed_ms=80150`, `inference_frame_equiv_us=331677`, `inference_dispatch_avg_us=1264521`, `encode_avg_us=49905`
+  - steady-state interpretation after the warm rerun:
+    - CNN batching is no longer catastrophically slower; `SPAN batch=4` is roughly on par with `batch=1` and slightly better on per-frame inference, but the end-to-end elapsed time improvement is negligible on this short clip
+    - transformer-family `Nomos batch=4` remains materially faster end-to-end than `batch=1`, but that path is still under the conservative transformer batching guard and should not be over-interpreted as a validated generic transformer batching win
   - next optimization target should be chosen from measured evidence rather than assumptions; likely candidates are backend execution tuning for CNN models and profiler fidelity, not broader host-architecture changes
 
 #### Native Verification Workflow
@@ -421,6 +429,57 @@
 - It is still unclear how much of the temp-file architecture can be removed without broader mux/container changes.
 - Native performance tuning should wait until cleanup and accounting are trustworthy, otherwise benchmark data will be noisy or misleading.
 - If there are hidden operational dependencies on current temp-file retention, Phase 3 may need an explicit diagnostics design before implementation.
+
+## Next Steps
+- Scope: `model-aware native batching policy`
+- Goal: replace broad batching assumptions with explicit per-model defaults derived from current benchmark evidence.
+
+### Planned Work
+- Define where native per-model batching policy lives.
+  - Prefer a small, explicit policy layer near native model discovery or native request setup.
+- Implement initial policy defaults from current evidence.
+  - Keep current CNN-style models such as `SPAN` at `batch=1` by default unless a longer representative benchmark shows a clear win.
+  - Allow higher default batching for validated transformer-family models where warm steady-state runs show material end-to-end improvement.
+- Narrow the current conservative transformer batching guard.
+  - Move from broad family-level assumptions toward validated per-model policy where possible.
+- Wire the policy into:
+  - native request path
+  - native benchmark path
+  - any user-facing model selection metadata that should expose the effective default
+- Verify with a short warm cached native benchmark set.
+  - same clip, `--trt-cache --warmup-runs 1`
+  - at minimum: `SPAN` and `Nomos`
+- Record resulting defaults and rationale in this file.
+
+### Acceptance Criteria
+- Native batching defaults are explicit rather than implicit.
+- `SPAN`-style CNN models do not default into a batch setting that provides no practical end-to-end benefit on current evidence.
+- Validated transformer models can use a higher default where it improves real warm-run throughput.
+- Benchmark and native request paths agree on the effective default policy.
+
+#### Implementation Notes
+- Completed on: `2026-03-06`
+- What changed:
+  - Added an explicit native batching policy source in [`src-tauri/src/models.rs`](/C:/Users/Calvin/Desktop/VideoForge1/src-tauri/src/models.rs).
+  - Exposed per-model native policy in discovered model metadata via `native_batch_policy`.
+  - Applied model-aware default batch selection in [`src-tauri/src/commands/native_engine.rs`](/C:/Users/Calvin/Desktop/VideoForge1/src-tauri/src/commands/native_engine.rs) when callers omit `max_batch`.
+  - Exposed `effective_max_batch` in native result payloads so UI and benchmark callers can verify the resolved policy.
+  - Updated [`src-tauri/src/bin/videoforge_bench.rs`](/C:/Users/Calvin/Desktop/VideoForge1/src-tauri/src/bin/videoforge_bench.rs) so `--max-batch` is now a true override instead of an implicit hardcoded default.
+  - Replaced the broad transformer-family runtime batching block in [`engine-v2/src/backends/tensorrt.rs`](/C:/Users/Calvin/Desktop/VideoForge1/engine-v2/src/backends/tensorrt.rs) with an explicit validated allowlist.
+- Current defaults:
+  - `2x_SPAN_soft.onnx`: default `batch=1`, validated runtime batching up to `4`
+  - `4xNomos2_hq_dat2_fp32.onnx`: default `batch=4`, validated runtime batching up to `4`
+  - other ONNX models: default `batch=1`, no validated runtime batching beyond `1` yet
+- Verification:
+  - `cargo test --manifest-path src-tauri/Cargo.toml models --lib`
+  - `cargo test --manifest-path engine-v2/Cargo.toml --lib`
+  - `cargo check --manifest-path src-tauri/Cargo.toml --features native_engine --bin videoforge_bench`
+  - Warm cached direct-native default-policy validation:
+    - `2x_SPAN_soft.onnx` resolved to `effective_max_batch=1`
+    - `4xNomos2_hq_dat2_fp32.onnx` resolved to `effective_max_batch=4`
+- Follow-up:
+  - extend the allowlist only after warm cached benchmarks validate additional ONNX models
+  - decide whether UI should surface `native_batch_policy` directly in model details or advanced settings
 
 ## Suggested Update Template
 - When a phase starts, change `Status` to `In progress`.

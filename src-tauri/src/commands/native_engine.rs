@@ -349,6 +349,7 @@ pub struct NativeUpscaleResult {
     pub encoder_mode: String,
     pub encoder_detail: Option<String>,
     pub frames_processed: u64,
+    pub effective_max_batch: u32,
     pub audio_preserved: bool,
     pub trt_cache_enabled: bool,
     pub trt_cache_dir: Option<String>,
@@ -523,6 +524,7 @@ async fn run_native_via_rave_cli(
         encoder_mode: "rave_cli".to_string(),
         encoder_detail,
         frames_processed: 0,
+        effective_max_batch: max_batch,
         audio_preserved: preserve_audio,
         trt_cache_enabled,
         trt_cache_dir,
@@ -609,7 +611,9 @@ pub async fn upscale_request_native(
 
         let precision = precision.unwrap_or_else(|| "fp32".to_string());
         let audio = audio.unwrap_or(true);
-        let max_batch = max_batch.unwrap_or(1);
+        let batch_policy = crate::models::native_batch_policy_for_path(&model_path);
+        let requested_max_batch = max_batch;
+        let max_batch = requested_max_batch.unwrap_or(batch_policy.default_max_batch);
         let effective_scale = infer_model_scale(&model_path).unwrap_or(scale);
         if effective_scale != scale {
             tracing::warn!(
@@ -617,6 +621,22 @@ pub async fn upscale_request_native(
                 inferred_scale = effective_scale,
                 model = %model_path,
                 "Requested native scale does not match model filename; overriding to inferred model scale"
+            );
+        }
+        if requested_max_batch.is_none() {
+            tracing::info!(
+                model = %model_path,
+                default_max_batch = batch_policy.default_max_batch,
+                max_validated_batch = batch_policy.max_validated_batch,
+                "Applying model-aware native batching default"
+            );
+        } else {
+            tracing::info!(
+                model = %model_path,
+                requested_max_batch = max_batch,
+                default_max_batch = batch_policy.default_max_batch,
+                max_validated_batch = batch_policy.max_validated_batch,
+                "Using explicit native batching override"
             );
         }
 
@@ -967,6 +987,7 @@ async fn run_engine_pipeline(
         encoder_mode,
         encoder_detail,
         frames_processed: frames,
+        effective_max_batch: max_batch,
         audio_preserved: preserve_audio,
         trt_cache_enabled,
         trt_cache_dir,

@@ -31,7 +31,7 @@ struct BenchArgs {
     #[allow(dead_code)]
     onnx_model: Option<String>,
     #[allow(dead_code)]
-    max_batch: u32,
+    max_batch: Option<u32>,
     #[allow(dead_code)]
     preserve_audio: bool,
     #[allow(dead_code)]
@@ -269,6 +269,7 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
                     "engine": report.engine,
                     "encoder_mode": report.encoder_mode,
                     "frames_processed": report.frames_processed,
+                    "effective_max_batch": report.effective_max_batch,
                     "trt_cache_enabled": report.trt_cache_enabled,
                     "trt_cache_dir": report.trt_cache_dir,
                     "output": report.output_path,
@@ -293,7 +294,8 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
             "trt_cache_dir": report.trt_cache_dir,
             "mode": "native",
             "native_direct": args.native_direct,
-            "max_batch": args.max_batch,
+            "requested_max_batch": args.max_batch,
+            "effective_max_batch": report.effective_max_batch,
             "warmup_runs": args.warmup_runs,
         })),
         Err(message) => emit_error_and_exit(&message),
@@ -338,7 +340,7 @@ async fn run_native_once(
         args.scale,
         Some(precision.to_string()),
         Some(args.preserve_audio),
-        Some(args.max_batch),
+        args.max_batch,
     )
     .await
 }
@@ -401,7 +403,7 @@ fn parse_args(args: Vec<String>) -> Result<BenchArgs, CliExit> {
     let mut native = false;
     let mut native_direct = false;
     let mut onnx_model = None;
-    let mut max_batch = 1u32;
+    let mut max_batch = None;
     let mut preserve_audio = false;
     let mut trt_cache = false;
     let mut warmup_runs = 0u32;
@@ -454,7 +456,7 @@ fn parse_args(args: Vec<String>) -> Result<BenchArgs, CliExit> {
                 if parsed == 0 {
                     return Err(CliExit::Error("--max-batch must be >= 1".to_string()));
                 }
-                max_batch = parsed;
+                max_batch = Some(parsed);
             }
             "--warmup-runs" => {
                 let raw = next_value(&args, &mut i, "--warmup-runs")?;

@@ -449,22 +449,16 @@ impl TensorRtBackend {
         input_batch_dim.is_none() && output_batch_dim.is_none()
     }
 
-    fn is_transformer_family_model(model_path: &std::path::Path) -> bool {
-        let stem = model_path
-            .file_stem()
+    fn validated_runtime_batching_model(model_path: &std::path::Path) -> bool {
+        let file_name = model_path
+            .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let patterns = [
-            "dat",
-            "hat",
-            "swin",
-            "grl",
-            "nomos",
-            "realwebphoto",
-            "apisr",
-        ];
-        patterns.iter().any(|pattern| stem.contains(pattern))
+        matches!(
+            file_name.as_str(),
+            "2x_span_soft.onnx" | "4xnomos2_hq_dat2_fp32.onnx"
+        )
     }
 
     fn release_state_resources(&self, state: InferenceState) {
@@ -746,12 +740,12 @@ impl TensorRtBackend {
 
         let input_channels = input_dims[1].unwrap_or(3) as u32;
         let dynamic_batch_axes = Self::supports_runtime_batching(input_dims[0], output_dims[0]);
-        let transformer_family = Self::is_transformer_family_model(model_path);
-        let supports_runtime_batching = dynamic_batch_axes && !transformer_family;
-        if dynamic_batch_axes && transformer_family {
+        let validated_runtime_batching = Self::validated_runtime_batching_model(model_path);
+        let supports_runtime_batching = dynamic_batch_axes && validated_runtime_batching;
+        if dynamic_batch_axes && !validated_runtime_batching {
             warn!(
                 model = %model_path.display(),
-                "Model looks transformer-based; disabling batched inference until batch stability is validated"
+                "Model is not on the validated runtime-batching allowlist; falling back to sequential execution for batch requests"
             );
         }
 
@@ -1432,15 +1426,18 @@ mod tests {
     }
 
     #[test]
-    fn transformer_family_detection_matches_current_models() {
-        assert!(TensorRtBackend::is_transformer_family_model(Path::new(
+    fn validated_runtime_batching_allowlist_matches_current_models() {
+        assert!(TensorRtBackend::validated_runtime_batching_model(Path::new(
+            "weights/2x_SPAN_soft.onnx"
+        )));
+        assert!(TensorRtBackend::validated_runtime_batching_model(Path::new(
             "weights/4xNomos2_hq_dat2_fp32.onnx"
         )));
-        assert!(TensorRtBackend::is_transformer_family_model(Path::new(
+        assert!(!TensorRtBackend::validated_runtime_batching_model(Path::new(
             "weights/4x_APISR_GRL_GAN_generator_fp16.fp16.onnx"
         )));
-        assert!(!TensorRtBackend::is_transformer_family_model(Path::new(
-            "weights/2x_SPAN_soft.onnx"
+        assert!(!TensorRtBackend::validated_runtime_batching_model(Path::new(
+            "weights/4xRealWebPhoto_v4_dat2_fp32_opset17.onnx"
         )));
     }
 
