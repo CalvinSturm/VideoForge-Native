@@ -780,7 +780,8 @@ async fn check_e2e_native(
     keep_temp: bool,
 ) -> bool {
     use app_lib::commands::native_engine::{
-        native_result_summary_lines, run_native_tool_request, NativeToolRunRequest,
+        native_smoke_success_lines, native_tool_run_banner, run_native_tool_request,
+        NativeToolRunRequest,
     };
 
     // A) Input prereq checks
@@ -819,10 +820,7 @@ async fn check_e2e_native(
     .with_optional_output_path(output_path.map(str::to_string))
     .with_max_batch(Some(1))
     .with_native_direct(native_direct);
-    println!(
-        "  Running native pipeline via {} (this may take time)...",
-        request.route_label()
-    );
+    println!("{}", native_tool_run_banner(&request));
     let result = run_native_tool_request(request).await;
 
     let report = match result {
@@ -833,7 +831,7 @@ async fn check_e2e_native(
         }
     };
 
-    let summary_lines = native_result_summary_lines(&report);
+    let summary_lines = native_smoke_success_lines(&report);
     check(
         "Native pipeline completed",
         true,
@@ -841,10 +839,6 @@ async fn check_e2e_native(
     );
     for line in summary_lines.iter().skip(1) {
         println!("  → {line}");
-    }
-    println!("  encoder_mode={}", report.encoder_mode);
-    if let Some(detail) = &report.encoder_detail {
-        println!("  encoder_detail={}", detail);
     }
     let actual_out = &report.output_path;
 

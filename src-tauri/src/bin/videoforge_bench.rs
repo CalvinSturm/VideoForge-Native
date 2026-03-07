@@ -7,7 +7,8 @@ use std::time::Instant;
 use app_lib::commands::upscale::{run_upscale_job, JobProgress, JobProgressFn, UpscaleJobConfig};
 #[cfg(feature = "native_engine")]
 use app_lib::commands::native_engine::{
-    native_result_summary_json, run_native_tool_request, NativeToolRunRequest,
+    native_benchmark_done_json, native_benchmark_result_json,
+    native_benchmark_warmup_start_json, run_native_tool_request, NativeToolRunRequest,
 };
 use app_lib::control::ResearchConfig;
 use app_lib::edit_config::EditConfig;
@@ -236,54 +237,45 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
     .with_default_benchmark_trt_cache(args.trt_cache)
     .with_output_path(args.output.clone());
 
-    let cache_dir = base_request.trt_cache_dir.clone();
-    if let Some(cache_dir) = &cache_dir {
-        if let Err(err) = std::fs::create_dir_all(cache_dir) {
-            emit_error_and_exit(&format!(
-                "Failed to create TensorRT cache directory {}: {err}",
-                cache_dir.display()
-            ));
-        }
+    if let Err(message) = base_request.prepare_runtime_filesystem() {
+        emit_error_and_exit(&message);
     }
     for warmup_idx in 0..args.warmup_runs {
         let warmup_output = base_request.warmup_output_path(warmup_idx + 1);
-        emit_json(json!({
-            "event": "warmup_start",
-            "index": warmup_idx + 1,
-            "output": warmup_output,
-            "native_direct": args.native_direct,
-            "trt_cache_enabled": args.trt_cache,
-        }));
+        emit_json(native_benchmark_warmup_start_json(
+            &base_request,
+            warmup_idx + 1,
+            warmup_output.clone(),
+        ));
         let warmup_started = Instant::now();
         match run_native_tool_request(
             base_request.clone().with_output_path(warmup_output.clone()),
         )
         .await {
             Ok(report) => {
-                let mut payload = native_result_summary_json(&report);
-                payload.insert("event".to_string(), json!("warmup_done"));
-                payload.insert("index".to_string(), json!(warmup_idx + 1));
-                payload.insert(
-                    "elapsed_ms".to_string(),
-                    json!(warmup_started.elapsed().as_millis()),
+                let mut payload = native_benchmark_result_json(
+                    &report,
+                    "warmup_done",
+                    warmup_started.elapsed().as_millis(),
                 );
-                emit_json(serde_json::Value::Object(payload));
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("index".to_string(), json!(warmup_idx + 1));
+                }
+                emit_json(payload);
                 let _ = std::fs::remove_file(&warmup_output);
             }
             Err(message) => emit_error_and_exit(&message),
         }
     }
 
-    match run_native_tool_request(base_request).await {
+    match run_native_tool_request(base_request.clone()).await {
         Ok(report) => {
-            let mut payload = native_result_summary_json(&report);
-            payload.insert("event".to_string(), json!("done"));
-            payload.insert("elapsed_ms".to_string(), json!(started.elapsed().as_millis()));
-            payload.insert("mode".to_string(), json!("native"));
-            payload.insert("native_direct".to_string(), json!(args.native_direct));
-            payload.insert("requested_max_batch".to_string(), json!(args.max_batch));
-            payload.insert("warmup_runs".to_string(), json!(args.warmup_runs));
-            emit_json(serde_json::Value::Object(payload));
+            emit_json(native_benchmark_done_json(
+                &report,
+                started.elapsed().as_millis(),
+                &base_request,
+                args.warmup_runs,
+            ));
         }
         Err(message) => emit_error_and_exit(&message),
     }

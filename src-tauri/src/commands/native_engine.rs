@@ -625,6 +625,18 @@ impl NativeToolRunRequest {
         native_tool_warmup_output_path(&self.output_path, run_idx)
     }
 
+    pub fn prepare_runtime_filesystem(&self) -> Result<(), String> {
+        if let Some(cache_dir) = &self.trt_cache_dir {
+            std::fs::create_dir_all(cache_dir).map_err(|err| {
+                format!(
+                    "Failed to create TensorRT cache directory {}: {err}",
+                    cache_dir.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn runtime_overrides(&self) -> NativeRuntimeOverrides {
         NativeRuntimeOverrides::native_command(self.native_direct).with_trt_cache(
             self.trt_cache_dir.is_some(),
@@ -836,6 +848,56 @@ pub fn native_result_summary_json(report: &NativeUpscaleResult) -> serde_json::M
 }
 
 #[cfg(feature = "native_engine")]
+pub fn native_benchmark_warmup_start_json(
+    request: &NativeToolRunRequest,
+    index: u32,
+    output: String,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event": "warmup_start",
+        "index": index,
+        "output": output,
+        "native_direct": request.native_direct,
+        "trt_cache_enabled": request.trt_cache_dir.is_some(),
+    })
+}
+
+#[cfg(feature = "native_engine")]
+pub fn native_benchmark_result_json(
+    report: &NativeUpscaleResult,
+    event: &'static str,
+    elapsed_ms: u128,
+) -> serde_json::Value {
+    let mut payload = native_result_summary_json(report);
+    payload.insert("event".to_string(), serde_json::json!(event));
+    payload.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
+    serde_json::Value::Object(payload)
+}
+
+#[cfg(feature = "native_engine")]
+pub fn native_benchmark_done_json(
+    report: &NativeUpscaleResult,
+    elapsed_ms: u128,
+    request: &NativeToolRunRequest,
+    warmup_runs: u32,
+) -> serde_json::Value {
+    let mut payload = native_result_summary_json(report);
+    payload.insert("event".to_string(), serde_json::json!("done"));
+    payload.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
+    payload.insert("mode".to_string(), serde_json::json!("native"));
+    payload.insert(
+        "native_direct".to_string(),
+        serde_json::json!(request.native_direct),
+    );
+    payload.insert(
+        "requested_max_batch".to_string(),
+        serde_json::json!(request.max_batch),
+    );
+    payload.insert("warmup_runs".to_string(), serde_json::json!(warmup_runs));
+    serde_json::Value::Object(payload)
+}
+
+#[cfg(feature = "native_engine")]
 pub fn native_result_summary_lines(report: &NativeUpscaleResult) -> Vec<String> {
     let mut lines = vec![
         format!(
@@ -875,11 +937,31 @@ pub fn native_result_summary_lines(report: &NativeUpscaleResult) -> Vec<String> 
     lines
 }
 
+#[cfg(feature = "native_engine")]
+pub fn native_tool_run_banner(request: &NativeToolRunRequest) -> String {
+    format!(
+        "  Running native pipeline via {} (this may take time)...",
+        request.route_label()
+    )
+}
+
+#[cfg(feature = "native_engine")]
+pub fn native_smoke_success_lines(report: &NativeUpscaleResult) -> Vec<String> {
+    let mut lines = native_result_summary_lines(report);
+    lines.push(format!("encoder_mode={}", report.encoder_mode));
+    if let Some(detail) = &report.encoder_detail {
+        lines.push(format!("encoder_detail={detail}"));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        default_native_tool_trt_cache_dir, NativeRuntimeOverrides, NativeToolRunRequest, NativeVideoOutputProfile,
-        NativeVideoSourceProfile,
+        default_native_tool_trt_cache_dir, native_benchmark_done_json,
+        native_smoke_success_lines, native_tool_run_banner, NativePerfReport,
+        NativeRuntimeOverrides, NativeToolRunRequest, NativeUpscaleResult,
+        NativeVideoOutputProfile, NativeVideoSourceProfile,
     };
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
@@ -1006,6 +1088,117 @@ mod tests {
             req.trt_cache_dir,
             Some(default_native_tool_trt_cache_dir())
         );
+    }
+
+    #[cfg(feature = "native_engine")]
+    #[test]
+    fn tool_request_prepare_runtime_filesystem_creates_cache_dir() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "videoforge-native-tool-cache-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let req = NativeToolRunRequest::new("in.mp4", "model.onnx", 2, "fp16")
+            .with_trt_cache_dir(Some(cache_dir.clone()));
+        req.prepare_runtime_filesystem().expect("create cache dir");
+        assert!(cache_dir.exists());
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[cfg(feature = "native_engine")]
+    #[test]
+    fn native_benchmark_done_payload_uses_shared_request_fields() {
+        let request = NativeToolRunRequest::new("in.mp4", "model.onnx", 2, "fp16")
+            .with_native_direct(true)
+            .with_max_batch(Some(4));
+        let report = NativeUpscaleResult {
+            output_path: "out.mp4".to_string(),
+            engine: "native_direct".to_string(),
+            encoder_mode: "nvenc".to_string(),
+            encoder_detail: None,
+            audio_preserved: true,
+            perf: NativePerfReport {
+                requested_executor: Some("direct".to_string()),
+                executed_executor: Some("direct".to_string()),
+                direct_attempted: true,
+                fallback_used: false,
+                fallback_reason_code: None,
+                fallback_reason_message: None,
+                frames_processed: 120,
+                effective_max_batch: 4,
+                trt_cache_enabled: false,
+                trt_cache_dir: None,
+                total_elapsed_ms: Some(321),
+                frames_decoded: Some(120),
+                frames_preprocessed: None,
+                frames_inferred: Some(120),
+                frames_encoded: Some(120),
+                preprocess_avg_us: None,
+                inference_frame_avg_us: None,
+                inference_dispatch_avg_us: None,
+                postprocess_frame_avg_us: None,
+                postprocess_dispatch_avg_us: None,
+                encode_avg_us: None,
+                vram_current_mb: None,
+                vram_peak_mb: None,
+            },
+        };
+        let payload = native_benchmark_done_json(&report, 999, &request, 2);
+        assert_eq!(payload["event"], "done");
+        assert_eq!(payload["mode"], "native");
+        assert_eq!(payload["native_direct"], true);
+        assert_eq!(payload["requested_max_batch"], 4);
+        assert_eq!(payload["warmup_runs"], 2);
+        assert_eq!(payload["elapsed_ms"], 999);
+        assert_eq!(payload["output"], "out.mp4");
+    }
+
+    #[cfg(feature = "native_engine")]
+    #[test]
+    fn native_tool_helpers_shape_smoke_output() {
+        let request = NativeToolRunRequest::new("in.mp4", "model.onnx", 2, "fp16")
+            .with_native_direct(true);
+        assert_eq!(
+            native_tool_run_banner(&request),
+            "  Running native pipeline via direct engine-v2 path (this may take time)..."
+        );
+
+        let report = NativeUpscaleResult {
+            output_path: "out.mp4".to_string(),
+            engine: "native_direct".to_string(),
+            encoder_mode: "nvenc".to_string(),
+            encoder_detail: Some("h264".to_string()),
+            audio_preserved: true,
+            perf: NativePerfReport {
+                frames_processed: 10,
+                effective_max_batch: 1,
+                trt_cache_enabled: false,
+                trt_cache_dir: None,
+                requested_executor: Some("direct".to_string()),
+                executed_executor: Some("direct".to_string()),
+                direct_attempted: true,
+                fallback_used: false,
+                fallback_reason_code: None,
+                fallback_reason_message: None,
+                total_elapsed_ms: None,
+                frames_decoded: None,
+                frames_preprocessed: None,
+                frames_inferred: None,
+                frames_encoded: None,
+                preprocess_avg_us: None,
+                inference_frame_avg_us: None,
+                inference_dispatch_avg_us: None,
+                postprocess_frame_avg_us: None,
+                postprocess_dispatch_avg_us: None,
+                encode_avg_us: None,
+                vram_current_mb: None,
+                vram_peak_mb: None,
+            },
+        };
+        let lines = native_smoke_success_lines(&report);
+        assert_eq!(lines[0], "frames=10 encoder_mode=nvenc encoder_detail=h264");
+        assert!(lines.iter().any(|line| line == "encoder_mode=nvenc"));
+        assert!(lines.iter().any(|line| line == "encoder_detail=h264"));
     }
 }
 
