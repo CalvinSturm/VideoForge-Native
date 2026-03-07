@@ -559,6 +559,63 @@ pub struct NativeToolRunRequest {
 
 #[cfg(feature = "native_engine")]
 impl NativeToolRunRequest {
+    pub fn new(
+        input_path: impl Into<String>,
+        model_path: impl Into<String>,
+        scale: u32,
+        precision: impl Into<String>,
+    ) -> Self {
+        Self {
+            input_path: input_path.into(),
+            output_path: String::new(),
+            model_path: model_path.into(),
+            scale,
+            precision: precision.into(),
+            preserve_audio: true,
+            max_batch: None,
+            native_direct: false,
+            trt_cache_dir: None,
+        }
+    }
+
+    pub fn with_output_path(mut self, output_path: impl Into<String>) -> Self {
+        self.output_path = output_path.into();
+        self
+    }
+
+    pub fn with_optional_output_path(mut self, output_path: Option<String>) -> Self {
+        self.output_path = output_path.unwrap_or_default();
+        self
+    }
+
+    pub fn with_preserve_audio(mut self, preserve_audio: bool) -> Self {
+        self.preserve_audio = preserve_audio;
+        self
+    }
+
+    pub fn with_max_batch(mut self, max_batch: Option<u32>) -> Self {
+        self.max_batch = max_batch;
+        self
+    }
+
+    pub fn with_native_direct(mut self, native_direct: bool) -> Self {
+        self.native_direct = native_direct;
+        self
+    }
+
+    pub fn with_trt_cache_dir(mut self, trt_cache_dir: Option<PathBuf>) -> Self {
+        self.trt_cache_dir = trt_cache_dir;
+        self
+    }
+
+    pub fn route_label(&self) -> &'static str {
+        if self.native_direct {
+            "direct engine-v2 path"
+        } else {
+            "default native command path"
+        }
+    }
+
     pub fn runtime_overrides(&self) -> NativeRuntimeOverrides {
         NativeRuntimeOverrides::native_command(self.native_direct).with_trt_cache(
             self.trt_cache_dir.is_some(),
@@ -869,17 +926,11 @@ mod tests {
     #[test]
     fn tool_request_runtime_overrides_follow_cache_presence() {
         let _guard = env_test_lock().lock().expect("env test lock");
-        let req = NativeToolRunRequest {
-            input_path: "in.mp4".to_string(),
-            output_path: "out.mp4".to_string(),
-            model_path: "model.onnx".to_string(),
-            scale: 2,
-            precision: "fp16".to_string(),
-            preserve_audio: true,
-            max_batch: Some(4),
-            native_direct: true,
-            trt_cache_dir: Some(PathBuf::from("cache-dir")),
-        };
+        let req = NativeToolRunRequest::new("in.mp4", "model.onnx", 2, "fp16")
+            .with_output_path("out.mp4")
+            .with_max_batch(Some(4))
+            .with_native_direct(true)
+            .with_trt_cache_dir(Some(PathBuf::from("cache-dir")));
 
         {
             let _runtime = req.runtime_overrides().apply();
@@ -897,6 +948,21 @@ mod tests {
             );
             assert_eq!(std::env::var("VIDEOFORGE_TRT_CACHE_DIR").as_deref(), Ok("cache-dir"));
         }
+    }
+
+    #[cfg(feature = "native_engine")]
+    #[test]
+    fn tool_request_builder_normalizes_optional_output_and_route_label() {
+        let direct = NativeToolRunRequest::new("in.mp4", "model.onnx", 2, "fp16")
+            .with_optional_output_path(None)
+            .with_native_direct(true);
+        assert_eq!(direct.output_path, "");
+        assert_eq!(direct.route_label(), "direct engine-v2 path");
+
+        let cli = NativeToolRunRequest::new("in.mp4", "model.onnx", 2, "fp16")
+            .with_optional_output_path(Some("out.mp4".to_string()));
+        assert_eq!(cli.output_path, "out.mp4");
+        assert_eq!(cli.route_label(), "default native command path");
     }
 }
 

@@ -312,18 +312,18 @@ async fn run_native_once(
     onnx_model: &str,
     output_path: &str,
 ) -> Result<app_lib::commands::native_engine::NativeUpscaleResult, String> {
-    run_native_tool_request(NativeToolRunRequest {
-        input_path: args.input.clone(),
-        output_path: output_path.to_string(),
-        model_path: onnx_model.to_string(),
-        scale: args.scale,
-        precision: precision.to_string(),
-        preserve_audio: args.preserve_audio,
-        max_batch: args.max_batch,
-        native_direct: args.native_direct,
-        trt_cache_dir: args.trt_cache.then(default_trt_cache_dir),
-    })
-    .await
+    let request = NativeToolRunRequest::new(
+        args.input.clone(),
+        onnx_model.to_string(),
+        args.scale,
+        precision.to_string(),
+    )
+    .with_output_path(output_path.to_string())
+    .with_preserve_audio(args.preserve_audio)
+    .with_max_batch(args.max_batch)
+    .with_native_direct(args.native_direct)
+    .with_trt_cache_dir(args.trt_cache.then(default_trt_cache_dir));
+    run_native_tool_request(request).await
 }
 
 fn default_trt_cache_dir() -> std::path::PathBuf {

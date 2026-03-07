@@ -810,27 +810,20 @@ async fn check_e2e_native(
     }
     check("Model file exists", true, model_path);
 
-    let out = output_path.unwrap_or("").to_string();
-
-    // B) Run pipeline
-    let route_label = if native_direct {
-        "direct engine-v2 path"
-    } else {
-        "default native command path"
-    };
-    println!("  Running native pipeline via {route_label} (this may take time)...");
-    let result = run_native_tool_request(NativeToolRunRequest {
-        input_path: input_path.to_string(),
-        output_path: out,
-        model_path: model_path.to_string(),
+    let request = NativeToolRunRequest::new(
+        input_path.to_string(),
+        model_path.to_string(),
         scale,
-        precision: precision.to_string(),
-        preserve_audio: true,
-        max_batch: Some(1),
-        native_direct,
-        trt_cache_dir: None,
-    })
-    .await;
+        precision.to_string(),
+    )
+    .with_optional_output_path(output_path.map(str::to_string))
+    .with_max_batch(Some(1))
+    .with_native_direct(native_direct);
+    println!(
+        "  Running native pipeline via {} (this may take time)...",
+        request.route_label()
+    );
+    let result = run_native_tool_request(request).await;
 
     let report = match result {
         Ok(r) => r,
