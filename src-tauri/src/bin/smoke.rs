@@ -860,6 +860,29 @@ async fn check_e2e_native(
         println!("  → encoder detail: {}", detail);
         println!("  encoder_detail={}", detail);
     }
+    if let Some(elapsed_ms) = report.perf.total_elapsed_ms {
+        println!("  → native elapsed ms: {}", elapsed_ms);
+    }
+    if let Some(vram_peak_mb) = report.perf.vram_peak_mb {
+        println!("  → native peak vram mb: {}", vram_peak_mb);
+    }
+    if let Some(requested) = &report.perf.requested_executor {
+        println!("  → requested executor: {}", requested);
+    }
+    if let Some(executed) = &report.perf.executed_executor {
+        println!("  → executed executor: {}", executed);
+    }
+    if report.perf.fallback_used {
+        println!(
+            "  → fallback: {} {}",
+            report.perf.fallback_reason_code.as_deref().unwrap_or("unknown"),
+            report
+                .perf
+                .fallback_reason_message
+                .as_deref()
+                .unwrap_or("no message")
+        );
+    }
     println!("  encoder_mode={}", report.encoder_mode);
     let actual_out = &report.output_path;
 

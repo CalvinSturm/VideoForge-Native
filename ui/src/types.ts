@@ -27,6 +27,12 @@ export interface NativeUpscaleResultJson {
   audio_preserved: boolean;
   trt_cache_enabled: boolean;
   trt_cache_dir?: string | null;
+  requested_executor?: string | null;
+  executed_executor?: string | null;
+  direct_attempted?: boolean;
+  fallback_used?: boolean;
+  fallback_reason_code?: string | null;
+  fallback_reason_message?: string | null;
 }
 
 export interface ColorSettings {
@@ -73,6 +79,12 @@ export interface Job {
   audioPreserved?: boolean;
   trtCacheEnabled?: boolean;
   trtCacheDir?: string | null;
+  requestedExecutor?: string | null;
+  executedExecutor?: string | null;
+  directAttempted?: boolean;
+  fallbackUsed?: boolean;
+  fallbackReasonCode?: string | null;
+  fallbackReasonMessage?: string | null;
 }
 
 export interface Toast {

@@ -107,6 +107,12 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
             let audioPreserved: boolean | undefined;
             let trtCacheEnabled: boolean | undefined;
             let trtCacheDir: string | null | undefined;
+            let requestedExecutor: string | null | undefined;
+            let executedExecutor: string | null | undefined;
+            let directAttempted: boolean | undefined;
+            let fallbackUsed: boolean | undefined;
+            let fallbackReasonCode: string | null | undefined;
+            let fallbackReasonMessage: string | null | undefined;
             const canUseNative = upscaleConfig.useNativeEngine && video.mode === 'video';
 
             if (canUseNative) {
@@ -146,10 +152,20 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
                     audioPreserved = nativeResult.audio_preserved;
                     trtCacheEnabled = nativeResult.trt_cache_enabled;
                     trtCacheDir = nativeResult.trt_cache_dir ?? null;
+                    requestedExecutor = nativeResult.requested_executor ?? null;
+                    executedExecutor = nativeResult.executed_executor ?? null;
+                    directAttempted = nativeResult.direct_attempted;
+                    fallbackUsed = nativeResult.fallback_used;
+                    fallbackReasonCode = nativeResult.fallback_reason_code ?? null;
+                    fallbackReasonMessage = nativeResult.fallback_reason_message ?? null;
                     setLogs(prev => [
                         ...prev,
                         `[NATIVE] engine=${nativeResult.engine} encoder_mode=${nativeResult.encoder_mode} frames=${nativeResult.frames_processed}`
                             + ` trt_cache=${String(nativeResult.trt_cache_enabled)}`
+                            + (nativeResult.requested_executor ? ` requested=${nativeResult.requested_executor}` : "")
+                            + (nativeResult.executed_executor ? ` executed=${nativeResult.executed_executor}` : "")
+                            + (typeof nativeResult.fallback_used === "boolean" ? ` fallback=${String(nativeResult.fallback_used)}` : "")
+                            + (nativeResult.fallback_reason_code ? ` fallback_code=${nativeResult.fallback_reason_code}` : "")
                             + (nativeResult.trt_cache_dir ? ` cache_dir=${nativeResult.trt_cache_dir}` : "")
                             + (nativeResult.encoder_detail ? ` detail=${nativeResult.encoder_detail}` : "")
                     ]);
@@ -173,7 +189,13 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
                 ...(typeof framesProcessed === "number" ? { framesProcessed } : {}),
                 ...(typeof audioPreserved === "boolean" ? { audioPreserved } : {}),
                 ...(typeof trtCacheEnabled === "boolean" ? { trtCacheEnabled } : {}),
-                ...(trtCacheDir !== undefined ? { trtCacheDir } : {})
+                ...(trtCacheDir !== undefined ? { trtCacheDir } : {}),
+                ...(requestedExecutor !== undefined ? { requestedExecutor } : {}),
+                ...(executedExecutor !== undefined ? { executedExecutor } : {}),
+                ...(typeof directAttempted === "boolean" ? { directAttempted } : {}),
+                ...(typeof fallbackUsed === "boolean" ? { fallbackUsed } : {}),
+                ...(fallbackReasonCode !== undefined ? { fallbackReasonCode } : {}),
+                ...(fallbackReasonMessage !== undefined ? { fallbackReasonMessage } : {})
             };
             setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
             setActiveJob(finishedJob);

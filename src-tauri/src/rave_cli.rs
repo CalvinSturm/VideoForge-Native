@@ -115,6 +115,16 @@ fn prepend_runtime_path(cmd: &mut Command, workspace_root: &Path, bin_path: &Pat
 pub struct RaveResult {
     pub json: Value,
     pub stderr: String,
+    pub progress: Option<RaveProgressSummary>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RaveProgressSummary {
+    pub elapsed_ms: u64,
+    pub frames_decoded: u64,
+    pub frames_inferred: u64,
+    pub frames_encoded: u64,
+    pub final_record_seen: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -225,7 +235,62 @@ async fn run_cli(
 
     let json = parse_json_stdout_contract(&stdout)?;
     assert_required_contract_fields(command, &json)?;
-    Ok(RaveResult { json, stderr })
+    let progress = parse_progress_summary(&stderr, command);
+    Ok(RaveResult {
+        json,
+        stderr,
+        progress,
+    })
+}
+
+fn parse_progress_summary(stderr: &str, command: &str) -> Option<RaveProgressSummary> {
+    let mut latest: Option<RaveProgressSummary> = None;
+
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) != Some("progress") {
+            continue;
+        }
+        if value.get("command").and_then(|v| v.as_str()) != Some(command) {
+            continue;
+        }
+
+        let Some(frames) = value.get("frames") else {
+            continue;
+        };
+        let Some(elapsed_ms) = value.get("elapsed_ms").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let Some(frames_decoded) = frames.get("decoded").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let Some(frames_inferred) = frames.get("inferred").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let Some(frames_encoded) = frames.get("encoded").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+
+        latest = Some(RaveProgressSummary {
+            elapsed_ms,
+            frames_decoded,
+            frames_inferred,
+            frames_encoded,
+            final_record_seen: value
+                .get("final")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        });
+    }
+
+    latest
 }
 
 fn parse_json_stdout_contract(stdout: &str) -> Result<Value, RaveCliError> {
@@ -301,7 +366,7 @@ fn assert_required_contract_fields(command: &str, json: &Value) -> Result<(), Ra
 
 #[cfg(test)]
 mod tests {
-    use super::{assert_required_contract_fields, parse_json_stdout_contract};
+    use super::{assert_required_contract_fields, parse_json_stdout_contract, parse_progress_summary};
 
     #[test]
     fn parse_accepts_single_json_object() {
@@ -359,5 +424,28 @@ mod tests {
             "host_copy_audit_disable_reason": null
         });
         assert!(assert_required_contract_fields("validate", &v).is_ok());
+    }
+
+    #[test]
+    fn progress_summary_uses_latest_matching_record() {
+        let stderr = r#"
+noise
+{"schema_version":1,"type":"progress","command":"upscale","elapsed_ms":100,"frames":{"decoded":5,"inferred":4,"encoded":3},"final":false}
+{"schema_version":1,"type":"progress","command":"upscale","elapsed_ms":250,"frames":{"decoded":9,"inferred":8,"encoded":7},"final":true}
+"#;
+        let summary = parse_progress_summary(stderr, "upscale").expect("progress summary");
+        assert_eq!(summary.elapsed_ms, 250);
+        assert_eq!(summary.frames_decoded, 9);
+        assert_eq!(summary.frames_inferred, 8);
+        assert_eq!(summary.frames_encoded, 7);
+        assert!(summary.final_record_seen);
+    }
+
+    #[test]
+    fn progress_summary_ignores_non_matching_records() {
+        let stderr = r#"
+{"schema_version":1,"type":"progress","command":"benchmark","elapsed_ms":100,"frames":{"decoded":5,"inferred":4,"encoded":3},"final":true}
+"#;
+        assert!(parse_progress_summary(stderr, "upscale").is_none());
     }
 }

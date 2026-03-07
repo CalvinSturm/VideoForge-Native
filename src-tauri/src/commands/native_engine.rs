@@ -348,6 +348,25 @@ pub struct NativePerfReport {
     pub effective_max_batch: u32,
     pub trt_cache_enabled: bool,
     pub trt_cache_dir: Option<String>,
+    pub requested_executor: Option<String>,
+    pub executed_executor: Option<String>,
+    pub direct_attempted: bool,
+    pub fallback_used: bool,
+    pub fallback_reason_code: Option<String>,
+    pub fallback_reason_message: Option<String>,
+    pub total_elapsed_ms: Option<u64>,
+    pub frames_decoded: Option<u64>,
+    pub frames_preprocessed: Option<u64>,
+    pub frames_inferred: Option<u64>,
+    pub frames_encoded: Option<u64>,
+    pub preprocess_avg_us: Option<u64>,
+    pub inference_frame_avg_us: Option<u64>,
+    pub inference_dispatch_avg_us: Option<u64>,
+    pub postprocess_frame_avg_us: Option<u64>,
+    pub postprocess_dispatch_avg_us: Option<u64>,
+    pub encode_avg_us: Option<u64>,
+    pub vram_current_mb: Option<u64>,
+    pub vram_peak_mb: Option<u64>,
 }
 
 /// Structured response returned by `upscale_request_native`.
@@ -374,6 +393,49 @@ impl NativeUpscaleError {
         Self {
             code: code.to_string(),
             message: message.into(),
+        }
+    }
+}
+
+#[cfg(feature = "native_engine")]
+#[derive(Debug, Clone)]
+struct NativeExecutionRoute {
+    requested_executor: &'static str,
+    executed_executor: &'static str,
+    direct_attempted: bool,
+    fallback_reason_code: Option<String>,
+    fallback_reason_message: Option<String>,
+}
+
+#[cfg(feature = "native_engine")]
+impl NativeExecutionRoute {
+    fn direct() -> Self {
+        Self {
+            requested_executor: "direct",
+            executed_executor: "direct",
+            direct_attempted: true,
+            fallback_reason_code: None,
+            fallback_reason_message: None,
+        }
+    }
+
+    fn cli_requested() -> Self {
+        Self {
+            requested_executor: "cli",
+            executed_executor: "cli",
+            direct_attempted: false,
+            fallback_reason_code: None,
+            fallback_reason_message: None,
+        }
+    }
+
+    fn cli_fallback(err: &NativeUpscaleError) -> Self {
+        Self {
+            requested_executor: "direct",
+            executed_executor: "cli",
+            direct_attempted: true,
+            fallback_reason_code: Some(err.code.clone()),
+            fallback_reason_message: Some(err.message.clone()),
         }
     }
 }
@@ -524,26 +586,57 @@ impl NativeJobSpec {
         args
     }
 
+    fn base_perf(&self, frames_processed: u64) -> NativePerfReport {
+        NativePerfReport {
+            frames_processed,
+            effective_max_batch: self.max_batch,
+            trt_cache_enabled: self.trt_cache_enabled,
+            trt_cache_dir: self.trt_cache_dir.clone(),
+            requested_executor: None,
+            executed_executor: None,
+            direct_attempted: false,
+            fallback_used: false,
+            fallback_reason_code: None,
+            fallback_reason_message: None,
+            total_elapsed_ms: None,
+            frames_decoded: None,
+            frames_preprocessed: None,
+            frames_inferred: None,
+            frames_encoded: None,
+            preprocess_avg_us: None,
+            inference_frame_avg_us: None,
+            inference_dispatch_avg_us: None,
+            postprocess_frame_avg_us: None,
+            postprocess_dispatch_avg_us: None,
+            encode_avg_us: None,
+            vram_current_mb: None,
+            vram_peak_mb: None,
+        }
+    }
+
     fn build_result(
         &self,
         output_path: String,
         engine: impl Into<String>,
         encoder_mode: impl Into<String>,
         encoder_detail: Option<String>,
-        frames_processed: u64,
+        mut perf: NativePerfReport,
+        route: NativeExecutionRoute,
     ) -> NativeUpscaleResult {
+        perf.requested_executor = Some(route.requested_executor.to_string());
+        perf.executed_executor = Some(route.executed_executor.to_string());
+        perf.direct_attempted = route.direct_attempted;
+        perf.fallback_used = route.fallback_reason_code.is_some();
+        perf.fallback_reason_code = route.fallback_reason_code;
+        perf.fallback_reason_message = route.fallback_reason_message;
+
         NativeUpscaleResult {
             output_path,
             engine: engine.into(),
             encoder_mode: encoder_mode.into(),
             encoder_detail,
             audio_preserved: self.preserve_audio,
-            perf: NativePerfReport {
-                frames_processed,
-                effective_max_batch: self.max_batch,
-                trt_cache_enabled: self.trt_cache_enabled,
-                trt_cache_dir: self.trt_cache_dir.clone(),
-            },
+            perf,
         }
     }
 }
@@ -623,14 +716,74 @@ fn infer_model_scale(model_path: &str) -> Option<u32> {
 }
 
 #[cfg(feature = "native_engine")]
+fn build_cli_perf_report(
+    job: &NativeJobSpec,
+    res: &serde_json::Value,
+    progress: Option<&crate::rave_cli::RaveProgressSummary>,
+) -> NativePerfReport {
+    let mut perf = job.base_perf(progress.map(|p| p.frames_encoded).unwrap_or(0));
+    perf.total_elapsed_ms = res
+        .get("elapsed_ms")
+        .and_then(|v| v.as_u64())
+        .or_else(|| progress.map(|p| p.elapsed_ms));
+    perf.frames_decoded = progress.map(|p| p.frames_decoded);
+    perf.frames_inferred = progress.map(|p| p.frames_inferred);
+    perf.frames_encoded = progress.map(|p| p.frames_encoded);
+    perf.vram_current_mb = res.get("vram_current_mb").and_then(|v| v.as_u64());
+    perf.vram_peak_mb = res.get("vram_peak_mb").and_then(|v| v.as_u64());
+    perf
+}
+
+#[cfg(feature = "native_engine")]
+fn build_direct_perf_report(
+    job: &NativeJobSpec,
+    metrics: &videoforge_engine::engine::pipeline::PipelineMetrics,
+    total_elapsed_ms: u64,
+    vram_current_bytes: usize,
+    vram_peak_bytes: usize,
+) -> NativePerfReport {
+    use std::sync::atomic::Ordering;
+
+    let frames_decoded = metrics.frames_decoded.load(Ordering::Relaxed);
+    let frames_preprocessed = metrics.frames_preprocessed.load(Ordering::Relaxed);
+    let frames_inferred = metrics.frames_inferred.load(Ordering::Relaxed);
+    let frames_encoded = metrics.frames_encoded.load(Ordering::Relaxed);
+    let inference_dispatches = metrics.inference_dispatches.load(Ordering::Relaxed);
+    let postprocess_dispatches = metrics.postprocess_dispatches.load(Ordering::Relaxed);
+    let avg = |total: &std::sync::atomic::AtomicU64, count: u64| -> Option<u64> {
+        if count > 0 {
+            Some(total.load(Ordering::Relaxed) / count)
+        } else {
+            None
+        }
+    };
+
+    let mut perf = job.base_perf(frames_encoded);
+    perf.total_elapsed_ms = Some(total_elapsed_ms);
+    perf.frames_decoded = Some(frames_decoded);
+    perf.frames_preprocessed = Some(frames_preprocessed);
+    perf.frames_inferred = Some(frames_inferred);
+    perf.frames_encoded = Some(frames_encoded);
+    perf.preprocess_avg_us = avg(&metrics.preprocess_total_us, frames_preprocessed);
+    perf.inference_frame_avg_us = avg(&metrics.inference_total_us, frames_inferred);
+    perf.inference_dispatch_avg_us = avg(&metrics.inference_total_us, inference_dispatches);
+    perf.postprocess_frame_avg_us = avg(&metrics.postprocess_total_us, frames_inferred);
+    perf.postprocess_dispatch_avg_us = avg(&metrics.postprocess_total_us, postprocess_dispatches);
+    perf.encode_avg_us = avg(&metrics.encode_total_us, frames_encoded);
+    perf.vram_current_mb = Some((vram_current_bytes / (1024 * 1024)) as u64);
+    perf.vram_peak_mb = Some((vram_peak_bytes / (1024 * 1024)) as u64);
+    perf
+}
+
+#[cfg(feature = "native_engine")]
 async fn run_native_via_rave_cli(
     job: &NativeJobSpec,
-    encoder_detail: Option<String>,
+    route: NativeExecutionRoute,
 ) -> Result<NativeUpscaleResult, String> {
     let make_err =
         |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
     let resolved_output = job.resolve_cli_output_path();
-    let res = crate::commands::rave::run_rave_upscale_command(
+    let res = crate::commands::rave::run_rave_upscale_internal(
         job.build_cli_args(&resolved_output),
         true,
         false,
@@ -638,6 +791,7 @@ async fn run_native_via_rave_cli(
     )
     .await?;
     let output = res
+        .json
         .get("output")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
@@ -648,12 +802,15 @@ async fn run_native_via_rave_cli(
         })?
         .to_string();
 
+    let perf = build_cli_perf_report(job, &res.json, res.progress.as_ref());
+
     Ok(job.build_result(
         output,
         "native_via_rave_cli",
         "rave_cli",
-        encoder_detail,
-        0,
+        None,
+        perf,
+        route,
     ))
 }
 
@@ -760,18 +917,14 @@ pub async fn upscale_request_native(
                             message = %err.message,
                             "Direct native path failed; falling back to CLI-backed native path"
                         );
-                        run_native_via_rave_cli(
-                            &job,
-                            Some(format!("direct_native_failed: {}: {}", err.code, err.message)),
-                        )
-                        .await
+                        run_native_via_rave_cli(&job, NativeExecutionRoute::cli_fallback(&err)).await
                     } else {
                         Err(err_json)
                     }
                 }
             }
         } else {
-            run_native_via_rave_cli(&job, None).await
+            run_native_via_rave_cli(&job, NativeExecutionRoute::cli_requested()).await
         }
     }
 }
@@ -828,6 +981,7 @@ async fn run_engine_pipeline(
 
     let make_err =
         |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
+    let started = std::time::Instant::now();
 
     // ── Step 1.5: Probe input for dimensions ──────────────────────────────────
     // encoder_nv12_pitch and encoder width/height must be set before
@@ -999,12 +1153,20 @@ async fn run_engine_pipeline(
         ));
     }
 
-    let frames = pipeline
-        .metrics()
+    let metrics = pipeline.metrics();
+    let frames = metrics
         .frames_encoded
         .load(std::sync::atomic::Ordering::Relaxed);
     let encoder_mode = encoder_mode.as_str().to_string();
     let encoder_detail = encoder_detail.get();
+    let (vram_current, vram_peak) = ctx.vram_usage();
+    let perf = build_direct_perf_report(
+        job,
+        &metrics,
+        started.elapsed().as_millis() as u64,
+        vram_current,
+        vram_peak,
+    );
     tracing::info!(
         frames_encoded = frames,
         encoder_mode = %encoder_mode,
@@ -1019,7 +1181,8 @@ async fn run_engine_pipeline(
         "native_v2",
         encoder_mode,
         encoder_detail,
-        frames,
+        perf,
+        NativeExecutionRoute::direct(),
     ))
 }
 

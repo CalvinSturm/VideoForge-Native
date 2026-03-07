@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use crate::rave_cli::{run_benchmark, run_upscale, run_validate, RaveCliConfig, RaveCliError};
+use crate::rave_cli::{
+    run_benchmark, run_upscale, run_validate, RaveCliConfig, RaveCliError, RaveResult,
+};
 
 fn workspace_root() -> Result<PathBuf, String> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -288,21 +290,22 @@ pub async fn rave_upscale(
     mock_run: Option<bool>,
     ui_opt_in: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    run_rave_upscale_command(
+    Ok(run_rave_upscale_internal(
         args,
         strict_audit.unwrap_or(true),
         mock_run.unwrap_or(false),
         ui_opt_in.unwrap_or(false),
     )
-    .await
+    .await?
+    .json)
 }
 
-pub async fn run_rave_upscale_command(
+pub async fn run_rave_upscale_internal(
     args: Vec<String>,
     strict_audit: bool,
     mock_run: bool,
     ui_opt_in: bool,
-) -> Result<serde_json::Value, String> {
+) -> Result<RaveResult, String> {
     if !ui_opt_in && !native_engine_runtime_enabled() {
         return Err(encode_rave_error(
             "native_engine_disabled",
@@ -323,7 +326,7 @@ pub async fn run_rave_upscale_command(
         .await
         .map_err(map_rave_error)?;
 
-    Ok(res.json)
+    Ok(res)
 }
 
 #[cfg(test)]
