@@ -23,6 +23,7 @@
 //! and the opt-in engine-v2 direct path.
 
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::path::Path;
 #[cfg(feature = "native_engine")]
 use std::collections::VecDeque;
@@ -397,6 +398,153 @@ impl NativeUpscaleError {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct NativeRuntimeOverrides {
+    pub enable_native: bool,
+    pub direct: Option<bool>,
+    pub trt_cache_enabled: Option<bool>,
+    #[cfg(feature = "native_engine")]
+    pub trt_cache_dir: Option<PathBuf>,
+}
+
+pub struct NativeRuntimeEnvGuard {
+    saved: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl NativeRuntimeOverrides {
+    pub fn native_command(direct: bool) -> Self {
+        Self {
+            enable_native: true,
+            direct: Some(direct),
+            trt_cache_enabled: None,
+            #[cfg(feature = "native_engine")]
+            trt_cache_dir: None,
+        }
+    }
+
+    #[cfg(feature = "native_engine")]
+    pub fn with_trt_cache(mut self, enabled: bool, dir: Option<PathBuf>) -> Self {
+        self.trt_cache_enabled = Some(enabled);
+        self.trt_cache_dir = dir;
+        self
+    }
+
+    pub fn apply(&self) -> NativeRuntimeEnvGuard {
+        let vars: Vec<(&'static str, Option<OsString>)> = vec![
+            (
+                "VIDEOFORGE_ENABLE_NATIVE_ENGINE",
+                if self.enable_native {
+                    Some(OsString::from("1"))
+                } else {
+                    None
+                },
+            ),
+            (
+                "VIDEOFORGE_NATIVE_ENGINE_DIRECT",
+                self.direct
+                    .and_then(|enabled| enabled.then(|| OsString::from("1"))),
+            ),
+            (
+                "VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE",
+                self.trt_cache_enabled
+                    .and_then(|enabled| enabled.then(|| OsString::from("1"))),
+            ),
+            (
+                "VIDEOFORGE_TRT_CACHE_DIR",
+                {
+                    #[cfg(feature = "native_engine")]
+                    {
+                        self.trt_cache_dir
+                            .as_ref()
+                            .map(|p| p.as_os_str().to_os_string())
+                    }
+                    #[cfg(not(feature = "native_engine"))]
+                    {
+                        None
+                    }
+                },
+            ),
+        ];
+
+        let mut saved = Vec::with_capacity(vars.len());
+        for (key, value) in vars {
+            saved.push((key, std::env::var_os(key)));
+            match value {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+
+        NativeRuntimeEnvGuard { saved }
+    }
+}
+
+impl Drop for NativeRuntimeEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.drain(..).rev() {
+            match value {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NativeRuntimeOverrides;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn native_runtime_env_guard_restores_previous_values() {
+        let _guard = env_test_lock().lock().expect("env test lock");
+        let direct_key = "VIDEOFORGE_NATIVE_ENGINE_DIRECT";
+        let cache_dir_key = "VIDEOFORGE_TRT_CACHE_DIR";
+
+        unsafe {
+            std::env::set_var("VIDEOFORGE_ENABLE_NATIVE_ENGINE", "0");
+            std::env::set_var(direct_key, "0");
+            std::env::set_var("VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE", "0");
+            std::env::set_var(cache_dir_key, "before");
+        }
+
+        {
+            #[cfg(feature = "native_engine")]
+            let _runtime = NativeRuntimeOverrides::native_command(true)
+                .with_trt_cache(true, Some(PathBuf::from("cache-dir")))
+                .apply();
+
+            assert_eq!(
+                std::env::var("VIDEOFORGE_ENABLE_NATIVE_ENGINE").as_deref(),
+                Ok("1")
+            );
+            assert_eq!(std::env::var(direct_key).as_deref(), Ok("1"));
+            assert_eq!(
+                std::env::var("VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE").as_deref(),
+                Ok("1")
+            );
+            assert_eq!(std::env::var(cache_dir_key).as_deref(), Ok("cache-dir"));
+        }
+
+        assert_eq!(
+            std::env::var("VIDEOFORGE_ENABLE_NATIVE_ENGINE").as_deref(),
+            Ok("0")
+        );
+        assert_eq!(std::env::var(direct_key).as_deref(), Ok("0"));
+        assert_eq!(
+            std::env::var("VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE").as_deref(),
+            Ok("0")
+        );
+        assert_eq!(std::env::var(cache_dir_key).as_deref(), Ok("before"));
+    }
+}
+
 #[cfg(feature = "native_engine")]
 #[derive(Debug, Clone)]
 struct NativeExecutionRoute {
@@ -656,8 +804,7 @@ This is usually a broken or incompatible export, not a native runtime failure. O
     format!("TensorRT backend init failed: {err}")
 }
 
-#[cfg(feature = "native_engine")]
-fn native_engine_runtime_enabled() -> bool {
+pub(crate) fn native_engine_runtime_enabled() -> bool {
     match std::env::var("VIDEOFORGE_ENABLE_NATIVE_ENGINE") {
         Ok(v) => matches!(
             v.trim().to_ascii_lowercase().as_str(),
@@ -668,7 +815,7 @@ fn native_engine_runtime_enabled() -> bool {
 }
 
 #[cfg(feature = "native_engine")]
-fn native_engine_direct_enabled() -> bool {
+pub(crate) fn native_engine_direct_enabled() -> bool {
     match std::env::var("VIDEOFORGE_NATIVE_ENGINE_DIRECT") {
         Ok(v) => matches!(
             v.trim().to_ascii_lowercase().as_str(),

@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use app_lib::commands::upscale::{run_upscale_job, JobProgress, JobProgressFn, UpscaleJobConfig};
 #[cfg(feature = "native_engine")]
-use app_lib::commands::native_engine::upscale_request_native;
+use app_lib::commands::native_engine::{upscale_request_native, NativeRuntimeOverrides};
 use app_lib::control::ResearchConfig;
 use app_lib::edit_config::EditConfig;
 use app_lib::models;
@@ -222,26 +222,18 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
         .as_ref()
         .unwrap_or_else(|| emit_error_and_exit("Native benchmarking requires --onnx-model <path>."));
 
-    // SAFETY: process-local env mutation to select the desired native route.
-    unsafe {
-        env::set_var("VIDEOFORGE_ENABLE_NATIVE_ENGINE", "1");
-        if args.native_direct {
-            env::set_var("VIDEOFORGE_NATIVE_ENGINE_DIRECT", "1");
-        } else {
-            env::remove_var("VIDEOFORGE_NATIVE_ENGINE_DIRECT");
-        }
-        if args.trt_cache {
-            let cache_dir = default_trt_cache_dir();
-            if let Err(err) = std::fs::create_dir_all(&cache_dir) {
-                emit_error_and_exit(&format!(
-                    "Failed to create TensorRT cache directory {}: {err}",
-                    cache_dir.display()
-                ));
-            }
-            env::set_var("VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE", "1");
-            env::set_var("VIDEOFORGE_TRT_CACHE_DIR", &cache_dir);
+    let cache_dir = args.trt_cache.then(default_trt_cache_dir);
+    if let Some(cache_dir) = &cache_dir {
+        if let Err(err) = std::fs::create_dir_all(cache_dir) {
+            emit_error_and_exit(&format!(
+                "Failed to create TensorRT cache directory {}: {err}",
+                cache_dir.display()
+            ));
         }
     }
+    let _runtime_env = NativeRuntimeOverrides::native_command(args.native_direct)
+        .with_trt_cache(args.trt_cache, cache_dir)
+        .apply();
 
     for warmup_idx in 0..args.warmup_runs {
         let warmup_output = warmup_output_path(&args.output, warmup_idx + 1);

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::commands::native_engine::native_engine_runtime_enabled;
 use crate::rave_cli::{
     run_benchmark, run_upscale, run_validate, RaveCliConfig, RaveCliError, RaveResult,
 };
@@ -40,14 +41,19 @@ fn resolve_profile() -> Result<String, String> {
     Ok(env_profile_override()?.unwrap_or_else(|| default_profile().to_string()))
 }
 
-fn native_engine_runtime_enabled() -> bool {
-    match std::env::var("VIDEOFORGE_ENABLE_NATIVE_ENGINE") {
-        Ok(v) => matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => false,
+fn ensure_native_runtime_opt_in(ui_opt_in: bool) -> Result<(), String> {
+    if ui_opt_in || native_engine_runtime_enabled() {
+        return Ok(());
     }
+
+    Err(encode_rave_error(
+        "native_engine_disabled",
+        "Native engine path is disabled by default for stability.",
+        None,
+        Some(
+            "Set VIDEOFORGE_ENABLE_NATIVE_ENGINE=1 to opt in explicitly, or switch the header toggle to Python.",
+        ),
+    ))
 }
 
 fn ensure_profile_arg(mut args: Vec<String>, profile: &str) -> Vec<String> {
@@ -103,6 +109,23 @@ fn validate_max_batch_arg(args: &[String]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn prepare_rave_cli_args(
+    args: Vec<String>,
+    ui_opt_in: bool,
+    validate_max_batch: bool,
+) -> Result<(RaveCliConfig, Vec<String>), String> {
+    ensure_native_runtime_opt_in(ui_opt_in)?;
+    if validate_max_batch {
+        validate_max_batch_arg(&args)?;
+    }
+
+    let profile = resolve_profile()?;
+    let root = workspace_root()?;
+    let config = RaveCliConfig::from_workspace_root(root);
+    let args = ensure_profile_arg(args, &profile);
+    Ok((config, args))
 }
 
 fn encode_rave_error(
@@ -306,23 +329,22 @@ pub async fn run_rave_upscale_internal(
     mock_run: bool,
     ui_opt_in: bool,
 ) -> Result<RaveResult, String> {
-    if !ui_opt_in && !native_engine_runtime_enabled() {
-        return Err(encode_rave_error(
-            "native_engine_disabled",
-            "Native engine path is disabled by default for stability.",
-            None,
-            Some(
-                "Set VIDEOFORGE_ENABLE_NATIVE_ENGINE=1 to opt in explicitly, or switch the header toggle to Python.",
-            ),
-        ));
-    }
-
-    validate_max_batch_arg(&args)?;
-    let profile = resolve_profile()?;
-    let root = workspace_root()?;
-    let config = RaveCliConfig::from_workspace_root(root);
-    let args = ensure_profile_arg(args, &profile);
+    let (config, args) = prepare_rave_cli_args(args, ui_opt_in, true)?;
     let res = run_upscale(&config, &args, strict_audit, mock_run)
+        .await
+        .map_err(map_rave_error)?;
+
+    Ok(res)
+}
+
+pub async fn run_rave_benchmark_internal(
+    args: Vec<String>,
+    strict_audit: bool,
+    mock_run: bool,
+    ui_opt_in: bool,
+) -> Result<RaveResult, String> {
+    let (config, args) = prepare_rave_cli_args(args, ui_opt_in, true)?;
+    let res = run_benchmark(&config, &args, strict_audit, mock_run)
         .await
         .map_err(map_rave_error)?;
 
@@ -404,29 +426,12 @@ pub async fn rave_benchmark(
     mock_run: Option<bool>,
     ui_opt_in: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    if !ui_opt_in.unwrap_or(false) && !native_engine_runtime_enabled() {
-        return Err(encode_rave_error(
-            "native_engine_disabled",
-            "Native engine path is disabled by default for stability.",
-            None,
-            Some(
-                "Set VIDEOFORGE_ENABLE_NATIVE_ENGINE=1 to opt in explicitly, or switch the header toggle to Python.",
-            ),
-        ));
-    }
-
-    let profile = resolve_profile()?;
-    let root = workspace_root()?;
-    let config = RaveCliConfig::from_workspace_root(root);
-    let args = ensure_profile_arg(args, &profile);
-    let res = run_benchmark(
-        &config,
-        &args,
+    Ok(run_rave_benchmark_internal(
+        args,
         strict_audit.unwrap_or(true),
         mock_run.unwrap_or(false),
+        ui_opt_in.unwrap_or(false),
     )
-    .await
-    .map_err(map_rave_error)?;
-
-    Ok(res.json)
+    .await?
+    .json)
 }

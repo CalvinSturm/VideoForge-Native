@@ -779,7 +779,7 @@ async fn check_e2e_native(
     native_direct: bool,
     keep_temp: bool,
 ) -> bool {
-    use app_lib::commands::native_engine::upscale_request_native;
+    use app_lib::commands::native_engine::{upscale_request_native, NativeRuntimeOverrides};
 
     // A) Input prereq checks
     if !std::path::Path::new(input_path).exists() {
@@ -817,15 +817,7 @@ async fn check_e2e_native(
         "default native command path"
     };
     println!("  Running native pipeline via {route_label} (this may take time)...");
-    // Native engine is runtime-gated; smoke native E2E opts in explicitly.
-    unsafe {
-        std::env::set_var("VIDEOFORGE_ENABLE_NATIVE_ENGINE", "1");
-        if native_direct {
-            std::env::set_var("VIDEOFORGE_NATIVE_ENGINE_DIRECT", "1");
-        } else {
-            std::env::remove_var("VIDEOFORGE_NATIVE_ENGINE_DIRECT");
-        }
-    }
+    let _runtime_env = NativeRuntimeOverrides::native_command(native_direct).apply();
     let result = upscale_request_native(
         input_path.to_string(),
         out,
