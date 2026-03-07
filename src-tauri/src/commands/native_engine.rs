@@ -545,7 +545,7 @@ impl Drop for NativeRuntimeEnvGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::NativeRuntimeOverrides;
+    use super::{NativeRuntimeOverrides, NativeVideoOutputProfile, NativeVideoSourceProfile};
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
 
@@ -595,6 +595,26 @@ mod tests {
             Ok("0")
         );
         assert_eq!(std::env::var(cache_dir_key).as_deref(), Ok("before"));
+    }
+
+    #[cfg(feature = "native_engine")]
+    #[test]
+    fn source_profile_derives_expected_output_profile() {
+        let source = NativeVideoSourceProfile {
+            coded_width: 1920,
+            coded_height: 1080,
+            fps: 23.976,
+            total_frames: 240,
+            codec: videoforge_engine::codecs::sys::cudaVideoCodec::H264,
+        };
+
+        let output: NativeVideoOutputProfile = source.scaled_output(2);
+        assert_eq!(output.width, 3840);
+        assert_eq!(output.height, 2160);
+        assert_eq!(output.nv12_pitch, 3840);
+        assert_eq!(output.fps_num, 23_976);
+        assert_eq!(output.fps_den, 1000);
+        assert_eq!(output.frame_rate_arg(), "23976/1000");
     }
 }
 
@@ -1219,6 +1239,7 @@ async fn run_native_pipeline(
         scale = job.scale,
         precision = %job.precision,
         max_batch = job.max_batch,
+        estimated_frames = plan.source.total_frames,
         "Native engine pipeline starting"
     );
 
@@ -1231,15 +1252,113 @@ async fn run_native_pipeline(
 
 #[cfg(feature = "native_engine")]
 #[derive(Debug, Clone)]
+struct NativeVideoSourceProfile {
+    coded_width: usize,
+    coded_height: usize,
+    fps: f64,
+    total_frames: u64,
+    codec: videoforge_engine::codecs::sys::cudaVideoCodec,
+}
+
+#[cfg(feature = "native_engine")]
+impl NativeVideoSourceProfile {
+    fn probe(input_path: &str) -> Result<Self, String> {
+        tracing::info!(path = %input_path, "Probing input video dimensions");
+        let (coded_width, coded_height, _duration, fps, total_frames, codec) =
+            probe_video_coded_geometry(input_path).map_err(|e| {
+                serde_json::to_string(&NativeUpscaleError::new("PROBE_FAILED", &e)).unwrap()
+            })?;
+
+        tracing::info!(
+            coded_width,
+            coded_height,
+            fps,
+            total_frames,
+            codec = ?codec,
+            "Native video source profile resolved"
+        );
+
+        Ok(Self {
+            coded_width,
+            coded_height,
+            fps,
+            total_frames,
+            codec,
+        })
+    }
+
+    fn mux_codec_hint(&self) -> StreamingCodecHint {
+        StreamingCodecHint::new(match self.codec {
+            videoforge_engine::codecs::sys::cudaVideoCodec::H264 => Some("h264"),
+            videoforge_engine::codecs::sys::cudaVideoCodec::HEVC => Some("hevc"),
+            _ => None,
+        })
+    }
+
+    fn scaled_output(&self, scale: u32) -> NativeVideoOutputProfile {
+        let width = self.coded_width.saturating_mul(scale as usize);
+        let height = self.coded_height.saturating_mul(scale as usize);
+        NativeVideoOutputProfile {
+            width,
+            height,
+            nv12_pitch: width.div_ceil(256) * 256,
+            fps_num: (self.fps * 1000.0).round() as u32,
+            fps_den: 1000u32,
+        }
+    }
+}
+
+#[cfg(feature = "native_engine")]
+#[derive(Debug, Clone)]
+struct NativeVideoOutputProfile {
+    width: usize,
+    height: usize,
+    nv12_pitch: usize,
+    fps_num: u32,
+    fps_den: u32,
+}
+
+#[cfg(feature = "native_engine")]
+impl NativeVideoOutputProfile {
+    fn frame_rate_arg(&self) -> String {
+        format!("{}/{}", self.fps_num, self.fps_den.max(1))
+    }
+
+    fn nvenc_config(&self) -> videoforge_engine::codecs::nvenc::NvEncConfig {
+        videoforge_engine::codecs::nvenc::NvEncConfig {
+            width: self.width as u32,
+            height: self.height as u32,
+            fps_num: self.fps_num,
+            fps_den: self.fps_den,
+            bitrate: 8_000_000,
+            max_bitrate: 0,
+            gop_length: 30,
+            b_frames: 0,
+            nv12_pitch: self.nv12_pitch as u32,
+        }
+    }
+
+    fn pipeline_config(
+        &self,
+        model_precision: videoforge_engine::core::kernels::ModelPrecision,
+        inference_max_batch: usize,
+    ) -> videoforge_engine::engine::pipeline::PipelineConfig {
+        videoforge_engine::engine::pipeline::PipelineConfig {
+            model_precision,
+            encoder_nv12_pitch: self.nv12_pitch,
+            inference_max_batch,
+            ..videoforge_engine::engine::pipeline::PipelineConfig::default()
+        }
+    }
+}
+
+#[cfg(feature = "native_engine")]
+#[derive(Debug, Clone)]
 struct NativeDirectPlan {
     ffmpeg_cmd: String,
     output_path: String,
-    probed_codec: videoforge_engine::codecs::sys::cudaVideoCodec,
-    output_w: usize,
-    output_h: usize,
-    encoder_nv12_pitch: usize,
-    fps_num: u32,
-    fps_den: u32,
+    source: NativeVideoSourceProfile,
+    output: NativeVideoOutputProfile,
     mux_codec_hint: StreamingCodecHint,
 }
 
@@ -1251,50 +1370,49 @@ impl NativeDirectPlan {
         requested_codec: videoforge_engine::codecs::sys::cudaVideoCodec,
     ) -> Result<Self, String> {
         let output_path = job.resolved_output_path(NativeOutputPathStyle::DirectTemp);
-        tracing::info!(path = %job.input_path, "Probing input video dimensions");
-        let (input_w, input_h, _duration, fps, _, probed_codec) =
-            probe_video_coded_geometry(&job.input_path).map_err(|e| {
-                serde_json::to_string(&NativeUpscaleError::new("PROBE_FAILED", &e)).unwrap()
-            })?;
-        if probed_codec != requested_codec {
+        let source = NativeVideoSourceProfile::probe(&job.input_path)?;
+        if source.codec != requested_codec {
             tracing::warn!(
                 requested = ?requested_codec,
-                probed = ?probed_codec,
+                probed = ?source.codec,
                 "Native codec routing differed from ffprobe result; using probed codec for streamed demux"
             );
         }
 
-        let output_w = input_w.saturating_mul(job.scale as usize);
-        let output_h = input_h.saturating_mul(job.scale as usize);
-        let encoder_nv12_pitch = output_w.div_ceil(256) * 256;
-        let fps_num = (fps * 1000.0).round() as u32;
-        let fps_den = 1000u32;
+        let output = source.scaled_output(job.scale);
 
         tracing::info!(
-            input_w,
-            input_h,
-            output_w,
-            output_h,
-            encoder_nv12_pitch,
-            fps,
+            input_w = source.coded_width,
+            input_h = source.coded_height,
+            output_w = output.width,
+            output_h = output.height,
+            encoder_nv12_pitch = output.nv12_pitch,
+            fps = source.fps,
             "Video dimensions resolved"
         );
+
+        let mux_codec_hint = source.mux_codec_hint();
 
         Ok(Self {
             ffmpeg_cmd,
             output_path,
-            probed_codec,
-            output_w,
-            output_h,
-            encoder_nv12_pitch,
-            fps_num,
-            fps_den,
-            mux_codec_hint: StreamingCodecHint::new(match probed_codec {
-                videoforge_engine::codecs::sys::cudaVideoCodec::H264 => Some("h264"),
-                videoforge_engine::codecs::sys::cudaVideoCodec::HEVC => Some("hevc"),
-                _ => None,
-            }),
+            source,
+            output,
+            mux_codec_hint,
         })
+    }
+
+    fn nvenc_config(&self) -> videoforge_engine::codecs::nvenc::NvEncConfig {
+        self.output.nvenc_config()
+    }
+
+    fn pipeline_config(
+        &self,
+        model_precision: videoforge_engine::core::kernels::ModelPrecision,
+        inference_max_batch: usize,
+    ) -> videoforge_engine::engine::pipeline::PipelineConfig {
+        self.output
+            .pipeline_config(model_precision, inference_max_batch)
     }
 }
 
@@ -1358,7 +1476,7 @@ async fn run_engine_pipeline(
     let kernels = Arc::new(kernels);
 
     // ── Step 5: Create decoder with FFmpeg-streamed elementary source ────────
-    tracing::info!(path = %job.input_path, codec = ?plan.probed_codec, "Creating NVDEC decoder");
+    tracing::info!(path = %job.input_path, codec = ?plan.source.codec, "Creating NVDEC decoder");
     let model_prec = match backend
         .metadata()
         .map_err(|e| make_err("BACKEND_INIT", &format!("Model metadata unavailable: {}", e)))?
@@ -1367,25 +1485,15 @@ async fn run_engine_pipeline(
         videoforge_engine::core::types::PixelFormat::RgbPlanarF16 => ModelPrecision::F16,
         _ => ModelPrecision::F32,
     };
-    let source = FfmpegBitstreamSource::spawn(&plan.ffmpeg_cmd, &job.input_path, plan.probed_codec)
+    let source = FfmpegBitstreamSource::spawn(&plan.ffmpeg_cmd, &job.input_path, plan.source.codec)
         .map_err(|e| make_err("SOURCE_OPEN", &format!("Cannot stream elementary input: {}", e)))?;
-    let decoder = NvDecoder::new(ctx.clone(), Box::new(source), plan.probed_codec)
+    let decoder = NvDecoder::new(ctx.clone(), Box::new(source), plan.source.codec)
         .map_err(|e| make_err("DECODER_INIT", &format!("NVDEC decoder init failed: {}", e)))?;
 
     // ── Step 6: Create encoder with streaming FFmpeg mux sink ────────────────
     tracing::info!(path = %plan.output_path, "Creating NVENC encoder and mux sink");
 
-    let enc_config = NvEncConfig {
-        width: plan.output_w as u32,
-        height: plan.output_h as u32,
-        fps_num: plan.fps_num,
-        fps_den: plan.fps_den,
-        bitrate: 8_000_000,
-        max_bitrate: 0,
-        gop_length: 30,
-        b_frames: 0,
-        nv12_pitch: plan.encoder_nv12_pitch as u32,
-    };
+    let enc_config: NvEncConfig = plan.nvenc_config();
     let sink = StreamingMuxSink::new(
         &plan.ffmpeg_cmd,
         &plan.output_path,
@@ -1421,12 +1529,7 @@ async fn run_engine_pipeline(
     let encoder_detail = encoder.detail_handle();
 
     // ── Step 7: Run the pipeline ──────────────────────────────────────────────
-    let config = PipelineConfig {
-        model_precision: model_prec,
-        encoder_nv12_pitch: plan.encoder_nv12_pitch,
-        inference_max_batch: job.max_batch as usize,
-        ..PipelineConfig::default()
-    };
+    let config: PipelineConfig = plan.pipeline_config(model_prec, job.max_batch as usize);
     let pipeline = UpscalePipeline::new(ctx.clone(), kernels, config);
 
     tracing::info!("Running engine-v2 pipeline");
@@ -1892,14 +1995,10 @@ impl SoftwareBitstreamEncoder {
         ctx: Arc<videoforge_engine::core::context::GpuContext>,
         ffmpeg_cmd: &str,
         output_path: &Path,
-        width: u32,
-        height: u32,
-        fps_num: u32,
-        fps_den: u32,
+        output: &NativeVideoOutputProfile,
     ) -> videoforge_engine::error::Result<Self> {
         use std::process::{Command, Stdio};
 
-        let fps_den = fps_den.max(1);
         let codec = match output_path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -1921,9 +2020,9 @@ impl SoftwareBitstreamEncoder {
             .arg("-pix_fmt")
             .arg("nv12")
             .arg("-s:v")
-            .arg(format!("{width}x{height}"))
+            .arg(format!("{}x{}", output.width, output.height))
             .arg("-framerate")
-            .arg(format!("{fps_num}/{fps_den}"))
+            .arg(output.frame_rate_arg())
             .arg("-i")
             .arg("-")
             .arg("-an")
@@ -1953,8 +2052,8 @@ impl SoftwareBitstreamEncoder {
             child: Some(child),
             stdin: Some(stdin),
             ctx,
-            width: width as usize,
-            height: height as usize,
+            width: output.width,
+            height: output.height,
             tight_nv12: Vec::new(),
         })
     }
