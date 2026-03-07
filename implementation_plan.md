@@ -404,7 +404,7 @@
   - it isolates optimization within the current architecture and avoids mixing with file-boundary refactors
 
 ### PR 4: Direct Native Boundary Reduction
-- Status: `Not started`
+- Status: `Completed`
 - In scope:
   - reducing or replacing temp-file boundaries around direct native execution
   - matching error-handling and diagnostics to the new boundary model
@@ -425,37 +425,35 @@
 - Why this PR boundary is correct:
   - it is the largest-risk architectural change and should be reviewed separately from internal fixes
 
+#### Implementation Notes
+- Completed on: `2026-03-06`
+- What changed:
+  - Removed both direct-native temp-file boundaries in [`src-tauri/src/commands/native_engine.rs`](/C:/Users/Calvin/Desktop/VideoForge1/src-tauri/src/commands/native_engine.rs) by streaming FFmpeg demux stdout into `engine-v2` and streaming NVENC output into FFmpeg mux stdin.
+  - Hardened streamed mux/demux process diagnostics with bounded stderr capture and deterministic codec hinting.
+  - Fixed direct NVENC resource registration so the native path uses `encoder_mode="nvenc"` instead of the legacy staging fallback.
+  - Stabilized native output correctness and warm benchmarking on the streamed direct path.
+- Verification:
+  - warm cached direct-native benchmark and probe validation for `SPAN` and `Nomos`
+  - valid MP4 outputs with matching frame counts and `has_b_frames=0`
+  - direct-native policy validation in [`artifacts/benchmarks/native_policy`](/C:/Users/Calvin/Desktop/VideoForge1/artifacts/benchmarks/native_policy)
+- Follow-up:
+  - additional model validation and UI policy exposure are deferred, not blockers for the core native path
+
 ## Risks / Open Questions
 - It is still unclear how much of the temp-file architecture can be removed without broader mux/container changes.
 - Native performance tuning should wait until cleanup and accounting are trustworthy, otherwise benchmark data will be noisy or misleading.
 - If there are hidden operational dependencies on current temp-file retention, Phase 3 may need an explicit diagnostics design before implementation.
 
-## Next Steps
-- Scope: `model-aware native batching policy`
-- Goal: replace broad batching assumptions with explicit per-model defaults derived from current benchmark evidence.
+## Archived Status
+- State: `Core work complete; follow-ups deferred`
+- Summary:
+  - the direct `engine-v2` native path is stable, streamed, benchmarked, and uses model-aware default batching for validated models
+  - remaining work is optional productization and validation expansion, not a blocker for the completed core implementation
 
-### Planned Work
-- Define where native per-model batching policy lives.
-  - Prefer a small, explicit policy layer near native model discovery or native request setup.
-- Implement initial policy defaults from current evidence.
-  - Keep current CNN-style models such as `SPAN` at `batch=1` by default unless a longer representative benchmark shows a clear win.
-  - Allow higher default batching for validated transformer-family models where warm steady-state runs show material end-to-end improvement.
-- Narrow the current conservative transformer batching guard.
-  - Move from broad family-level assumptions toward validated per-model policy where possible.
-- Wire the policy into:
-  - native request path
-  - native benchmark path
-  - any user-facing model selection metadata that should expose the effective default
-- Verify with a short warm cached native benchmark set.
-  - same clip, `--trt-cache --warmup-runs 1`
-  - at minimum: `SPAN` and `Nomos`
-- Record resulting defaults and rationale in this file.
-
-### Acceptance Criteria
-- Native batching defaults are explicit rather than implicit.
-- `SPAN`-style CNN models do not default into a batch setting that provides no practical end-to-end benefit on current evidence.
-- Validated transformer models can use a higher default where it improves real warm-run throughput.
-- Benchmark and native request paths agree on the effective default policy.
+## Deferred Follow-Ups
+- Extend the validated runtime-batching allowlist only after warm cached direct-native benchmarks validate additional ONNX models.
+- Decide whether the frontend should surface `native_batch_policy` as read-only advanced info or as an override control.
+- Add native-request-level tests for policy resolution if we want stricter regression coverage beyond the current model metadata and backend allowlist tests.
 
 #### Implementation Notes
 - Completed on: `2026-03-06`
