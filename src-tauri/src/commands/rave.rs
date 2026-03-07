@@ -1,17 +1,9 @@
 use std::path::PathBuf;
 
-use crate::commands::native_engine::native_engine_runtime_enabled;
+use crate::commands::native_engine::{native_engine_runtime_enabled, workspace_root};
 use crate::rave_cli::{
     run_benchmark, run_upscale, run_validate, RaveCliConfig, RaveCliError, RaveResult,
 };
-
-fn workspace_root() -> Result<PathBuf, String> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .canonicalize()
-        .map_err(|e| format!("Failed to resolve workspace root: {e}"))?;
-    Ok(p)
-}
 
 fn default_profile() -> &'static str {
     if cfg!(debug_assertions) {
@@ -122,10 +114,52 @@ fn prepare_rave_cli_args(
     }
 
     let profile = resolve_profile()?;
-    let root = workspace_root()?;
+    let root = workspace_root().ok_or_else(|| "Failed to resolve workspace root".to_string())?;
     let config = RaveCliConfig::from_workspace_root(root);
     let args = ensure_profile_arg(args, &profile);
     Ok((config, args))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedRaveCliCommand {
+    config: RaveCliConfig,
+    args: Vec<String>,
+    strict_audit: bool,
+    mock_run: bool,
+}
+
+fn prepare_rave_cli_command(
+    args: Vec<String>,
+    strict_audit: bool,
+    mock_run: bool,
+    ui_opt_in: bool,
+    validate_max_batch: bool,
+) -> Result<PreparedRaveCliCommand, String> {
+    let (config, args) = prepare_rave_cli_args(args, ui_opt_in, validate_max_batch)?;
+    Ok(PreparedRaveCliCommand {
+        config,
+        args,
+        strict_audit,
+        mock_run,
+    })
+}
+
+pub(crate) fn prepare_rave_upscale_command(
+    args: Vec<String>,
+    strict_audit: bool,
+    mock_run: bool,
+    ui_opt_in: bool,
+) -> Result<PreparedRaveCliCommand, String> {
+    prepare_rave_cli_command(args, strict_audit, mock_run, ui_opt_in, true)
+}
+
+pub(crate) fn prepare_rave_benchmark_command(
+    args: Vec<String>,
+    strict_audit: bool,
+    mock_run: bool,
+    ui_opt_in: bool,
+) -> Result<PreparedRaveCliCommand, String> {
+    prepare_rave_cli_command(args, strict_audit, mock_run, ui_opt_in, true)
 }
 
 fn encode_rave_error(
@@ -286,7 +320,7 @@ pub async fn rave_validate(
     strict_audit: Option<bool>,
     mock_run: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    let root = workspace_root()?;
+    let root = workspace_root().ok_or_else(|| "Failed to resolve workspace root".to_string())?;
     let config = RaveCliConfig::from_workspace_root(root);
     let fixture_path = fixture
         .as_deref()
@@ -304,6 +338,32 @@ pub async fn rave_validate(
     .map_err(map_rave_error)?;
 
     Ok(res.json)
+}
+
+pub(crate) async fn run_prepared_rave_upscale(
+    prepared: PreparedRaveCliCommand,
+) -> Result<RaveResult, String> {
+    run_upscale(
+        &prepared.config,
+        &prepared.args,
+        prepared.strict_audit,
+        prepared.mock_run,
+    )
+    .await
+    .map_err(map_rave_error)
+}
+
+pub(crate) async fn run_prepared_rave_benchmark(
+    prepared: PreparedRaveCliCommand,
+) -> Result<RaveResult, String> {
+    run_benchmark(
+        &prepared.config,
+        &prepared.args,
+        prepared.strict_audit,
+        prepared.mock_run,
+    )
+    .await
+    .map_err(map_rave_error)
 }
 
 #[tauri::command]
@@ -329,12 +389,13 @@ pub async fn run_rave_upscale_internal(
     mock_run: bool,
     ui_opt_in: bool,
 ) -> Result<RaveResult, String> {
-    let (config, args) = prepare_rave_cli_args(args, ui_opt_in, true)?;
-    let res = run_upscale(&config, &args, strict_audit, mock_run)
-        .await
-        .map_err(map_rave_error)?;
-
-    Ok(res)
+    run_prepared_rave_upscale(prepare_rave_upscale_command(
+        args,
+        strict_audit,
+        mock_run,
+        ui_opt_in,
+    )?)
+    .await
 }
 
 pub async fn run_rave_benchmark_internal(
@@ -343,17 +404,20 @@ pub async fn run_rave_benchmark_internal(
     mock_run: bool,
     ui_opt_in: bool,
 ) -> Result<RaveResult, String> {
-    let (config, args) = prepare_rave_cli_args(args, ui_opt_in, true)?;
-    let res = run_benchmark(&config, &args, strict_audit, mock_run)
-        .await
-        .map_err(map_rave_error)?;
-
-    Ok(res)
+    run_prepared_rave_benchmark(prepare_rave_benchmark_command(
+        args,
+        strict_audit,
+        mock_run,
+        ui_opt_in,
+    )?)
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_exit_stderr, map_rave_error, validate_max_batch_arg};
+    use super::{
+        classify_exit_stderr, map_rave_error, prepare_rave_upscale_command, validate_max_batch_arg,
+    };
     use crate::rave_cli::RaveCliError;
 
     #[test]
@@ -416,6 +480,27 @@ mod tests {
             serde_json::from_str(&out).expect("mapped error should be JSON");
         assert_eq!(parsed["category"], "input_contract_error");
         assert!(parsed.get("next_action").is_some());
+    }
+
+    #[test]
+    fn prepared_upscale_command_injects_profile_once() {
+        let prepared = prepare_rave_upscale_command(
+            vec!["-i".to_string(), "input.mp4".to_string()],
+            true,
+            false,
+            true,
+        )
+        .expect("prepared command");
+
+        let profile_positions = prepared
+            .args
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, arg)| (arg == "--profile").then_some(idx))
+            .collect::<Vec<_>>();
+        assert_eq!(profile_positions.len(), 1);
+        let profile_idx = profile_positions[0];
+        assert!(prepared.args.get(profile_idx + 1).is_some());
     }
 }
 

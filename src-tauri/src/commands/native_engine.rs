@@ -24,11 +24,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "native_engine")]
 use std::collections::VecDeque;
-#[cfg(feature = "native_engine")]
-use std::path::PathBuf;
 #[cfg(feature = "native_engine")]
 use std::sync::Arc;
 #[cfg(feature = "native_engine")]
@@ -51,8 +49,7 @@ fn preload_windows_dll(path: &Path) {
     let _ = unsafe { LoadLibraryW(wide.as_ptr()) };
 }
 
-#[cfg(feature = "native_engine")]
-fn workspace_root() -> Option<PathBuf> {
+pub(crate) fn workspace_root() -> Option<PathBuf> {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .canonicalize()
@@ -74,8 +71,7 @@ fn prepend_path_dirs(dirs: &[PathBuf]) {
     }
 }
 
-#[cfg(feature = "native_engine")]
-fn find_file_under(root: &Path, file_name: &str, max_depth: usize) -> Option<PathBuf> {
+pub(crate) fn find_file_under(root: &Path, file_name: &str, max_depth: usize) -> Option<PathBuf> {
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
         if depth > max_depth {
@@ -95,16 +91,18 @@ fn find_file_under(root: &Path, file_name: &str, max_depth: usize) -> Option<Pat
     None
 }
 
-#[cfg(feature = "native_engine")]
-struct NativeRuntimeEnv {
-    ffmpeg_cmd: String,
+#[derive(Debug, Clone)]
+pub(crate) struct NativeRuntimePaths {
+    pub ffmpeg_cmd: String,
+    pub ffprobe_cmd: String,
+    pub path_additions: Vec<PathBuf>,
+    pub tensorrt_bin: Option<PathBuf>,
 }
 
-#[cfg(feature = "native_engine")]
-static NATIVE_RUNTIME_ENV: OnceLock<NativeRuntimeEnv> = OnceLock::new();
-
-#[cfg(feature = "native_engine")]
-fn discover_native_runtime_env() -> NativeRuntimeEnv {
+pub(crate) fn resolve_native_runtime_paths(
+    workspace_root: Option<&Path>,
+    extra_path_dir: Option<&Path>,
+) -> NativeRuntimePaths {
     let ffmpeg_exe = if cfg!(windows) {
         "ffmpeg.exe"
     } else {
@@ -119,7 +117,7 @@ fn discover_native_runtime_env() -> NativeRuntimeEnv {
     let mut ffmpeg_bin: Option<PathBuf> = None;
     let mut tensorrt_bin: Option<PathBuf> = None;
 
-    if let Some(root) = workspace_root() {
+    if let Some(root) = workspace_root {
         let known_ffmpeg = [
             root.join("third_party").join("ffmpeg").join("bin"),
             root.join("third_party").join("ffmpeg"),
@@ -151,19 +149,69 @@ fn discover_native_runtime_env() -> NativeRuntimeEnv {
         let known_trt = root.join("third_party").join("tensorrt");
         if known_trt.join("nvinfer_10.dll").exists() {
             tensorrt_bin = Some(known_trt);
-        } else if let Some(nvinfer) =
-            find_file_under(&root.join("third_party"), "nvinfer_10.dll", 4)
+        } else if let Some(nvinfer) = find_file_under(&root.join("third_party"), "nvinfer_10.dll", 4)
         {
             tensorrt_bin = nvinfer.parent().map(|p| p.to_path_buf());
         }
     }
 
     let mut path_additions = Vec::new();
-    if let Some(dir) = &ffmpeg_bin {
-        path_additions.push(dir.clone());
-    }
+    let mut push_unique = |path: PathBuf| {
+        if path.exists() && !path_additions.iter().any(|p| p == &path) {
+            path_additions.push(path);
+        }
+    };
+
     if let Some(dir) = &tensorrt_bin {
-        path_additions.push(dir.clone());
+        push_unique(dir.clone());
+    }
+    if let Some(dir) = &ffmpeg_bin {
+        push_unique(dir.clone());
+    }
+    if let Ok(vcpkg_root) = std::env::var("VCPKG_ROOT") {
+        push_unique(
+            PathBuf::from(vcpkg_root)
+                .join("installed")
+                .join("x64-windows")
+                .join("bin"),
+        );
+    }
+    push_unique(PathBuf::from(r"C:\tools\vcpkg\installed\x64-windows\bin"));
+    if let Some(extra_dir) = extra_path_dir {
+        push_unique(extra_dir.to_path_buf());
+    }
+
+    let ffmpeg_cmd = ffmpeg_bin
+        .as_ref()
+        .map(|bin| bin.join(ffmpeg_exe).to_string_lossy().to_string())
+        .unwrap_or_else(|| "ffmpeg".to_string());
+    let ffprobe_cmd = ffmpeg_bin
+        .as_ref()
+        .map(|bin| bin.join(ffprobe_exe).to_string_lossy().to_string())
+        .unwrap_or_else(|| "ffprobe".to_string());
+
+    NativeRuntimePaths {
+        ffmpeg_cmd,
+        ffprobe_cmd,
+        path_additions,
+        tensorrt_bin,
+    }
+}
+
+#[cfg(feature = "native_engine")]
+struct NativeRuntimeEnv {
+    ffmpeg_cmd: String,
+    ffprobe_cmd: String,
+}
+
+#[cfg(feature = "native_engine")]
+static NATIVE_RUNTIME_ENV: OnceLock<NativeRuntimeEnv> = OnceLock::new();
+
+#[cfg(feature = "native_engine")]
+fn discover_native_runtime_env() -> NativeRuntimeEnv {
+    let runtime_paths = resolve_native_runtime_paths(workspace_root().as_deref(), None);
+
+    if let Some(dir) = &runtime_paths.tensorrt_bin {
 
         #[cfg(windows)]
         {
@@ -208,23 +256,27 @@ fn discover_native_runtime_env() -> NativeRuntimeEnv {
             }
         }
     }
-    prepend_path_dirs(&path_additions);
+    prepend_path_dirs(&runtime_paths.path_additions);
 
-    let ffmpeg_cmd = if let Some(bin) = ffmpeg_bin {
-        bin.join(ffmpeg_exe).to_string_lossy().to_string()
-    } else {
-        "ffmpeg".to_string()
-    };
+    NativeRuntimeEnv {
+        ffmpeg_cmd: runtime_paths.ffmpeg_cmd,
+        ffprobe_cmd: runtime_paths.ffprobe_cmd,
+    }
+}
 
-    NativeRuntimeEnv { ffmpeg_cmd }
+#[cfg(feature = "native_engine")]
+fn native_runtime_env() -> &'static NativeRuntimeEnv {
+    NATIVE_RUNTIME_ENV.get_or_init(discover_native_runtime_env)
 }
 
 #[cfg(feature = "native_engine")]
 fn configure_native_runtime_env() -> String {
-    NATIVE_RUNTIME_ENV
-        .get_or_init(discover_native_runtime_env)
-        .ffmpeg_cmd
-        .clone()
+    native_runtime_env().ffmpeg_cmd.clone()
+}
+
+#[cfg(feature = "native_engine")]
+fn configure_native_probe_cmd() -> String {
+    native_runtime_env().ffprobe_cmd.clone()
 }
 
 #[cfg(feature = "native_engine")]
@@ -241,7 +293,8 @@ fn probe_video_coded_geometry(
     ),
     String,
 > {
-    let output = std::process::Command::new("ffprobe")
+    let ffprobe_cmd = configure_native_probe_cmd();
+    let output = std::process::Command::new(&ffprobe_cmd)
         .args([
             "-v",
             "error",
@@ -256,7 +309,7 @@ fn probe_video_coded_geometry(
             path,
         ])
         .output()
-        .map_err(|e| format!("ffprobe launch failed: {e}"))?;
+        .map_err(|e| format!("ffprobe launch failed via {ffprobe_cmd}: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -589,6 +642,33 @@ impl NativeExecutionRoute {
 }
 
 #[cfg(feature = "native_engine")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeRequestedExecutor {
+    Direct,
+    Cli,
+}
+
+#[cfg(feature = "native_engine")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeOutputPathStyle {
+    DirectTemp,
+    CliStable,
+}
+
+#[cfg(feature = "native_engine")]
+#[derive(Debug, Clone)]
+struct NativeCliInvocation {
+    output_path: String,
+    args: Vec<String>,
+}
+
+#[cfg(feature = "native_engine")]
+struct NativeCliExecutionPlan {
+    output_path: String,
+    prepared_command: crate::commands::rave::PreparedRaveCliCommand,
+}
+
+#[cfg(feature = "native_engine")]
 #[derive(Debug, Clone)]
 struct NativeJobSpec {
     input_path: String,
@@ -673,11 +753,18 @@ impl NativeJobSpec {
         })
     }
 
-    fn resolve_cli_output_path(&self) -> String {
+    fn resolved_output_path(&self, style: NativeOutputPathStyle) -> String {
         if !self.requested_output_path.trim().is_empty() {
             return self.requested_output_path.clone();
         }
 
+        match style {
+            NativeOutputPathStyle::CliStable => self.default_cli_output_path(),
+            NativeOutputPathStyle::DirectTemp => self.default_direct_output_path(),
+        }
+    }
+
+    fn default_cli_output_path(&self) -> String {
         let p = Path::new(&self.input_path);
         let stem = p
             .file_stem()
@@ -697,11 +784,7 @@ impl NativeJobSpec {
         }
     }
 
-    fn resolve_direct_output_path(&self) -> String {
-        if !self.requested_output_path.trim().is_empty() {
-            return self.requested_output_path.clone();
-        }
-
+    fn default_direct_output_path(&self) -> String {
         let stem = Path::new(&self.input_path)
             .file_stem()
             .unwrap_or_default()
@@ -714,14 +797,15 @@ impl NativeJobSpec {
         dir.join(file_name).to_string_lossy().to_string()
     }
 
-    fn build_cli_args(&self, resolved_output: &str) -> Vec<String> {
+    fn prepare_cli_invocation(&self) -> NativeCliInvocation {
+        let output_path = self.resolved_output_path(NativeOutputPathStyle::CliStable);
         let mut args = vec![
             "-i".to_string(),
             self.input_path.clone(),
             "-m".to_string(),
             self.model_path.clone(),
             "-o".to_string(),
-            resolved_output.to_string(),
+            output_path.clone(),
             "--precision".to_string(),
             self.precision.clone(),
             "--progress".to_string(),
@@ -731,7 +815,27 @@ impl NativeJobSpec {
             args.push("--max-batch".to_string());
             args.push(self.max_batch.to_string());
         }
-        args
+        NativeCliInvocation { output_path, args }
+    }
+
+    fn prepare_cli_execution(&self) -> Result<NativeCliExecutionPlan, String> {
+        let invocation = self.prepare_cli_invocation();
+        let prepared_command = crate::commands::rave::prepare_rave_upscale_command(
+            invocation.args,
+            true,
+            false,
+            true,
+        )?;
+        Ok(NativeCliExecutionPlan {
+            output_path: invocation.output_path,
+            prepared_command,
+        })
+    }
+
+    fn prepare_direct_plan(&self, ffmpeg_cmd: String) -> Result<NativeDirectPlan, String> {
+        use videoforge_engine::codecs::sys::cudaVideoCodec as CudaCodec;
+
+        NativeDirectPlan::prepare(self, ffmpeg_cmd, CudaCodec::H264)
     }
 
     fn base_perf(&self, frames_processed: u64) -> NativePerfReport {
@@ -923,20 +1027,23 @@ fn build_direct_perf_report(
 }
 
 #[cfg(feature = "native_engine")]
+fn requested_native_executor() -> NativeRequestedExecutor {
+    if native_engine_direct_enabled() {
+        NativeRequestedExecutor::Direct
+    } else {
+        NativeRequestedExecutor::Cli
+    }
+}
+
+#[cfg(feature = "native_engine")]
 async fn run_native_via_rave_cli(
     job: &NativeJobSpec,
     route: NativeExecutionRoute,
 ) -> Result<NativeUpscaleResult, String> {
     let make_err =
         |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
-    let resolved_output = job.resolve_cli_output_path();
-    let res = crate::commands::rave::run_rave_upscale_internal(
-        job.build_cli_args(&resolved_output),
-        true,
-        false,
-        true,
-    )
-    .await?;
+    let cli = job.prepare_cli_execution()?;
+    let res = crate::commands::rave::run_prepared_rave_upscale(cli.prepared_command).await?;
     let output = res
         .json
         .get("output")
@@ -948,6 +1055,13 @@ async fn run_native_via_rave_cli(
             )
         })?
         .to_string();
+    if output != cli.output_path {
+        tracing::warn!(
+            expected_output = %cli.output_path,
+            actual_output = %output,
+            "CLI-native returned an output path that differs from the prepared native job output"
+        );
+    }
 
     let perf = build_cli_perf_report(job, &res.json, res.progress.as_ref());
 
@@ -972,6 +1086,40 @@ fn should_fallback_to_rave_cli(err: &NativeUpscaleError) -> bool {
         && (err.message.contains("NVENC")
             || err.message.contains("nvEnc")
             || err.message.contains("Software fallback"))
+}
+
+#[cfg(feature = "native_engine")]
+async fn run_native_job(job: NativeJobSpec) -> Result<NativeUpscaleResult, String> {
+    match requested_native_executor() {
+        NativeRequestedExecutor::Direct => run_direct_with_fallback(job).await,
+        NativeRequestedExecutor::Cli => {
+            run_native_via_rave_cli(&job, NativeExecutionRoute::cli_requested()).await
+        }
+    }
+}
+
+#[cfg(feature = "native_engine")]
+async fn run_direct_with_fallback(job: NativeJobSpec) -> Result<NativeUpscaleResult, String> {
+    let direct_result = run_native_pipeline(&job).await;
+
+    match direct_result {
+        Ok(result) => Ok(result),
+        Err(err_json) => {
+            let Some(err) = decode_native_error(&err_json) else {
+                return Err(err_json);
+            };
+            if should_fallback_to_rave_cli(&err) {
+                tracing::warn!(
+                    code = %err.code,
+                    message = %err.message,
+                    "Direct native path failed; falling back to CLI-backed native path"
+                );
+                run_native_via_rave_cli(&job, NativeExecutionRoute::cli_fallback(&err)).await
+            } else {
+                Err(err_json)
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -1049,30 +1197,7 @@ pub async fn upscale_request_native(
             max_batch,
         )?;
 
-        if native_engine_direct_enabled() {
-            let direct_result = run_native_pipeline(job.clone()).await;
-
-            match direct_result {
-                Ok(result) => Ok(result),
-                Err(err_json) => {
-                    let Some(err) = decode_native_error(&err_json) else {
-                        return Err(err_json);
-                    };
-                    if should_fallback_to_rave_cli(&err) {
-                        tracing::warn!(
-                            code = %err.code,
-                            message = %err.message,
-                            "Direct native path failed; falling back to CLI-backed native path"
-                        );
-                        run_native_via_rave_cli(&job, NativeExecutionRoute::cli_fallback(&err)).await
-                    } else {
-                        Err(err_json)
-                    }
-                }
-            }
-        } else {
-            run_native_via_rave_cli(&job, NativeExecutionRoute::cli_requested()).await
-        }
+        run_native_job(job).await
     }
 }
 
@@ -1082,16 +1207,14 @@ pub async fn upscale_request_native(
 
 #[cfg(feature = "native_engine")]
 async fn run_native_pipeline(
-    job: NativeJobSpec,
+    job: &NativeJobSpec,
 ) -> Result<NativeUpscaleResult, String> {
-    use videoforge_engine::codecs::sys::cudaVideoCodec as CudaCodec;
-
     let ffmpeg_cmd = configure_native_runtime_env();
-    let output_path = job.resolve_direct_output_path();
+    let plan = job.prepare_direct_plan(ffmpeg_cmd)?;
 
     tracing::info!(
         input = %job.input_path,
-        output = %output_path,
+        output = %plan.output_path,
         model = %job.model_path,
         scale = job.scale,
         precision = %job.precision,
@@ -1101,20 +1224,84 @@ async fn run_native_pipeline(
 
     run_engine_pipeline(
         &job,
-        output_path,
-        ffmpeg_cmd,
-        CudaCodec::H264,
+        &plan,
     )
     .await
 }
 
 #[cfg(feature = "native_engine")]
-#[allow(clippy::too_many_arguments)] // TODO(clippy): this pipeline entry mirrors explicit stage inputs; keep stable for now.
+#[derive(Debug, Clone)]
+struct NativeDirectPlan {
+    ffmpeg_cmd: String,
+    output_path: String,
+    probed_codec: videoforge_engine::codecs::sys::cudaVideoCodec,
+    output_w: usize,
+    output_h: usize,
+    encoder_nv12_pitch: usize,
+    fps_num: u32,
+    fps_den: u32,
+    mux_codec_hint: StreamingCodecHint,
+}
+
+#[cfg(feature = "native_engine")]
+impl NativeDirectPlan {
+    fn prepare(
+        job: &NativeJobSpec,
+        ffmpeg_cmd: String,
+        requested_codec: videoforge_engine::codecs::sys::cudaVideoCodec,
+    ) -> Result<Self, String> {
+        let output_path = job.resolved_output_path(NativeOutputPathStyle::DirectTemp);
+        tracing::info!(path = %job.input_path, "Probing input video dimensions");
+        let (input_w, input_h, _duration, fps, _, probed_codec) =
+            probe_video_coded_geometry(&job.input_path).map_err(|e| {
+                serde_json::to_string(&NativeUpscaleError::new("PROBE_FAILED", &e)).unwrap()
+            })?;
+        if probed_codec != requested_codec {
+            tracing::warn!(
+                requested = ?requested_codec,
+                probed = ?probed_codec,
+                "Native codec routing differed from ffprobe result; using probed codec for streamed demux"
+            );
+        }
+
+        let output_w = input_w.saturating_mul(job.scale as usize);
+        let output_h = input_h.saturating_mul(job.scale as usize);
+        let encoder_nv12_pitch = output_w.div_ceil(256) * 256;
+        let fps_num = (fps * 1000.0).round() as u32;
+        let fps_den = 1000u32;
+
+        tracing::info!(
+            input_w,
+            input_h,
+            output_w,
+            output_h,
+            encoder_nv12_pitch,
+            fps,
+            "Video dimensions resolved"
+        );
+
+        Ok(Self {
+            ffmpeg_cmd,
+            output_path,
+            probed_codec,
+            output_w,
+            output_h,
+            encoder_nv12_pitch,
+            fps_num,
+            fps_den,
+            mux_codec_hint: StreamingCodecHint::new(match probed_codec {
+                videoforge_engine::codecs::sys::cudaVideoCodec::H264 => Some("h264"),
+                videoforge_engine::codecs::sys::cudaVideoCodec::HEVC => Some("hevc"),
+                _ => None,
+            }),
+        })
+    }
+}
+
+#[cfg(feature = "native_engine")]
 async fn run_engine_pipeline(
     job: &NativeJobSpec,
-    final_output: String,
-    ffmpeg_cmd: String,
-    codec: videoforge_engine::codecs::sys::cudaVideoCodec,
+    plan: &NativeDirectPlan,
 ) -> Result<NativeUpscaleResult, String> {
     use std::sync::Arc;
 
@@ -1129,36 +1316,6 @@ async fn run_engine_pipeline(
     let make_err =
         |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
     let started = std::time::Instant::now();
-
-    // ── Step 1.5: Probe input for dimensions ──────────────────────────────────
-    // encoder_nv12_pitch and encoder width/height must be set before
-    // UpscalePipeline::new() — the pipeline asserts pitch > 0.
-    tracing::info!(path = %job.input_path, "Probing input video dimensions");
-    let (input_w, input_h, _duration, fps, _, probed_codec) = probe_video_coded_geometry(&job.input_path)
-        .map_err(|e| make_err("PROBE_FAILED", &e))?;
-    if probed_codec != codec {
-        tracing::warn!(
-            requested = ?codec,
-            probed = ?probed_codec,
-            "Native codec routing differed from ffprobe result; using probed codec for streamed demux"
-        );
-    }
-    let output_w = input_w.saturating_mul(job.scale as usize);
-    let output_h = input_h.saturating_mul(job.scale as usize);
-    // NV12 row stride must be 256-byte aligned (NVENC hardware requirement).
-    let encoder_nv12_pitch = output_w.div_ceil(256) * 256;
-    // Express fps as a rational with 1000 as denominator — handles 23.976, 29.97, etc.
-    let fps_num = (fps * 1000.0).round() as u32;
-    let fps_den = 1000u32;
-    tracing::info!(
-        input_w,
-        input_h,
-        output_w,
-        output_h,
-        encoder_nv12_pitch,
-        fps,
-        "Video dimensions resolved"
-    );
 
     // ── Step 2: Initialise GPU context ────────────────────────────────────────
     tracing::info!("Initialising GPU context (device 0)");
@@ -1201,7 +1358,7 @@ async fn run_engine_pipeline(
     let kernels = Arc::new(kernels);
 
     // ── Step 5: Create decoder with FFmpeg-streamed elementary source ────────
-    tracing::info!(path = %job.input_path, codec = ?probed_codec, "Creating NVDEC decoder");
+    tracing::info!(path = %job.input_path, codec = ?plan.probed_codec, "Creating NVDEC decoder");
     let model_prec = match backend
         .metadata()
         .map_err(|e| make_err("BACKEND_INIT", &format!("Model metadata unavailable: {}", e)))?
@@ -1210,36 +1367,31 @@ async fn run_engine_pipeline(
         videoforge_engine::core::types::PixelFormat::RgbPlanarF16 => ModelPrecision::F16,
         _ => ModelPrecision::F32,
     };
-    let source = FfmpegBitstreamSource::spawn(&ffmpeg_cmd, &job.input_path, probed_codec)
+    let source = FfmpegBitstreamSource::spawn(&plan.ffmpeg_cmd, &job.input_path, plan.probed_codec)
         .map_err(|e| make_err("SOURCE_OPEN", &format!("Cannot stream elementary input: {}", e)))?;
-    let decoder = NvDecoder::new(ctx.clone(), Box::new(source), probed_codec)
+    let decoder = NvDecoder::new(ctx.clone(), Box::new(source), plan.probed_codec)
         .map_err(|e| make_err("DECODER_INIT", &format!("NVDEC decoder init failed: {}", e)))?;
 
     // ── Step 6: Create encoder with streaming FFmpeg mux sink ────────────────
-    tracing::info!(path = %final_output, "Creating NVENC encoder and mux sink");
+    tracing::info!(path = %plan.output_path, "Creating NVENC encoder and mux sink");
 
     let enc_config = NvEncConfig {
-        width: output_w as u32,
-        height: output_h as u32,
-        fps_num,
-        fps_den,
+        width: plan.output_w as u32,
+        height: plan.output_h as u32,
+        fps_num: plan.fps_num,
+        fps_den: plan.fps_den,
         bitrate: 8_000_000,
         max_bitrate: 0,
         gop_length: 30,
         b_frames: 0,
-        nv12_pitch: encoder_nv12_pitch as u32,
+        nv12_pitch: plan.encoder_nv12_pitch as u32,
     };
-    let mux_codec_hint = StreamingCodecHint::new(match probed_codec {
-        videoforge_engine::codecs::sys::cudaVideoCodec::H264 => Some("h264"),
-        videoforge_engine::codecs::sys::cudaVideoCodec::HEVC => Some("hevc"),
-        _ => None,
-    });
     let sink = StreamingMuxSink::new(
-        &ffmpeg_cmd,
-        &final_output,
+        &plan.ffmpeg_cmd,
+        &plan.output_path,
         &job.input_path,
         job.preserve_audio,
-        mux_codec_hint.clone(),
+        plan.mux_codec_hint.clone(),
     )
         .map_err(|e| make_err("SINK_OPEN", &format!("Cannot create mux stream: {}", e)))?;
     // NvEncoder::new takes (raw_cuda_context: *mut c_void, sink, config).
@@ -1257,12 +1409,12 @@ async fn run_engine_pipeline(
         .map_err(|e| make_err("ENCODER_INIT", &format!("cuCtxGetCurrent failed: {}", e)))?;
     let encoder = NativeVideoEncoderWrapper::new(
         ctx.clone(),
-        ffmpeg_cmd.clone(),
+        plan.ffmpeg_cmd.clone(),
         cuda_ctx,
         Box::new(sink),
         enc_config,
-        PathBuf::from(&final_output),
-        mux_codec_hint,
+        PathBuf::from(&plan.output_path),
+        plan.mux_codec_hint.clone(),
     )
     .map_err(|e| make_err("ENCODER_INIT", &format!("Encoder init failed: {}", e)))?;
     let encoder_mode = encoder.mode_handle();
@@ -1271,7 +1423,7 @@ async fn run_engine_pipeline(
     // ── Step 7: Run the pipeline ──────────────────────────────────────────────
     let config = PipelineConfig {
         model_precision: model_prec,
-        encoder_nv12_pitch,
+        encoder_nv12_pitch: plan.encoder_nv12_pitch,
         inference_max_batch: job.max_batch as usize,
         ..PipelineConfig::default()
     };
@@ -1321,10 +1473,10 @@ async fn run_engine_pipeline(
         "engine-v2 pipeline complete"
     );
 
-    tracing::info!(output = %final_output, "Native engine upscale complete");
+    tracing::info!(output = %plan.output_path, "Native engine upscale complete");
 
     Ok(job.build_result(
-        final_output,
+        plan.output_path.clone(),
         "native_v2",
         encoder_mode,
         encoder_detail,
@@ -1391,7 +1543,7 @@ impl SharedStderrTail {
 }
 
 #[cfg(feature = "native_engine")]
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 struct StreamingCodecHint(Arc<Mutex<Option<&'static str>>>);
 
 #[cfg(feature = "native_engine")]

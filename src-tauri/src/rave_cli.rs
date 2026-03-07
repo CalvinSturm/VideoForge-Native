@@ -1,9 +1,9 @@
 use serde_json::Value;
-use std::collections::HashSet;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
+
+use crate::commands::native_engine::resolve_native_runtime_paths;
 
 #[derive(Debug, Clone)]
 pub struct RaveCliConfig {
@@ -59,50 +59,19 @@ impl RaveCliConfig {
 }
 
 fn prepend_runtime_path(cmd: &mut Command, workspace_root: &Path, bin_path: &Path) {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-
-    let mut push_dir = |p: PathBuf| {
-        if p.exists() && seen.insert(p.clone()) {
-            dirs.push(p);
-        }
-    };
-
-    push_dir(workspace_root.join("third_party").join("tensorrt"));
-    push_dir(
-        workspace_root
-            .join("third_party")
-            .join("ffmpeg")
-            .join("bin"),
-    );
-    push_dir(workspace_root.join("third_party").join("ffmpeg"));
-
-    if let Ok(vcpkg_root) = env::var("VCPKG_ROOT") {
-        push_dir(
-            PathBuf::from(vcpkg_root)
-                .join("installed")
-                .join("x64-windows")
-                .join("bin"),
-        );
-    }
-    push_dir(PathBuf::from(r"C:\tools\vcpkg\installed\x64-windows\bin"));
-
-    if let Some(parent) = bin_path.parent() {
-        push_dir(parent.to_path_buf());
-    }
-
-    if dirs.is_empty() {
+    let runtime = resolve_native_runtime_paths(Some(workspace_root), bin_path.parent());
+    if runtime.path_additions.is_empty() {
         return;
     }
 
     let mut merged = String::new();
-    for d in &dirs {
+    for d in &runtime.path_additions {
         if !merged.is_empty() {
             merged.push(';');
         }
         merged.push_str(&d.to_string_lossy());
     }
-    if let Ok(existing) = env::var("PATH") {
+    if let Ok(existing) = std::env::var("PATH") {
         if !existing.is_empty() {
             merged.push(';');
             merged.push_str(&existing);
@@ -139,6 +108,20 @@ pub enum RaveCliError {
     Exit { status: i32, stderr: String },
     #[error("rave-cli --json contract violated: {0}")]
     JsonContract(String),
+}
+
+#[cfg(test)]
+mod runtime_path_tests {
+    use super::*;
+    use crate::commands::native_engine::workspace_root;
+
+    #[test]
+    fn runtime_path_resolver_keeps_cli_bin_dir() {
+        let root = workspace_root().expect("workspace root");
+        let fake_bin = root.join("third_party").join("rave").join("target").join("release");
+        let runtime = resolve_native_runtime_paths(Some(&root), Some(&fake_bin));
+        assert!(runtime.path_additions.iter().any(|p| p == &fake_bin));
+    }
 }
 
 pub async fn run_validate(
