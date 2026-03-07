@@ -779,7 +779,9 @@ async fn check_e2e_native(
     native_direct: bool,
     keep_temp: bool,
 ) -> bool {
-    use app_lib::commands::native_engine::{run_native_tool_request, NativeToolRunRequest};
+    use app_lib::commands::native_engine::{
+        native_result_summary_lines, run_native_tool_request, NativeToolRunRequest,
+    };
 
     // A) Input prereq checks
     if !std::path::Path::new(input_path).exists() {
@@ -838,45 +840,19 @@ async fn check_e2e_native(
         }
     };
 
+    let summary_lines = native_result_summary_lines(&report);
     check(
         "Native pipeline completed",
         true,
-        &format!(
-            "frames={} encoder_mode={} encoder_detail={}",
-            report.perf.frames_processed,
-            report.encoder_mode,
-            report.encoder_detail.as_deref().unwrap_or("none")
-        ),
+        summary_lines.first().map(String::as_str).unwrap_or("native result"),
     );
-    println!("  → encoder mode: {}", report.encoder_mode);
-    if let Some(detail) = &report.encoder_detail {
-        println!("  → encoder detail: {}", detail);
-        println!("  encoder_detail={}", detail);
-    }
-    if let Some(elapsed_ms) = report.perf.total_elapsed_ms {
-        println!("  → native elapsed ms: {}", elapsed_ms);
-    }
-    if let Some(vram_peak_mb) = report.perf.vram_peak_mb {
-        println!("  → native peak vram mb: {}", vram_peak_mb);
-    }
-    if let Some(requested) = &report.perf.requested_executor {
-        println!("  → requested executor: {}", requested);
-    }
-    if let Some(executed) = &report.perf.executed_executor {
-        println!("  → executed executor: {}", executed);
-    }
-    if report.perf.fallback_used {
-        println!(
-            "  → fallback: {} {}",
-            report.perf.fallback_reason_code.as_deref().unwrap_or("unknown"),
-            report
-                .perf
-                .fallback_reason_message
-                .as_deref()
-                .unwrap_or("no message")
-        );
+    for line in summary_lines.iter().skip(1) {
+        println!("  → {line}");
     }
     println!("  encoder_mode={}", report.encoder_mode);
+    if let Some(detail) = &report.encoder_detail {
+        println!("  encoder_detail={}", detail);
+    }
     let actual_out = &report.output_path;
 
     // C) Validate output

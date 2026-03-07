@@ -584,6 +584,210 @@ pub async fn run_native_tool_request(
     .await
 }
 
+#[cfg(feature = "native_engine")]
+pub fn native_result_summary_json(report: &NativeUpscaleResult) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::{Map, Value};
+
+    let mut map = Map::new();
+    map.insert("output".to_string(), Value::String(report.output_path.clone()));
+    map.insert("engine".to_string(), Value::String(report.engine.clone()));
+    map.insert("encoder_mode".to_string(), Value::String(report.encoder_mode.clone()));
+    map.insert(
+        "encoder_detail".to_string(),
+        report
+            .encoder_detail
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    map.insert(
+        "audio_preserved".to_string(),
+        Value::Bool(report.audio_preserved),
+    );
+    map.insert(
+        "requested_executor".to_string(),
+        report
+            .perf
+            .requested_executor
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    map.insert(
+        "executed_executor".to_string(),
+        report
+            .perf
+            .executed_executor
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    map.insert(
+        "direct_attempted".to_string(),
+        Value::Bool(report.perf.direct_attempted),
+    );
+    map.insert(
+        "fallback_used".to_string(),
+        Value::Bool(report.perf.fallback_used),
+    );
+    map.insert(
+        "fallback_reason_code".to_string(),
+        report
+            .perf
+            .fallback_reason_code
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    map.insert(
+        "fallback_reason_message".to_string(),
+        report
+            .perf
+            .fallback_reason_message
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    map.insert(
+        "frames_processed".to_string(),
+        Value::from(report.perf.frames_processed),
+    );
+    map.insert(
+        "native_total_elapsed_ms".to_string(),
+        report
+            .perf
+            .total_elapsed_ms
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+    map.insert(
+        "frames_decoded".to_string(),
+        report.perf.frames_decoded.map(Value::from).unwrap_or(Value::Null),
+    );
+    map.insert(
+        "frames_preprocessed".to_string(),
+        report
+            .perf
+            .frames_preprocessed
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+    map.insert(
+        "frames_inferred".to_string(),
+        report.perf.frames_inferred.map(Value::from).unwrap_or(Value::Null),
+    );
+    map.insert(
+        "frames_encoded".to_string(),
+        report.perf.frames_encoded.map(Value::from).unwrap_or(Value::Null),
+    );
+    map.insert(
+        "preprocess_avg_us".to_string(),
+        report.perf.preprocess_avg_us.map(Value::from).unwrap_or(Value::Null),
+    );
+    map.insert(
+        "inference_frame_avg_us".to_string(),
+        report
+            .perf
+            .inference_frame_avg_us
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+    map.insert(
+        "inference_dispatch_avg_us".to_string(),
+        report
+            .perf
+            .inference_dispatch_avg_us
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+    map.insert(
+        "postprocess_frame_avg_us".to_string(),
+        report
+            .perf
+            .postprocess_frame_avg_us
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+    map.insert(
+        "postprocess_dispatch_avg_us".to_string(),
+        report
+            .perf
+            .postprocess_dispatch_avg_us
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+    map.insert(
+        "encode_avg_us".to_string(),
+        report.perf.encode_avg_us.map(Value::from).unwrap_or(Value::Null),
+    );
+    map.insert(
+        "vram_current_mb".to_string(),
+        report.perf.vram_current_mb.map(Value::from).unwrap_or(Value::Null),
+    );
+    map.insert(
+        "vram_peak_mb".to_string(),
+        report.perf.vram_peak_mb.map(Value::from).unwrap_or(Value::Null),
+    );
+    map.insert(
+        "effective_max_batch".to_string(),
+        Value::from(report.perf.effective_max_batch),
+    );
+    map.insert(
+        "trt_cache_enabled".to_string(),
+        Value::Bool(report.perf.trt_cache_enabled),
+    );
+    map.insert(
+        "trt_cache_dir".to_string(),
+        report
+            .perf
+            .trt_cache_dir
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    map
+}
+
+#[cfg(feature = "native_engine")]
+pub fn native_result_summary_lines(report: &NativeUpscaleResult) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "frames={} encoder_mode={} encoder_detail={}",
+            report.perf.frames_processed,
+            report.encoder_mode,
+            report.encoder_detail.as_deref().unwrap_or("none")
+        ),
+    ];
+    if let Some(elapsed_ms) = report.perf.total_elapsed_ms {
+        lines.push(format!("native elapsed ms: {elapsed_ms}"));
+    }
+    if let Some(vram_peak_mb) = report.perf.vram_peak_mb {
+        lines.push(format!("native peak vram mb: {vram_peak_mb}"));
+    }
+    if let Some(requested) = &report.perf.requested_executor {
+        lines.push(format!("requested executor: {requested}"));
+    }
+    if let Some(executed) = &report.perf.executed_executor {
+        lines.push(format!("executed executor: {executed}"));
+    }
+    if report.perf.fallback_used {
+        lines.push(format!(
+            "fallback: {} {}",
+            report
+                .perf
+                .fallback_reason_code
+                .as_deref()
+                .unwrap_or("unknown"),
+            report
+                .perf
+                .fallback_reason_message
+                .as_deref()
+                .unwrap_or("no message")
+        ));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

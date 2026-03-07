@@ -6,7 +6,9 @@ use std::time::Instant;
 
 use app_lib::commands::upscale::{run_upscale_job, JobProgress, JobProgressFn, UpscaleJobConfig};
 #[cfg(feature = "native_engine")]
-use app_lib::commands::native_engine::{run_native_tool_request, NativeToolRunRequest};
+use app_lib::commands::native_engine::{
+    native_result_summary_json, run_native_tool_request, NativeToolRunRequest,
+};
 use app_lib::control::ResearchConfig;
 use app_lib::edit_config::EditConfig;
 use app_lib::models;
@@ -250,37 +252,14 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
         .await
         {
             Ok(report) => {
-                emit_json(json!({
-                    "event": "warmup_done",
-                    "index": warmup_idx + 1,
-                    "elapsed_ms": warmup_started.elapsed().as_millis(),
-                    "engine": report.engine,
-                    "encoder_mode": report.encoder_mode,
-                    "requested_executor": report.perf.requested_executor,
-                    "executed_executor": report.perf.executed_executor,
-                    "direct_attempted": report.perf.direct_attempted,
-                    "fallback_used": report.perf.fallback_used,
-                    "fallback_reason_code": report.perf.fallback_reason_code,
-                    "fallback_reason_message": report.perf.fallback_reason_message,
-                    "frames_processed": report.perf.frames_processed,
-                    "native_total_elapsed_ms": report.perf.total_elapsed_ms,
-                    "frames_decoded": report.perf.frames_decoded,
-                    "frames_preprocessed": report.perf.frames_preprocessed,
-                    "frames_inferred": report.perf.frames_inferred,
-                    "frames_encoded": report.perf.frames_encoded,
-                    "preprocess_avg_us": report.perf.preprocess_avg_us,
-                    "inference_frame_avg_us": report.perf.inference_frame_avg_us,
-                    "inference_dispatch_avg_us": report.perf.inference_dispatch_avg_us,
-                    "postprocess_frame_avg_us": report.perf.postprocess_frame_avg_us,
-                    "postprocess_dispatch_avg_us": report.perf.postprocess_dispatch_avg_us,
-                    "encode_avg_us": report.perf.encode_avg_us,
-                    "vram_current_mb": report.perf.vram_current_mb,
-                    "vram_peak_mb": report.perf.vram_peak_mb,
-                    "effective_max_batch": report.perf.effective_max_batch,
-                    "trt_cache_enabled": report.perf.trt_cache_enabled,
-                    "trt_cache_dir": report.perf.trt_cache_dir,
-                    "output": report.output_path,
-                }));
+                let mut payload = native_result_summary_json(&report);
+                payload.insert("event".to_string(), json!("warmup_done"));
+                payload.insert("index".to_string(), json!(warmup_idx + 1));
+                payload.insert(
+                    "elapsed_ms".to_string(),
+                    json!(warmup_started.elapsed().as_millis()),
+                );
+                emit_json(serde_json::Value::Object(payload));
                 let _ = std::fs::remove_file(&warmup_output);
             }
             Err(message) => emit_error_and_exit(&message),
@@ -288,42 +267,16 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
     }
 
     match run_native_once(args, precision, onnx_model, &args.output).await {
-        Ok(report) => emit_json(json!({
-            "event": "done",
-            "output": report.output_path,
-            "elapsed_ms": started.elapsed().as_millis(),
-            "frames_processed": report.perf.frames_processed,
-            "requested_executor": report.perf.requested_executor,
-            "executed_executor": report.perf.executed_executor,
-            "direct_attempted": report.perf.direct_attempted,
-            "fallback_used": report.perf.fallback_used,
-            "fallback_reason_code": report.perf.fallback_reason_code,
-            "fallback_reason_message": report.perf.fallback_reason_message,
-            "native_total_elapsed_ms": report.perf.total_elapsed_ms,
-            "frames_decoded": report.perf.frames_decoded,
-            "frames_preprocessed": report.perf.frames_preprocessed,
-            "frames_inferred": report.perf.frames_inferred,
-            "frames_encoded": report.perf.frames_encoded,
-            "preprocess_avg_us": report.perf.preprocess_avg_us,
-            "inference_frame_avg_us": report.perf.inference_frame_avg_us,
-            "inference_dispatch_avg_us": report.perf.inference_dispatch_avg_us,
-            "postprocess_frame_avg_us": report.perf.postprocess_frame_avg_us,
-            "postprocess_dispatch_avg_us": report.perf.postprocess_dispatch_avg_us,
-            "encode_avg_us": report.perf.encode_avg_us,
-            "vram_current_mb": report.perf.vram_current_mb,
-            "vram_peak_mb": report.perf.vram_peak_mb,
-            "engine": report.engine,
-            "encoder_mode": report.encoder_mode,
-            "encoder_detail": report.encoder_detail,
-            "audio_preserved": report.audio_preserved,
-            "trt_cache_enabled": report.perf.trt_cache_enabled,
-            "trt_cache_dir": report.perf.trt_cache_dir,
-            "mode": "native",
-            "native_direct": args.native_direct,
-            "requested_max_batch": args.max_batch,
-            "effective_max_batch": report.perf.effective_max_batch,
-            "warmup_runs": args.warmup_runs,
-        })),
+        Ok(report) => {
+            let mut payload = native_result_summary_json(&report);
+            payload.insert("event".to_string(), json!("done"));
+            payload.insert("elapsed_ms".to_string(), json!(started.elapsed().as_millis()));
+            payload.insert("mode".to_string(), json!("native"));
+            payload.insert("native_direct".to_string(), json!(args.native_direct));
+            payload.insert("requested_max_batch".to_string(), json!(args.max_batch));
+            payload.insert("warmup_runs".to_string(), json!(args.warmup_runs));
+            emit_json(serde_json::Value::Object(payload));
+        }
         Err(message) => emit_error_and_exit(&message),
     }
 }
