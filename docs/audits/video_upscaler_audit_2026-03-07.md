@@ -1,5 +1,11 @@
 # Video Upscaler Audit
 
+Status: Reference snapshot
+Created: 2026-03-07
+Scope: Cross-engine workspace audit for the Python path, native direct path, and native-cli adapter
+Use this for: Architecture review, bottleneck review, and planning context
+Do not use this for: Current execution status or resume-point tracking
+
 ## 1. Executive summary
 - Current architecture summary:
   - The application has two real engine families: a Python sidecar pipeline (`src-tauri/src/commands/upscale.rs`, `python/shm_worker.py`, `src-tauri/src/video_pipeline.rs`) and a native GPU pipeline exposed through `upscale_request_native` (`src-tauri/src/commands/native_engine.rs`, `engine-v2/`).

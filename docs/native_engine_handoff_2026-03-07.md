@@ -135,14 +135,12 @@ Notes:
 
 Tracked working tree should be clean after `e8e032a`.
 
-Untracked items expected in repo root:
+Untracked items expected at handoff time:
 
-- `VIDEO_UPSCALER_AUDIT.md`
-- `VIDEO_UPSCALER_PATCH_PLAN.md`
-- `VIDEO_UPSCALER_BENCHMARK_PLAN.md`
+- cross-engine audit/planning markdown files
 - `artifacts/`
 
-These were intentionally excluded from native refactor commits.
+Those audit/planning docs were intentionally excluded from the native refactor commits at the time of handoff.
 
 ## Strongest Current Architectural Conclusion
 

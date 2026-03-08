@@ -19,25 +19,27 @@
 
 ---
 
-## RAVE Integration Docs
+## Current Docs
 
-- `docs/VIDEOFORGE_2_WEEK_EXECUTION_PLAN.md` — execution plan for `rave-*` integration.
-- `docs/WINDOWS_RAVE_RUNTIME.md` — Windows runtime setup, commands, and troubleshooting for RAVE.
-- `docs/CI_GPU_STABILIZATION_CHECKLIST.md` — GPU CI stabilization, threshold calibration, and release signoff.
-- `docs/RELEASE_SIGNOFF.md` — release signoff record template and required gate evidence.
+- [`docs/README.md`](docs/README.md) — entrypoint for current docs and status references.
+- [`implementation_plan.md`](implementation_plan.md) — native engine execution tracker and archived status summary.
+- [`docs/native_engine_handoff_2026-03-07.md`](docs/native_engine_handoff_2026-03-07.md) — latest native-only handoff and recommended next steps.
+- [`docs/audits/video_upscaler_audit_2026-03-07.md`](docs/audits/video_upscaler_audit_2026-03-07.md) — workspace audit and bottleneck review.
+- [`docs/plans/video_upscaler_patch_plan_2026-03-07.md`](docs/plans/video_upscaler_patch_plan_2026-03-07.md) — PR-shaped cleanup and measurement plan.
+- [`docs/plans/video_upscaler_benchmark_plan_2026-03-07.md`](docs/plans/video_upscaler_benchmark_plan_2026-03-07.md) — benchmark policy and fixture plan.
 
 ---
 
 ## Overview
 
-VideoForge is a high-performance desktop application for AI-powered image and video upscaling. It runs entirely on your local machine — no cloud, no uploads, no data leaves your GPU. The app combines a Rust orchestration layer, a Python AI inference engine, and a professional React-based UI into a zero-copy pipeline that decodes, upscales, and encodes video frames with minimal overhead.
+VideoForge is a local-first desktop application for AI-powered image and video upscaling. It combines a Rust orchestration layer, a Python inference engine, and an optional native Rust video engine behind a Tauri desktop app and React UI.
 
 ### Core Philosophy
 
 - **Privacy First** — All processing happens locally on your GPU. No network calls, no telemetry.
 - **Determinism** — Supported models (RCAN, EDSR) produce bit-identical output across runs. GAN models (RealESRGAN) are clearly labeled as non-deterministic.
 - **User Authority** — Full control over trim, crop, color grading, model selection, and precision mode. Preview before you commit.
-- **Zero-Copy Pipeline** — Frames flow through shared memory between decoder → AI engine → encoder with no serialization overhead.
+- **Engine Flexibility** — Video jobs can run through the Python worker path or the opt-in native `engine-v2` path, depending on model/runtime eligibility.
 
 ---
 
@@ -51,7 +53,7 @@ VideoForge is a high-performance desktop application for AI-powered image and vi
 | **Research Layer** | Multi-model blending, frequency band analysis, hallucination detection, spatial routing |
 | **Auto Grading** | Histogram analysis, white balance correction, noise estimation, skin tone detection |
 | **Precision Modes** | FP32, FP16, and deterministic (forces `cudnn.deterministic`, disables TF32) |
-| **Job Queue** | Batch processing with per-job progress, ETA estimation, pause/resume controls |
+| **Job Queue** | Batch processing with per-job progress and ETA estimation |
 | **Professional UI** | Tiled mosaic layout (react-mosaic), video preview with crop overlay, interactive timeline |
 
 ---
@@ -91,14 +93,14 @@ VideoForge is a high-performance desktop application for AI-powered image and vi
                                  └─ auto_grade_analysis.py ── Auto color grading
 ```
 
-### Engine v2 (Next-Gen GPU-Native Pipeline)
+### Engine v2 (GPU-Native Video Path)
 
-A second-generation engine is in active development at `engine-v2/`. It targets a fully GPU-resident pipeline:
+`engine-v2/` is the native video engine used by the opt-in native path:
 
 - **NVDEC → CUDA Preprocessing → TensorRT/ONNX Inference → NVENC** — no CPU round-trips
 - CUDA custom kernels for NV12↔RGB conversion, scaling, and format transforms
 - RAII-based VRAM management with bucketed buffer pools
-- Async multi-threaded reactor (decode / infer / encode on dedicated threads)
+- Streamed FFmpeg demux/mux boundaries in the current direct-native host path
 
 ---
 
@@ -149,7 +151,7 @@ Model weights are loaded from the `weights/` directory and scanned automatically
 - **Software:**
   - [Node.js](https://nodejs.org/) ≥ 18
   - [Rust](https://rustup.rs/) (stable toolchain)
-  - [FFmpeg & FFprobe](https://ffmpeg.org/) in `PATH`
+  - [FFmpeg & FFprobe](https://ffmpeg.org/) available either in `PATH` or in supported repo/runtime locations discovered by the native runtime helpers
   - Python 3.10+ (bundled or installed to `%APPDATA%/VideoForge/python/`)
 
 ---
@@ -267,35 +269,31 @@ VideoForge/
 
 - **Windows-primary**: Python runtime resolves to `%APPDATA%/Local/VideoForge/python/` in distribution builds. Development uses local venvs.
 - **NVIDIA GPU required**: CUDA 11.7+ with NVENC support for hardware encoding.
-- **FFmpeg must be in PATH**: Both `ffmpeg` and `ffprobe` are invoked as subprocesses.
+- **Native engine is opt-in**: build with `--features native_engine` and enable `VIDEOFORGE_ENABLE_NATIVE_ENGINE=1` at runtime.
 - **Model weights** are scanned from `weights/` directories relative to the installation path.
 
 ---
 
-## Roadmap
+## Status
 
-The next-generation engine (`engine-v2`) follows a 10-phase roadmap:
+Current repo state, based on the checked-in native planning docs:
 
-| Phase | Goal | Status |
-|-------|------|--------|
-| **0** | Research & NVDEC/NVENC prototyping | ✅ Complete |
-| **1** | CLI entrypoint, engine bootstrap, capability validation | 🔧 In Progress |
-| **2** | NVDEC/NVENC codec integration | 🔧 In Progress |
-| **3** | TensorRT/ONNX backend model support | 🔧 In Progress |
-| **4** | VRAM management & bucketed buffer pools | ⬜ Planned |
-| **5** | Per-stage profiling & metrics | ⬜ Planned |
-| **6** | Error handling & graceful cancellation | ⬜ Planned |
-| **7** | Testing & audit suite | ⬜ Planned |
-| **8** | Packaging & distribution | ⬜ Planned |
-| **9** | Quality-of-life (multi-GPU, auto-detect, GUI) | ⬜ Planned |
+- Python remains the default engine path.
+- Native direct and native-cli now share a larger control plane and result contract.
+- The direct native path has removed the main temp-file boundaries in favor of streamed demux/mux.
+- Remaining work is mostly documentation cleanup, benchmark/tool alignment, and selective native productization.
 
-See [`docs/RoadMap.md`](docs/RoadMap.md) for the full expanded roadmap.
+For current planning detail, start with:
+
+- [`implementation_plan.md`](implementation_plan.md)
+- [`docs/native_engine_handoff_2026-03-07.md`](docs/native_engine_handoff_2026-03-07.md)
+- [`docs/README.md`](docs/README.md)
 
 ---
 
 ## Contributing
 
-Contributions are welcome. When contributing models or pipeline changes, ensure that determinism and performance characteristics are preserved where applicable. Please review the [Technical Audit](TECHNICAL_AUDIT_v1.md) for known issues and architectural guidelines.
+Contributions are welcome. When contributing models or pipeline changes, ensure that determinism and performance characteristics are preserved where applicable. Start with [`docs/README.md`](docs/README.md) for the current doc set.
 
 ---
 

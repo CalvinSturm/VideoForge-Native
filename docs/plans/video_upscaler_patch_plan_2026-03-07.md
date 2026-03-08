@@ -1,5 +1,11 @@
 # Video Upscaler Patch Plan
 
+Status: Planning snapshot
+Created: 2026-03-07
+Scope: PR-shaped follow-up plan for engine alignment, benchmarkability, and cleanup
+Use this for: Proposed sequencing and scope boundaries
+Do not use this for: Current shipped status without checking later handoff docs and current code
+
 ## 1. Priority-ranked PR plan
 ### PR 1: Unify native job/result contracts across direct and CLI
 **Goal:** Create one shared native execution contract so `native` and `native-cli` stop drifting at the app boundary.  

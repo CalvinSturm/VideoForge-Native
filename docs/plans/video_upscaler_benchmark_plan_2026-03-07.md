@@ -1,5 +1,11 @@
 # Video Upscaler Benchmark Plan
 
+Status: Planning snapshot
+Created: 2026-03-07
+Scope: Benchmark policy, fixture planning, and instrumentation targets
+Use this for: Benchmark design and regression-harness planning
+Do not use this for: Assuming all listed instrumentation gaps still exist in current code
+
 ## 1. Benchmark goals
 - Quantify the real cost split between decode, preprocess, inference, postprocess, encode, and mux/finalize.
 - Compare Python engine vs native engine fairly on the same media and model scale factor.

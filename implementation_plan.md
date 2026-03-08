@@ -1,12 +1,13 @@
 # Native Engine Implementation Plan
 
 ## Plan Status
-- Overall status: `In progress`
-- Last updated: `2026-03-06`
+- Overall status: `Archived snapshot`
+- Last updated: `2026-03-07`
 - Scope: `engine-v2` native path and its Tauri integration in `src-tauri/src/commands/native_engine.rs`
 
 ## How To Use This File
-- This file is the execution tracker for the native engine workstream.
+- This file is the archived execution tracker for the native engine workstream.
+- For the latest resume point, start with [`docs/native_engine_handoff_2026-03-07.md`](/C:/Users/Calvin/Desktop/VideoForge1/docs/native_engine_handoff_2026-03-07.md).
 - After each implemented section, update:
   - the phase status
   - the completed task checkboxes

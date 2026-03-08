@@ -55,6 +55,10 @@ CLAUDE.md
 weights/
 
 # Large runtime/build outputs
+artifacts/*.json
+artifacts/trt_cache*/
+artifacts/**/*.engine
+artifacts/**/*.profile
 artifacts/downloads/
 artifacts/benchmarks/
 third_party/**/bin/
