@@ -28,7 +28,7 @@
 - [`docs/metrics_trust.md`](docs/metrics_trust.md) — canonical metric provenance and comparison rules.
 - [`docs/README.md`](docs/README.md) — entrypoint for current docs and status references.
 - [`docs/release_hygiene_checklist.md`](docs/release_hygiene_checklist.md) — metadata/version alignment checklist for release and packaging changes.
-- [`docs/handoff_native_direct_glitch_followup_2026-03-13.md`](docs/handoff_native_direct_glitch_followup_2026-03-13.md) — active native direct investigation handoff.
+- [`docs/handoff_native_direct_glitch_followup_2026-03-13.md`](docs/handoff_native_direct_glitch_followup_2026-03-13.md) — resolved native direct investigation record to resume from if the regression returns.
 - [`SMOKE_TEST.md`](SMOKE_TEST.md) — smoke test runbook for current manual validation commands.
 
 Historical audits, plans, and completed handoffs now live under [`docs/archive/`](docs/archive/).
@@ -324,6 +324,43 @@ Useful debug-only flags:
 
 Debug artifacts are written under `artifacts/` and should not be committed.
 
+### Run Artifacts And RunScope
+
+Optional run artifacts are enabled with:
+
+| Env var | Purpose |
+|---|---|
+| `VIDEOFORGE_ENABLE_RUN_ARTIFACTS=1` | Write per-run artifact bundles under the output-adjacent `.videoforge_runs/<job_id>/` directory |
+
+When enabled, both Python and native command paths now write:
+
+- `videoforge.run_manifest.v1.json`
+- `videoforge.runtime_config_snapshot.v1.json`
+- `videoforge.run_observed_metrics.v1.json`
+- `videoforge_run.json`
+
+`videoforge_run.json` is a RunScope-ingestible producer bundle intended for the `runscope` workstream.
+
+Practical workflow:
+
+1. Run a VideoForge job with `VIDEOFORGE_ENABLE_RUN_ARTIFACTS=1`.
+2. Locate the output-adjacent `.videoforge_runs/<job_id>/` directory.
+3. Point RunScope ingestion at that directory or directly at `videoforge_run.json`.
+
+Concrete example:
+
+```bash
+runscope ingest "<output-path>/.videoforge_runs/<job_id>"
+```
+
+Helper:
+
+```bat
+run_latest_runscope_ingest.bat
+```
+
+That launcher prints the newest VideoForge artifact bundle it can find under the repo and a copy-paste `runscope ingest "<bundle-dir>"` command.
+
 ### Metadata Alignment
 
 - Version source of truth is shared across `package.json`, `ui/package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`.
@@ -363,6 +400,7 @@ VideoForge/
 ├── package.json            # Root workspace (Tauri CLI)
 ├── run.bat                 # One-click standard dev launcher
 ├── run_native_engine.bat   # One-click native direct dev launcher
+├── run_latest_runscope_ingest.bat # Print latest RunScope ingest command for VideoForge artifacts
 └── run_native_engine_debug.bat # One-click native direct startup-debug launcher
 ```
 
@@ -405,6 +443,7 @@ Current repo state, based on the canonical docs and checked-in code:
 - The canonical architecture, capability, routing, persistence, and metrics docs are now in place.
 - The cleanup follow-up refactor tracks are complete and the maintained validation matrix is green.
 - Optional run manifests now have parity across Python and native command paths through the shared artifact system.
+- Optional run artifacts now include a RunScope-ingestible `videoforge_run.json` bundle plus raw runtime snapshot and observed-metrics JSON alongside the manifest.
 - Remaining work is focused on selective native productization and refining user-facing status/support language, not on broad cleanup recovery.
 
 For current planning detail, start with:

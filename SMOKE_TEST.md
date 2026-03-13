@@ -139,3 +139,5 @@ gated behind the `ENABLE_GPU_CI` repository variable.
 - This runbook is for current operational commands.
 - Historical smoke notes were moved to `docs/archive/SMOKE_TESTS.md`.
 - For system-truth docs, start with `docs/README.md` rather than archived handoffs or plans.
+- If you also want the run to be ingestible by RunScope, enable `VIDEOFORGE_ENABLE_RUN_ARTIFACTS=1` before running the app or smoke command. VideoForge will then write a `.videoforge_runs/<job_id>/` bundle next to the output, including `videoforge_run.json`.
+- After a run finishes, `run_latest_runscope_ingest.bat` will print the newest artifact bundle path plus a copy-paste `runscope ingest "<bundle-dir>"` command.
