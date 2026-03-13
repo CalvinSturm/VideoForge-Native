@@ -24,7 +24,7 @@ Purpose: describe what state exists, who owns it, where it lives, and whether it
 | Installed Python runtime | Backend runtime discovery | `%LOCALAPPDATA%/VideoForge/python/` | Across sessions | Durable | `src-tauri/src/python_env.rs` |
 | Weights in dev paths | Backend model discovery | `weights/`, `python/weights/`, parent-relative paths | Across sessions | Durable | `src-tauri/src/models.rs` |
 | Python worker capabilities | Backend launch config | Process memory, optional manifest snapshot | Per run | Mostly transient | `src-tauri/src/python_env.rs`, `src-tauri/src/run_manifest.rs` |
-| Run manifest | Backend optional artifact | Output-adjacent `.videoforge_runs/<job_id>/` | Per run | Durable when enabled | `src-tauri/src/run_manifest.rs`, `src-tauri/src/commands/upscale.rs`, `src-tauri/src/commands/native_routing.rs` |
+| Run manifest and structured run artifacts | Backend optional artifact bundle | Output-adjacent `.videoforge_runs/<job_id>/` | Per run | Durable when enabled | `src-tauri/src/run_manifest.rs`, `src-tauri/src/commands/upscale.rs`, `src-tauri/src/commands/native_routing.rs` |
 | Native runtime flags | Process env vars | Process environment | Process lifetime | Transient unless set externally | `src-tauri/src/commands/native_engine.rs` |
 | TensorRT cache | Native runtime | Temp or configured cache dir | Across matching runs | Durable on disk | `src-tauri/src/commands/native_engine.rs` |
 | Python SHM backing store | Host/worker runtime | Temp/file-backed SHM | Per run | Transient | `src-tauri/src/commands/upscale.rs`, `python/shm_worker.py` |
@@ -43,6 +43,11 @@ Purpose: describe what state exists, who owns it, where it lives, and whether it
 - Run manifest support exists for both Python and native command paths through `maybe_write_run_manifest`
 - App command paths keep manifests off by default unless `VIDEOFORGE_ENABLE_RUN_ARTIFACTS=1` is set
 - Native manifests now record engine/route/runtime fields through the shared artifact schema
+- The same opt-in artifact root now also carries:
+  - `videoforge.runtime_config_snapshot.v1.json`
+  - `videoforge.run_observed_metrics.v1.json`
+  - `videoforge_run.json`
+- `videoforge_run.json` is the producer bundle intended for RunScope ingestion, while the schema-versioned snapshot/metrics files remain the more VideoForge-native raw artifacts
 
 ## Operational Guidance
 

@@ -38,6 +38,7 @@ Primary buckets:
   - stable smoke coverage
   - repeatable benchmark flows
   - faster detection of native regressions
+  - RunScope-friendly run artifact ingestion and eval visibility
 
 ## What Not To Restart
 

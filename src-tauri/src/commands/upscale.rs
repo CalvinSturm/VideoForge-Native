@@ -21,7 +21,8 @@ use crate::python_env::{
     WorkerCaps, PYTHON_PIDS,
 };
 use crate::run_manifest::{
-    maybe_write_run_manifest, run_artifacts_enabled_from_env, RunManifestInputs, WorkerCapsSnapshot,
+    maybe_finalize_run_artifacts, maybe_write_run_manifest, run_artifacts_enabled_from_env,
+    RunArtifactFinalizeInputs, RunManifestInputs, WorkerCapsSnapshot,
 };
 use crate::runtime_truth::{
     log_run_observed_metrics, log_runtime_config_snapshot, PythonRuntimeConfigExtension,
@@ -318,7 +319,7 @@ pub async fn run_upscale_job(
         tracing::warn!("--use-events is Windows-only; falling back to polling");
     }
 
-    if let Some(manifest_path) = maybe_write_run_manifest(
+    let artifacts_root = maybe_write_run_manifest(
         config.enable_run_artifacts,
         &RunManifestInputs {
             input_path: &config.input_path,
@@ -341,9 +342,10 @@ pub async fn run_upscale_job(
         },
     )
     .map_err(|e| format!("Failed to write run manifest: {e}"))?
-    {
+    .and_then(|manifest_path| {
         tracing::info!(path = %manifest_path.display(), "Run manifest written");
-    }
+        manifest_path.parent().map(Path::to_path_buf)
+    });
 
     // Generate a session-scoped job ID for IPC correlation.
     let job_id = ipc::protocol::next_request_id();
@@ -1097,9 +1099,17 @@ pub async fn run_upscale_job(
             if let Some(metrics) = &report.observed_metrics {
                 log_run_observed_metrics(metrics);
             }
+            let _ = maybe_finalize_run_artifacts(
+                artifacts_root.as_deref(),
+                &RunArtifactFinalizeInputs {
+                    runtime_snapshot: &report.runtime_snapshot,
+                    observed_metrics: report.observed_metrics.as_ref(),
+                },
+            )
+            .map_err(|e| tracing::warn!(error = %e, "Failed to finalize Python run artifacts"));
         }
         Err(error) => {
-            log_run_observed_metrics(&build_python_observed_metrics(
+            let failed_metrics = build_python_observed_metrics(
                 &job_id,
                 RunStatus::Failed,
                 Some(observed_started.elapsed().as_millis() as u64),
@@ -1107,7 +1117,18 @@ pub async fn run_upscale_job(
                 None,
                 None,
                 Some(error.clone()),
-            ));
+            );
+            log_run_observed_metrics(&failed_metrics);
+            let _ = maybe_finalize_run_artifacts(
+                artifacts_root.as_deref(),
+                &RunArtifactFinalizeInputs {
+                    runtime_snapshot: &runtime_snapshot,
+                    observed_metrics: Some(&failed_metrics),
+                },
+            )
+            .map_err(
+                |e| tracing::warn!(error = %e, "Failed to finalize failed Python run artifacts"),
+            );
         }
     }
 

@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "native_engine")]
 use crate::run_manifest::{
-    maybe_write_run_manifest, run_artifacts_enabled_from_env, RunManifestInputs, WorkerCapsSnapshot,
+    maybe_finalize_run_artifacts, maybe_write_run_manifest, run_artifacts_enabled_from_env,
+    RunArtifactFinalizeInputs, RunManifestInputs, WorkerCapsSnapshot,
 };
 #[cfg(feature = "native_engine")]
 use crate::runtime_truth::{
@@ -470,6 +471,17 @@ fn maybe_write_native_run_manifest(
     .map_err(|e| format!("Failed to write native run manifest: {e}"))?
     {
         tracing::info!(path = %manifest_path.display(), "Native run manifest written");
+        maybe_finalize_run_artifacts(
+            manifest_path.parent(),
+            &RunArtifactFinalizeInputs {
+                runtime_snapshot: result
+                    .runtime_snapshot
+                    .as_ref()
+                    .ok_or_else(|| "Native result missing runtime snapshot".to_string())?,
+                observed_metrics: result.observed_metrics.as_ref(),
+            },
+        )
+        .map_err(|e| format!("Failed to finalize native run artifacts: {e}"))?;
     }
 
     Ok(())

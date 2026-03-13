@@ -8,9 +8,13 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::python_env::WorkerCaps;
+use crate::runtime_truth::{RunObservedMetrics, RunStatus, RuntimeConfigSnapshot};
 
 pub const RUN_MANIFEST_SCHEMA_V1: &str = "videoforge.run_manifest.v1";
 const RUN_MANIFEST_FILENAME_V1: &str = "videoforge.run_manifest.v1.json";
+const RUNTIME_CONFIG_SNAPSHOT_FILENAME_V1: &str = "videoforge.runtime_config_snapshot.v1.json";
+const RUN_OBSERVED_METRICS_FILENAME_V1: &str = "videoforge.run_observed_metrics.v1.json";
+const RUNSCOPE_REPORT_FILENAME_V1: &str = "videoforge_run.json";
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkerCapsSnapshot {
@@ -99,6 +103,56 @@ pub struct RunManifestInputs<'a> {
     pub trt_cache_enabled: Option<bool>,
     pub trt_cache_dir: Option<&'a str>,
     pub app_version: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunArtifactFinalizeInputs<'a> {
+    pub runtime_snapshot: &'a RuntimeConfigSnapshot,
+    pub observed_metrics: Option<&'a RunObservedMetrics>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct VideoForgeRunScopeReport {
+    pub producer: String,
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suite: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scenario: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub metrics: std::collections::BTreeMap<String, f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    pub runtime_snapshot: RuntimeConfigSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_metrics: Option<RunObservedMetrics>,
 }
 
 pub fn run_artifacts_enabled_from_env() -> bool {
@@ -199,24 +253,290 @@ pub fn maybe_write_run_manifest(
         .with_context(|| format!("creating artifacts dir '{}'", artifacts_dir.display()))?;
 
     let final_path = artifacts_dir.join(RUN_MANIFEST_FILENAME_V1);
-    let tmp_path = artifacts_dir.join(format!("{}.tmp", RUN_MANIFEST_FILENAME_V1));
-    let json = serde_json::to_vec_pretty(&manifest).context("serializing run manifest")?;
-    fs::write(&tmp_path, json)
-        .with_context(|| format!("writing temp manifest '{}'", tmp_path.display()))?;
-    fs::rename(&tmp_path, &final_path).with_context(|| {
+    write_json_atomic(&final_path, &manifest)
+        .with_context(|| format!("writing run manifest artifact '{}'", final_path.display()))?;
+
+    Ok(Some(final_path))
+}
+
+pub fn maybe_finalize_run_artifacts(
+    artifacts_root: Option<&Path>,
+    inputs: &RunArtifactFinalizeInputs<'_>,
+) -> Result<Option<PathBuf>> {
+    let Some(root) = artifacts_root else {
+        return Ok(None);
+    };
+
+    fs::create_dir_all(root)
+        .with_context(|| format!("creating finalized artifacts dir '{}'", root.display()))?;
+
+    let runtime_snapshot_path = root.join(RUNTIME_CONFIG_SNAPSHOT_FILENAME_V1);
+    write_json_atomic(&runtime_snapshot_path, inputs.runtime_snapshot).with_context(|| {
         format!(
-            "renaming temp manifest '{}' -> '{}'",
-            tmp_path.display(),
-            final_path.display()
+            "writing runtime snapshot artifact '{}'",
+            runtime_snapshot_path.display()
         )
     })?;
 
-    Ok(Some(final_path))
+    if let Some(observed_metrics) = inputs.observed_metrics {
+        let observed_metrics_path = root.join(RUN_OBSERVED_METRICS_FILENAME_V1);
+        write_json_atomic(&observed_metrics_path, observed_metrics).with_context(|| {
+            format!(
+                "writing observed metrics artifact '{}'",
+                observed_metrics_path.display()
+            )
+        })?;
+    }
+
+    let runscope_report = build_runscope_report(inputs);
+    let runscope_report_path = root.join(RUNSCOPE_REPORT_FILENAME_V1);
+    write_json_atomic(&runscope_report_path, &runscope_report).with_context(|| {
+        format!(
+            "writing RunScope report artifact '{}'",
+            runscope_report_path.display()
+        )
+    })?;
+
+    Ok(Some(runscope_report_path))
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("artifact.json");
+    let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+    let json = serde_json::to_vec_pretty(value).context("serializing JSON artifact")?;
+    fs::write(&tmp_path, json)
+        .with_context(|| format!("writing temp artifact '{}'", tmp_path.display()))?;
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "renaming temp artifact '{}' -> '{}'",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn build_runscope_report(inputs: &RunArtifactFinalizeInputs<'_>) -> VideoForgeRunScopeReport {
+    let runtime_snapshot = inputs.runtime_snapshot.clone();
+    let observed_metrics = inputs.observed_metrics.cloned();
+    let route_id = runtime_snapshot.route_id.clone();
+    let model = runtime_snapshot
+        .model_key
+        .clone()
+        .or_else(|| basename_without_extension(runtime_snapshot.model_path.as_deref()));
+    let scenario = build_runscope_scenario(&runtime_snapshot, model.as_deref());
+    let status = observed_metrics
+        .as_ref()
+        .map(|metrics| runscope_status(&metrics.status))
+        .unwrap_or("unknown")
+        .to_string();
+    let started_at = Some(OffsetDateTime::now_utc().format(&Rfc3339).unwrap());
+    let finished_at = terminal_finished_at(observed_metrics.as_ref());
+    let duration_ms = observed_metrics
+        .as_ref()
+        .and_then(|metrics| metrics.total_elapsed_ms);
+    let exit_code = observed_metrics
+        .as_ref()
+        .map(|metrics| match metrics.status {
+            RunStatus::Succeeded => 0,
+            RunStatus::Running => 2,
+            RunStatus::Cancelled => 130,
+            RunStatus::Failed => 1,
+        });
+
+    VideoForgeRunScopeReport {
+        producer: "videoforge".to_string(),
+        run_id: runtime_snapshot.run_id.clone(),
+        suite: runtime_snapshot
+            .media_kind
+            .map(|kind| match kind {
+                crate::runtime_truth::RuntimeMediaKind::Image => "image_upscale".to_string(),
+                crate::runtime_truth::RuntimeMediaKind::Video => "video_upscale".to_string(),
+            })
+            .or_else(|| Some("upscale".to_string())),
+        scenario,
+        label: Some(route_id.clone()),
+        status,
+        started_at,
+        finished_at,
+        duration_ms,
+        exit_code,
+        backend: Some(route_id.clone()),
+        model,
+        precision: runtime_snapshot.precision.clone(),
+        dataset: None,
+        input_count: Some(1),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().to_string()),
+        command: build_runscope_command(&runtime_snapshot),
+        metrics: build_runscope_metrics(observed_metrics.as_ref()),
+        engine: Some(format!("{:?}", runtime_snapshot.engine_family).to_ascii_lowercase()),
+        pipeline: Some(route_id),
+        runtime_snapshot,
+        observed_metrics,
+    }
+}
+
+fn build_runscope_scenario(
+    runtime_snapshot: &RuntimeConfigSnapshot,
+    model: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    parts.push(runtime_snapshot.route_id.clone());
+    if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
+        parts.push(model.to_string());
+    }
+    if let Some(precision) = runtime_snapshot
+        .precision
+        .as_deref()
+        .filter(|precision| !precision.trim().is_empty())
+    {
+        parts.push(precision.to_string());
+    }
+    if let Some(scale) = runtime_snapshot.scale {
+        parts.push(format!("x{scale}"));
+    }
+    (!parts.is_empty()).then_some(parts.join("_"))
+}
+
+fn build_runscope_command(runtime_snapshot: &RuntimeConfigSnapshot) -> Vec<String> {
+    let mut command = vec!["videoforge".to_string(), "upscale".to_string()];
+    if matches!(
+        runtime_snapshot.engine_family,
+        crate::runtime_truth::RuntimeEngineFamily::Native
+    ) {
+        command.push("--native".to_string());
+    }
+    if let Some(route_id) = runtime_snapshot
+        .executed_executor
+        .as_deref()
+        .filter(|route_id| !route_id.trim().is_empty())
+    {
+        command.push(format!("--executor={route_id}"));
+    }
+    command
+}
+
+fn build_runscope_metrics(
+    observed_metrics: Option<&RunObservedMetrics>,
+) -> std::collections::BTreeMap<String, f64> {
+    let mut metrics = std::collections::BTreeMap::new();
+    let Some(observed_metrics) = observed_metrics else {
+        return metrics;
+    };
+
+    if let Some(total_elapsed_ms) = observed_metrics.total_elapsed_ms {
+        metrics.insert("total_elapsed_ms".to_string(), total_elapsed_ms as f64);
+    }
+    if let Some(work_units_processed) = observed_metrics.work_units_processed {
+        metrics.insert(
+            "work_units_processed".to_string(),
+            work_units_processed as f64,
+        );
+        if let Some(total_elapsed_ms) = observed_metrics.total_elapsed_ms.filter(|value| *value > 0)
+        {
+            let fps = work_units_processed as f64 / (total_elapsed_ms as f64 / 1000.0);
+            metrics.insert("fps".to_string(), fps);
+        }
+    }
+
+    if let Some(python) = observed_metrics.extensions.python.as_ref() {
+        if let Some(frames_decoded) = python.frames_decoded {
+            metrics.insert("frames_decoded".to_string(), frames_decoded as f64);
+        }
+        if let Some(frames_processed) = python.frames_processed {
+            metrics.insert("frames_processed".to_string(), frames_processed as f64);
+        }
+        if let Some(frames_encoded) = python.frames_encoded {
+            metrics.insert("frames_encoded".to_string(), frames_encoded as f64);
+        }
+    }
+
+    if let Some(native) = observed_metrics.extensions.native.as_ref() {
+        insert_native_metric(&mut metrics, "frames_decoded", native.frames_decoded);
+        insert_native_metric(
+            &mut metrics,
+            "frames_preprocessed",
+            native.frames_preprocessed,
+        );
+        insert_native_metric(&mut metrics, "frames_inferred", native.frames_inferred);
+        insert_native_metric(&mut metrics, "frames_encoded", native.frames_encoded);
+        insert_native_metric(&mut metrics, "preprocess_avg_us", native.preprocess_avg_us);
+        insert_native_metric(
+            &mut metrics,
+            "inference_frame_avg_us",
+            native.inference_frame_avg_us,
+        );
+        insert_native_metric(
+            &mut metrics,
+            "inference_dispatch_avg_us",
+            native.inference_dispatch_avg_us,
+        );
+        insert_native_metric(
+            &mut metrics,
+            "postprocess_frame_avg_us",
+            native.postprocess_frame_avg_us,
+        );
+        insert_native_metric(
+            &mut metrics,
+            "postprocess_dispatch_avg_us",
+            native.postprocess_dispatch_avg_us,
+        );
+        insert_native_metric(&mut metrics, "encode_avg_us", native.encode_avg_us);
+        insert_native_metric(&mut metrics, "vram_current_mb", native.vram_current_mb);
+        insert_native_metric(&mut metrics, "vram_peak_mb", native.vram_peak_mb);
+    }
+
+    metrics
+}
+
+fn insert_native_metric(
+    metrics: &mut std::collections::BTreeMap<String, f64>,
+    key: &str,
+    value: Option<u64>,
+) {
+    if let Some(value) = value {
+        metrics.insert(key.to_string(), value as f64);
+    }
+}
+
+fn basename_without_extension(path: Option<&str>) -> Option<String> {
+    let path = path?;
+    Path::new(path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(ToString::to_string)
+}
+
+fn runscope_status(status: &RunStatus) -> &'static str {
+    match status {
+        RunStatus::Running => "unknown",
+        RunStatus::Succeeded => "pass",
+        RunStatus::Failed => "fail",
+        RunStatus::Cancelled => "error",
+    }
+}
+
+fn terminal_finished_at(observed_metrics: Option<&RunObservedMetrics>) -> Option<String> {
+    let observed_metrics = observed_metrics?;
+    if matches!(observed_metrics.status, RunStatus::Running) {
+        None
+    } else {
+        Some(OffsetDateTime::now_utc().format(&Rfc3339).unwrap())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_truth::{
+        NativeRuntimeMetricsExtension, RunObservedMetrics, RunStatus, RuntimeConfigSnapshot,
+        RuntimeEngineFamily, RuntimeMediaKind, RuntimeMetricsExtensions,
+    };
     use serde_json::Value;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -252,6 +572,48 @@ mod tests {
             .expect("time ok")
             .as_nanos();
         std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), nanos))
+    }
+
+    fn test_runtime_snapshot() -> RuntimeConfigSnapshot {
+        let mut snapshot = RuntimeConfigSnapshot::new(
+            "run-123",
+            "native_direct",
+            RuntimeEngineFamily::Native,
+            r"C:\input\clip.mp4",
+            r"C:\output\clip_x2.mp4",
+        );
+        snapshot.media_kind = Some(RuntimeMediaKind::Video);
+        snapshot.model_key = Some("2x_SPAN_soft".to_string());
+        snapshot.model_path = Some(r"C:\weights\2x_SPAN_soft.onnx".to_string());
+        snapshot.scale = Some(2);
+        snapshot.precision = Some("fp16".to_string());
+        snapshot.requested_executor = Some("direct".to_string());
+        snapshot.executed_executor = Some("direct".to_string());
+        snapshot
+    }
+
+    fn test_observed_metrics() -> RunObservedMetrics {
+        let mut metrics = RunObservedMetrics::new("run-123", "native_direct", RunStatus::Succeeded);
+        metrics.total_elapsed_ms = Some(2_000);
+        metrics.work_units_processed = Some(100);
+        metrics.extensions = RuntimeMetricsExtensions {
+            python: None,
+            native: Some(NativeRuntimeMetricsExtension {
+                frames_decoded: Some(100),
+                frames_preprocessed: Some(100),
+                frames_inferred: Some(100),
+                frames_encoded: Some(100),
+                preprocess_avg_us: Some(1100),
+                inference_frame_avg_us: Some(2200),
+                inference_dispatch_avg_us: Some(2200),
+                postprocess_frame_avg_us: Some(3300),
+                postprocess_dispatch_avg_us: Some(3300),
+                encode_avg_us: Some(4400),
+                vram_current_mb: Some(512),
+                vram_peak_mb: Some(1024),
+            }),
+        };
+        metrics
     }
 
     #[test]
@@ -324,5 +686,42 @@ mod tests {
 
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn finalize_run_artifacts_writes_runscope_ingest_bundle() {
+        let root = unique_temp_dir("vf_runscope_bundle");
+        fs::create_dir_all(&root).expect("create root");
+        let snapshot = test_runtime_snapshot();
+        let metrics = test_observed_metrics();
+
+        let written = maybe_finalize_run_artifacts(
+            Some(&root),
+            &RunArtifactFinalizeInputs {
+                runtime_snapshot: &snapshot,
+                observed_metrics: Some(&metrics),
+            },
+        )
+        .expect("finalize artifacts")
+        .expect("bundle path");
+
+        assert!(written.ends_with(RUNSCOPE_REPORT_FILENAME_V1));
+        assert!(root.join(RUNTIME_CONFIG_SNAPSHOT_FILENAME_V1).exists());
+        assert!(root.join(RUN_OBSERVED_METRICS_FILENAME_V1).exists());
+        assert!(root.join(RUNSCOPE_REPORT_FILENAME_V1).exists());
+
+        let report: Value = serde_json::from_str(
+            &fs::read_to_string(root.join(RUNSCOPE_REPORT_FILENAME_V1)).expect("read report"),
+        )
+        .expect("parse report");
+        assert_eq!(report["producer"], "videoforge");
+        assert_eq!(report["run_id"], "run-123");
+        assert_eq!(report["backend"], "native_direct");
+        assert_eq!(report["engine"], "native");
+        assert_eq!(report["metrics"]["fps"], 50.0);
+        assert_eq!(report["runtime_snapshot"]["route_id"], "native_direct");
+        assert_eq!(report["observed_metrics"]["status"], "succeeded");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
