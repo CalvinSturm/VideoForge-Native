@@ -308,8 +308,9 @@ The currently strongest working theory is:
 
 - direct NVENC is producing visually coherent compressed packets
 - the catastrophic direct playback bounce was caused by broken direct demux timing before encode and is now fixed by the packet-aware demux port
-- the remaining residual issue is smaller: a couple black frames / slight glitches that survive into both the dumped encoded stream and the final MP4
-- the current fault domain is now upstream of NVENC packetization and upstream of final mux, likely in the direct path before or at the NVENC handoff surfaces for specific frame indices
+- the earlier residual issue was smaller: a couple black frames / slight glitches that survived into both the dumped encoded stream and the final MP4
+- the latest direct residual recheck did not reproduce black frames, so the residual issue currently appears resolved or at least non-reproducible on the latest rerun
+- the remaining work is now confirmation and documentation rather than an active catastrophic corruption hunt
 
 ## Latest Encode-Side Evidence
 
@@ -345,6 +346,10 @@ Expanded evidence now adds:
 - handoff-vs-bitstream SSIM for that residual run stayed extremely high over all 48 frames:
   - `count=48 min=0.998746 max=0.999999 avg=0.998909`
 - that means the residual black frames are already present in the direct NVENC handoff surfaces / encoded stream path and are not introduced by final muxing
+- latest direct residual recheck output:
+  - `artifacts/ui_direct_residual_202603157.mp4`
+- in that latest rerun, user-reported black frames did not reproduce
+- that rerun suggests the residual black-frame issue may already be resolved by the later direct-path changes, or was intermittent/run-specific
 
 ## Validation Status
 
@@ -398,28 +403,34 @@ Those are debug outputs, not source changes.
 ## What The Next Agent Should Do First
 
 1. Stop spending time on final mux and generic NVENC packet-order theories for this residual issue.
-2. Reproduce the residual direct run with targeted upstream dumps:
+2. First confirm whether the residual issue is still reproducible on the latest code.
+3. If it reproduces again, re-run the residual direct run with targeted upstream dumps:
    - `VIDEOFORGE_NVENC_DEBUG_DUMP_FRAMES=48`
    - `VIDEOFORGE_PIPELINE_DEBUG_DUMP=1`
    - optionally `VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP=1` if kernel-input correlation is needed
-3. Compare the specific residual black-frame indices against:
+4. Compare the specific residual black-frame indices against:
    - preprocess output
    - postprocess NV12 output
    - NVENC handoff NV12
    - dumped encoded bitstream
-4. Determine whether the black frames first appear:
+5. Determine whether the black frames first appear:
    - before postprocess completion
    - in postprocess output but not preprocess
    - or only once the frame reaches the NVENC handoff
-5. Focus the next code investigation on upstream direct-path continuity for those frame indices:
+6. Focus the next code investigation on upstream direct-path continuity for those frame indices:
    - frame metadata / `frame_index` propagation
    - recycled surface reuse
    - postprocess output integrity
    - any direct-path stage where a valid frame could be replaced by a near-empty / black surface
 
+If the issue does not reproduce across one or two fresh confirmation runs:
+
+- treat the direct-native corruption investigation as effectively resolved
+- keep the stage-specific debug switches available, but avoid more invasive changes unless the issue returns
+
 ## Next Suggested Direction
 
-Use the residual repro as the new baseline and isolate the first stage that turns black.
+Use the latest clean rerun as the new baseline and confirm stability before doing more invasive debugging.
 
 Recommended repro env:
 
@@ -435,7 +446,12 @@ Recommended output/dump targets:
 - output MP4: `artifacts/ui_direct_residual_followup.mp4`
 - dump dir: `artifacts/nvdec_debug/ui_direct_residual_followup/`
 
-Primary comparison goal:
+Latest known clean recheck:
+
+- output MP4: `artifacts/ui_direct_residual_202603157.mp4`
+- user-reported result: no black frames reproduced
+
+Primary comparison goal if the issue returns:
 
 - identify whether the residual black frames first appear in:
   - preprocess RGB
@@ -443,7 +459,7 @@ Primary comparison goal:
   - NVENC handoff NV12
   - encoded HEVC packet decode
 
-Suggested frame targets from the current residual repro:
+Suggested frame targets from the last known bad residual repro:
 
 - frame `0`
 - frame `5`
@@ -452,6 +468,11 @@ Those correspond to the two black intervals already confirmed in both the dumped
 
 - `0.000000 -> 0.041708`
 - `0.208542 -> 0.250250`
+
+If the latest clean behavior holds on another confirmation run:
+
+- update this handoff to mark the residual black-frame issue resolved
+- keep the packet-aware demux/mux path as the final fix set
 
 If the black frames are already present in preprocess/postprocess outputs:
 
@@ -598,3 +619,52 @@ Until that is done, the strongest current statement is:
 
 - frame `0` turns black no later than postprocess output
 - frame `5` turns black no later than NVENC handoff
+
+## 2026-03-15 Interpretation Correction
+
+Subsequent manual playback review plus `ffmpeg` `blackdetect` changed the interpretation of the later residual-labelled outputs.
+
+Files checked:
+
+- `artifacts/ui_direct_residual_20260314.mp4`
+- `artifacts/ui_direct_residual_20260315.mp4`
+
+What was observed:
+
+- the operator did **not** see the residual black-frame intervals in either of those two later runs
+- `blackdetect` did **not** report the previously confirmed black spans on either file
+- both files therefore appear clean relative to the earlier confirmed failing residual baseline
+
+Updated interpretation:
+
+- `artifacts/ui_direct_residual_20260313.mp4` remains the last confirmed failing residual baseline
+- `artifacts/ui_direct_residual_20260314.mp4` appears clean
+- `artifacts/ui_direct_residual_20260315.mp4` appears clean
+- the fresh dump set under `artifacts/nvdec_debug/ui_direct_residual_20260315_fresh/` should therefore be treated as an instrumented clean run, **not** as a confirmed failing repro
+
+Implication for the March 15 dump analysis:
+
+- do **not** rely on the March 15 dump set as proof that frame `0` or frame `5` were black in that run
+- the March 15 dump set still proves the dump plumbing worked in a fresh process with an isolated dump directory
+- the March 15 dump set still shows that pipeline-stage dumping is first-frame-only in practice
+- but it does **not** currently answer where a failing frame first turns black, because that run was not a confirmed visual repro
+
+## Updated Primary Goal
+
+The main investigation goal is no longer "isolate a deterministic residual black frame in the latest run."
+
+The primary goal is now:
+
+- reproduce the intermittent direct-native residual condition again under tightly controlled conditions
+
+Recommended reproduction discipline:
+
+- always start from a fully closed app and a fresh terminal
+- always use an explicit unique `VIDEOFORGE_NVDEC_DEBUG_DUMP_DIR` per run
+- keep input clip, model, route, precision, and output settings fixed
+- record the exact env vars used for every run
+- immediately classify each run as either:
+  - confirmed failing visually / by `blackdetect`
+  - or clean
+
+Only after a fresh failing run is captured with matching dumps should the next agent return to frame-stage isolation.
