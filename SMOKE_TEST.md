@@ -8,6 +8,21 @@
 - Python AI environment activated (conda/venv with torch, onnxruntime-gpu, etc.)
 - A short test video (e.g. `test_720p.mp4`)
 
+## Quick Launchers
+
+For app-level manual checks from the repo root:
+
+- `run.bat`
+  - standard dev launcher
+- `run_native_engine.bat`
+  - native direct launcher
+- `run_native_engine_debug.bat`
+  - native direct launcher with startup-focused debug dumps enabled
+
+The debug launcher writes artifacts under:
+
+- `artifacts/nvdec_debug/run_native_engine_debug/`
+
 ## 1. Python IPC Handshake (No GPU Required)
 
 ```powershell
@@ -56,11 +71,30 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin smoke -- \
 
 ## 4. Native Engine E2E (GPU Required, feature-gated)
 
+Native smoke requires:
+
+- `native_engine` Cargo feature enabled for the smoke binary
+- an ONNX model path passed via `--e2e-onnx`
+
+Optional direct-route request:
+
+- add `--native-direct` to force `VIDEOFORGE_NATIVE_ENGINE_DIRECT=1`
+
 ```powershell
 cargo run --manifest-path src-tauri/Cargo.toml --bin smoke \
   --features native_engine -- \
   --e2e-native --input test_720p.mp4 \
-  --native-model path/to/model.onnx --e2e-scale 4 \
+  --e2e-onnx path/to/model.onnx --e2e-scale 4 \
+  --precision fp32 --keep-temp
+```
+
+Direct-route variant:
+
+```powershell
+cargo run --manifest-path src-tauri/Cargo.toml --bin smoke \
+  --features native_engine -- \
+  --e2e-native --native-direct --input test_720p.mp4 \
+  --e2e-onnx path/to/model.onnx --e2e-scale 4 \
   --precision fp32 --keep-temp
 ```
 
@@ -99,3 +133,9 @@ gated behind the `ENABLE_GPU_CI` repository variable.
 |------|---------|
 | 0    | All checks passed |
 | 1    | One or more checks failed |
+
+## Notes
+
+- This runbook is for current operational commands.
+- Historical smoke notes were moved to `docs/archive/SMOKE_TESTS.md`.
+- For system-truth docs, start with `docs/README.md` rather than archived handoffs or plans.

@@ -15,23 +15,18 @@ This directory contains the durable architecture contracts plus archived plannin
 - [`metrics_trust.md`](metrics_trust.md)
   - Canonical metric provenance and comparability rules.
 
-## Archived Status And Planning
+## Active Working Docs
 
-- [`archive/implementation_plan.md`](archive/implementation_plan.md)
-  - Archived native-engine execution tracker and status snapshot.
-- [`archive/native_engine_handoff_2026-03-07.md`](archive/native_engine_handoff_2026-03-07.md)
-  - Archived native handoff snapshot.
-- [`archive/native_engine_implementation_plan.md`](archive/native_engine_implementation_plan.md)
-  - Archived native workstream implementation tracker.
+- [`handoff_native_direct_glitch_followup_2026-03-13.md`](handoff_native_direct_glitch_followup_2026-03-13.md)
+  - Active native direct investigation handoff.
+- [`release_hygiene_checklist.md`](release_hygiene_checklist.md)
+  - Release and packaging metadata checklist.
 
-## Cross-Engine Audit And Planning Snapshots
+## Historical Docs
 
-- [`audits/video_upscaler_audit_2026-03-07.md`](audits/video_upscaler_audit_2026-03-07.md)
-  - Broader cross-engine audit covering Python, native direct, and native-cli.
-- [`plans/video_upscaler_patch_plan_2026-03-07.md`](plans/video_upscaler_patch_plan_2026-03-07.md)
-  - PR-shaped cleanup and alignment plan derived from the audit.
-- [`plans/video_upscaler_benchmark_plan_2026-03-07.md`](plans/video_upscaler_benchmark_plan_2026-03-07.md)
-  - Benchmark policy and instrumentation plan derived from the audit.
+- [`archive/`](archive/)
+  - Historical handoffs, completed plans, prior audits, and retired root-level docs moved out of the active docs surface.
+  - See [`archive/README.md`](archive/README.md) for archive usage rules.
 
 ## Working Rule
 

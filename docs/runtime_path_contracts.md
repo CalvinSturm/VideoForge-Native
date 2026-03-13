@@ -55,7 +55,7 @@ UI intent is not execution truth.
 - Runtime gate: `VIDEOFORGE_ENABLE_NATIVE_ENGINE=1`
 - Direct gate: `VIDEOFORGE_NATIVE_ENGINE_DIRECT=1`
 - FFmpeg runtime path resolution is handled in `src-tauri/src/commands/native_engine.rs`
-- Direct pipeline uses FFmpeg demux stdout, `engine-v2`, and FFmpeg mux stdin
+- Direct pipeline uses packet-aware FFmpeg demux, in-process `engine-v2`, and packet-aware FFmpeg muxing in the host path
 - Result includes requested/executed executor, direct attempted flag, fallback flags, and perf fields
 - Run-start snapshot logging now exists with schema `videoforge.runtime_config_snapshot.native.v1`
 

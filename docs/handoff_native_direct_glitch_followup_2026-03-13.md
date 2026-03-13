@@ -1,7 +1,7 @@
 # Native Direct Glitch Follow-up Handoff
 
 Date: 2026-03-13
-Status: active
+Status: resolved pending future regression
 
 ## Purpose
 
@@ -11,8 +11,18 @@ This handoff captures the current state of the direct native-path corruption inv
 
 - Native runtime readiness is working again.
 - CLI-backed native is clean on the same clip, model, and settings.
-- Direct in-process native remains visually glitched.
-- The issue is therefore isolated to the direct `engine-v2` path, not the shared native runtime contract, ONNX model, TensorRT runtime, or general native routing.
+- The major direct in-process native corruption issue was resolved.
+- The decisive fix was aligning decode-to-preprocess input-buffer lifetime handling with the proven `third_party/rave` reference pattern.
+- Latest targeted rechecks include clean exports, but the full historical investigation trail is preserved here in case the issue regresses.
+
+## Resolution Note
+
+Use this file as:
+
+- the historical debugging record for the direct-native corruption investigation
+- the first place to resume from if the regression returns
+
+Do not read the opening sections alone as the current runtime state. Much of the body below records intermediate failing states that were later narrowed and fixed.
 
 ## Proven Facts
 

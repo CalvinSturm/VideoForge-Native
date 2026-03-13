@@ -27,12 +27,11 @@
 - [`docs/state_and_persistence.md`](docs/state_and_persistence.md) — canonical operational state model.
 - [`docs/metrics_trust.md`](docs/metrics_trust.md) — canonical metric provenance and comparison rules.
 - [`docs/README.md`](docs/README.md) — entrypoint for current docs and status references.
-- [`docs/archive/implementation_plan.md`](docs/archive/implementation_plan.md) — archived native engine execution tracker and status summary.
-- [`docs/archive/native_engine_handoff_2026-03-07.md`](docs/archive/native_engine_handoff_2026-03-07.md) — archived native-only handoff snapshot.
-- [`docs/audits/video_upscaler_audit_2026-03-07.md`](docs/audits/video_upscaler_audit_2026-03-07.md) — workspace audit and bottleneck review.
-- [`docs/plans/video_upscaler_patch_plan_2026-03-07.md`](docs/plans/video_upscaler_patch_plan_2026-03-07.md) — PR-shaped cleanup and measurement plan.
-- [`docs/plans/video_upscaler_benchmark_plan_2026-03-07.md`](docs/plans/video_upscaler_benchmark_plan_2026-03-07.md) — benchmark policy and fixture plan.
 - [`docs/release_hygiene_checklist.md`](docs/release_hygiene_checklist.md) — metadata/version alignment checklist for release and packaging changes.
+- [`docs/handoff_native_direct_glitch_followup_2026-03-13.md`](docs/handoff_native_direct_glitch_followup_2026-03-13.md) — active native direct investigation handoff.
+- [`SMOKE_TEST.md`](SMOKE_TEST.md) — smoke test runbook for current manual validation commands.
+
+Historical audits, plans, and completed handoffs now live under [`docs/archive/`](docs/archive/).
 
 ---
 
@@ -47,17 +46,26 @@ VideoForge is a local-first desktop application for AI-powered image and video u
 - **User Authority** — Full control over trim, crop, color grading, model selection, and precision mode. Preview before you commit.
 - **Engine Flexibility** — Video jobs can run through the Python worker path or the opt-in native `engine-v2` path, depending on model/runtime eligibility.
 
+### Native Engine Reality Check
+
+- The native family is for **video jobs only** and is only attempted for **ONNX** models.
+- There are two native execution modes:
+  - **Native direct**: in-process `engine-v2`
+  - **Native CLI-backed**: native-family fallback through the `rave` adapter
+- The direct path now uses packet-aware demux/mux boundaries in the host and a safer decode-to-preprocess lifetime contract aligned with the working `third_party/rave` reference path.
+- The Python path remains the broadest-compatibility route and the default for non-ONNX or non-video jobs.
+
 ---
 
 ## Features
 
 | Category | Details |
 |----------|---------|
-| **AI Upscaling** | RealESRGAN, RCAN, EDSR, SwinIR, HAT, Swin2SR, diffusion, and lightweight models |
-| **Video Pipeline** | FFmpeg decode → SHM ring buffer → PyTorch inference → FFmpeg encode (H.264/H.265 NVENC) |
+| **AI Upscaling** | Python path supports broad local model coverage; native family is currently limited to eligible ONNX video models |
+| **Video Pipeline** | Python path: FFmpeg decode → SHM ring buffer → PyTorch inference → FFmpeg encode. Native direct path: packet-aware demux → `engine-v2` → packet-aware mux |
 | **Editing** | Trim, crop, rotation, color grading (brightness, contrast, saturation, hue), FPS override |
-| **Research Layer** | Multi-model blending, frequency band analysis, hallucination detection, spatial routing |
-| **Auto Grading** | Histogram analysis, white balance correction, noise estimation, skin tone detection |
+| **Research Layer** | Python path only: multi-model blending, frequency band analysis, hallucination detection, spatial routing |
+| **Auto Grading** | Python-oriented grading and analysis flow; not a native-family contract |
 | **Precision Modes** | FP32, FP16, and deterministic (forces `cudnn.deterministic`, disables TF32) |
 | **Job Queue** | Batch processing with per-job progress and ETA estimation |
 | **Professional UI** | Tiled mosaic layout (react-mosaic), video preview with crop overlay, interactive timeline |
@@ -73,6 +81,7 @@ VideoForge is a local-first desktop application for AI-powered image and video u
 Notes:
 - The UI only attempts the native family for video jobs when native mode is enabled and the selected model is ONNX.
 - Research/blending features are part of the Python path, not the native contract.
+- Feature lists above should be read as repo capabilities, not a claim that every route supports every feature.
 - Speed comparisons should always be read with route, cache state, batch, and fallback status in mind.
 
 ---
@@ -119,11 +128,13 @@ Notes:
 - **NVDEC → CUDA Preprocessing → TensorRT/ONNX Inference → NVENC** — no CPU round-trips
 - CUDA custom kernels for NV12↔RGB conversion, scaling, and format transforms
 - RAII-based VRAM management with bucketed buffer pools
-- Streamed FFmpeg demux/mux boundaries in the current direct-native host path
+- Packet-aware FFmpeg demux/mux boundaries in the current direct-native host path
 
 ---
 
 ## Data Flow (Video Upscale)
+
+### Python sidecar path
 
 ```
 1. User selects input video, model, and edit settings in the UI
@@ -142,6 +153,24 @@ Notes:
    └──────────┘     └──────────────────┘
 6. Rust streams encoded frames to FFmpeg → final MP4 (NVENC H.264/H.265)
 7. Cleanup: SHM files removed, Python worker terminated
+```
+
+### Native direct path
+
+```
+1. User selects a video job with an ONNX model and native mode enabled
+2. UI sends upscale_request_native via Tauri IPC to the Rust backend
+3. Backend applies compile-time and runtime native gating
+4. Host performs packet-aware FFmpeg demux on the input container
+5. Direct processing loop:
+   packet-aware demux
+      -> NVDEC
+      -> CUDA preprocess
+      -> TensorRT / ONNX Runtime inference
+      -> CUDA postprocess
+      -> NVENC
+      -> packet-aware FFmpeg mux
+6. Final MP4 is written to the requested output path
 ```
 
 ---
@@ -171,7 +200,7 @@ Model weights are loaded from the `weights/` directory and scanned automatically
   - [Node.js](https://nodejs.org/) ≥ 18
   - [Rust](https://rustup.rs/) (stable toolchain)
   - [FFmpeg & FFprobe](https://ffmpeg.org/) available either in `PATH` or in supported repo/runtime locations discovered by the native runtime helpers
-  - Python 3.10+ (bundled or installed to `%APPDATA%/VideoForge/python/`)
+  - Python 3.10+ (bundled or installed to `%LOCALAPPDATA%/VideoForge/python/`)
 
 ---
 
@@ -180,7 +209,7 @@ Model weights are loaded from the `weights/` directory and scanned automatically
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-org/VideoForge.git
+git clone https://github.com/VideoForgeRepo/VideoForgeV1.5.git
 cd VideoForge
 ```
 
@@ -211,7 +240,40 @@ Alternatively, use the convenience script:
 run.bat
 ```
 
-### 4. Production build
+### 4. Run the native engine in development mode
+
+Native development requires the `native_engine` Cargo feature and runtime opt-in.
+
+CLI option:
+
+```bash
+npm run dev:native
+```
+
+One-click launchers:
+
+```bat
+run_native_engine.bat
+run_native_engine_debug.bat
+```
+
+Launcher behavior:
+
+- `run_native_engine.bat`
+  - enables `VIDEOFORGE_ENABLE_NATIVE_ENGINE=1`
+  - enables `VIDEOFORGE_NATIVE_ENGINE_DIRECT=1`
+  - starts `npm run dev:native`
+- `run_native_engine_debug.bat`
+  - enables the same native direct path
+  - also enables a small startup-focused debug capture window for NVDEC, pipeline, postprocess-kernel, NVENC, and mux logging
+  - writes dumps under `artifacts/nvdec_debug/run_native_engine_debug/`
+
+Important routing note:
+
+- The UI only attempts the native family for **video** jobs when native mode is enabled and the selected model is **ONNX**.
+- If those conditions are not met, the job uses the Python path instead.
+
+### 5. Production build
 
 ```bash
 npm run build
@@ -227,11 +289,40 @@ npm run build
 |---------|-------------|
 | `npm run dev` | Launch Tauri + Vite dev server with hot-reload |
 | `npm run dev:native` | Launch Tauri + Vite with the `native_engine` feature enabled |
+| `npm run dev:native:cached` | Launch native dev mode with TensorRT engine cache enabled |
 | `npm run build` | Production build (compiles Rust + bundles UI) |
 | `npm run build:native` | Production build with the `native_engine` feature enabled |
+| `npm run build:native:cached` | Production native build with TensorRT engine cache enabled |
 | `npm run ui-install` | Install UI npm dependencies |
 | `cd src-tauri && cargo test --workspace` | Run Rust workspace tests |
 | `cd ui && npx tsc --noEmit` | Type-check the TypeScript UI |
+
+### Native Runtime Flags
+
+Common native runtime flags:
+
+| Env var | Purpose |
+|---|---|
+| `VIDEOFORGE_ENABLE_NATIVE_ENGINE=1` | Runtime opt-in for the native family |
+| `VIDEOFORGE_NATIVE_ENGINE_DIRECT=1` | Prefer the in-process `engine-v2` direct path |
+| `VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE=1` | Enable TensorRT engine caching |
+| `VIDEOFORGE_TRT_CACHE_DIR=<path>` | Override TensorRT cache location |
+
+Useful debug-only flags:
+
+| Env var | Purpose |
+|---|---|
+| `VIDEOFORGE_NVDEC_DEBUG_DUMP=1` | Enable NVDEC dump support |
+| `VIDEOFORGE_NVDEC_DEBUG_DUMP_FRAMES=<N>` | Dump a decoded frame window |
+| `VIDEOFORGE_NVDEC_DEBUG_DUMP_START_FRAME=<F>` | Start frame for NVDEC windowed dumps |
+| `VIDEOFORGE_PIPELINE_DEBUG_DUMP_FRAMES=<N>` | Dump preprocess and postprocess frame windows |
+| `VIDEOFORGE_PIPELINE_DEBUG_DUMP_START_FRAME=<F>` | Start frame for pipeline-window dumps |
+| `VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_FRAMES=<N>` | Dump postprocess-kernel input frame windows |
+| `VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_START_FRAME=<F>` | Start frame for postprocess-kernel dumps |
+| `VIDEOFORGE_NVENC_DEBUG_DUMP_FRAMES=<N>` | Dump NVENC handoff surfaces and encoded packets |
+| `VIDEOFORGE_NATIVE_MUX_DEBUG=1` | Enable mux-side debug logging |
+
+Debug artifacts are written under `artifacts/` and should not be committed.
 
 ### Metadata Alignment
 
@@ -270,7 +361,9 @@ VideoForge/
 ├── docs/                   # Architecture docs & roadmap
 ├── requirements.txt        # Python dependencies
 ├── package.json            # Root workspace (Tauri CLI)
-└── run.bat                 # One-click dev launcher
+├── run.bat                 # One-click standard dev launcher
+├── run_native_engine.bat   # One-click native direct dev launcher
+└── run_native_engine_debug.bat # One-click native direct startup-debug launcher
 ```
 
 ---
@@ -294,7 +387,7 @@ VideoForge/
 
 ## Platform Notes
 
-- **Windows-primary**: Python runtime resolves to `%APPDATA%/Local/VideoForge/python/` in distribution builds. Development uses local venvs.
+- **Windows-primary**: Python runtime resolves to `%LOCALAPPDATA%/VideoForge/python/` in distribution builds. Development uses local venvs.
 - **NVIDIA GPU required**: CUDA 11.7+ with NVENC support for hardware encoding.
 - **Native engine is opt-in**: build with `--features native_engine` and enable `VIDEOFORGE_ENABLE_NATIVE_ENGINE=1` at runtime.
 - **Model weights** are scanned from `weights/` directories relative to the installation path.
@@ -307,7 +400,8 @@ Current repo state, based on the canonical docs and checked-in code:
 
 - Python remains the default engine path.
 - Native direct and native-cli now share a larger control plane and result contract.
-- The direct native path has removed the main temp-file boundaries in favor of streamed demux/mux.
+- The direct native path now uses packet-aware demux/mux boundaries instead of the earlier chunked streaming path.
+- Native direct startup reliability has been improved by aligning decode-to-preprocess buffer lifetime handling with the working `third_party/rave` reference pattern.
 - The canonical architecture, capability, routing, persistence, and metrics docs are now in place.
 - The cleanup follow-up refactor tracks are complete and the maintained validation matrix is green.
 - Optional run manifests now have parity across Python and native command paths through the shared artifact system.

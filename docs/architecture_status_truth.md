@@ -81,7 +81,7 @@ Status:
 `Current truth`:
 - Selected only when `VIDEOFORGE_ENABLE_NATIVE_ENGINE=1` and `VIDEOFORGE_NATIVE_ENGINE_DIRECT=1`
 - Uses the in-process `engine-v2` path
-- Current direct path uses FFmpeg demux stdout into the engine and FFmpeg mux stdin out of the engine
+- Current direct path uses packet-aware FFmpeg demux into the engine and packet-aware FFmpeg muxing out of the engine
 - Some direct failures fall back to CLI-native
 
 Key files:
