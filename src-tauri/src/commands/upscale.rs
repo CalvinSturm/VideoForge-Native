@@ -26,7 +26,7 @@ use crate::runtime_truth::{
     RuntimeConfigSnapshot, RuntimeEngineFamily, RuntimeMediaKind, RuntimeMetricsExtensions,
 };
 use crate::run_manifest::{
-    maybe_write_run_manifest, RunManifestInputs, WorkerCapsSnapshot,
+    maybe_write_run_manifest, run_artifacts_enabled_from_env, RunManifestInputs, WorkerCapsSnapshot,
 };
 use crate::tauri_contracts::{UpscaleProgressEventPayload, UpscaleRequest};
 use crate::video_pipeline;
@@ -323,12 +323,20 @@ pub async fn run_upscale_job(
         &RunManifestInputs {
             input_path: &config.input_path,
             output_path: &output_path,
+            engine_family: Some("python"),
+            route_id: Some("python_sidecar"),
             scale: config.scale,
             precision: &precision,
             model_key: Some(&config.model),
-            worker_caps: &worker_caps,
+            model_path: None,
+            worker_caps: WorkerCapsSnapshot::from(&worker_caps),
             ipc_protocol_version: Some(crate::ipc::PROTOCOL_VERSION),
             shm_protocol_version: None,
+            requested_executor: None,
+            executed_executor: None,
+            audio_preserved: None,
+            trt_cache_enabled: None,
+            trt_cache_dir: None,
             app_version: Some(env!("CARGO_PKG_VERSION")),
         },
     )
@@ -1387,7 +1395,7 @@ pub async fn upscale_request(
         edit_config: request.edit_config,
         research_config: research_state.inner().clone(),
         zenoh_timeout_secs: 60,
-        enable_run_artifacts: false,
+        enable_run_artifacts: run_artifacts_enabled_from_env(),
         use_shm_proto_v2: false,
         shm_ring_size_override: None,
     };

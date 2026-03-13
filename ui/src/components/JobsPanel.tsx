@@ -118,12 +118,6 @@ const IconTrash = () => (
   </svg>
 );
 
-const IconStop = () => (
-  <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
-    <rect x="6" y="6" width="12" height="12" rx="1" />
-  </svg>
-);
-
 // Spinner with modern styling
 const Spinner = () => (
   <div style={{
@@ -470,15 +464,6 @@ export const JobsPanel: React.FC<JobsPanelProps> = ({
 
                   {/* Actions */}
                   <div style={{ display: 'flex', gap: '6px' }}>
-                    {isRunning && (
-                      <ActionButton
-                        icon={<IconStop />}
-                        label="STOP"
-                        onClick={() => cancelJob(job.id)}
-                        variant="danger"
-                        title="Cancel Job"
-                      />
-                    )}
                     {isComplete && job.outputPath && (
                       <>
                         <ActionButton

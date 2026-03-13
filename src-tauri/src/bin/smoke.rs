@@ -36,9 +36,9 @@
 
 use std::process::{self, Stdio};
 use std::time::Duration;
-use std::{env, path::PathBuf};
 
 use app_lib::ipc::{self, protocol::RequestEnvelope};
+use app_lib::commands::native_runtime::configure_repo_tool_runtime_path;
 use app_lib::python_env::{get_free_port, resolve_python_environment, ProcessGuard, PYTHON_PIDS};
 use serde_json::json;
 use tokio::time::timeout;
@@ -80,52 +80,6 @@ fn check_ffprobe() -> bool {
         out.map(|s| s.success()).unwrap_or(false),
         "ffprobe not found — install FFmpeg (includes ffprobe) and ensure it is in PATH",
     )
-}
-
-fn configure_repo_runtime_path() {
-    let ffmpeg_exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-    let ffprobe_exe = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
-
-    let root = match PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .canonicalize()
-    {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-
-    let mut additions: Vec<PathBuf> = Vec::new();
-
-    for dir in [
-        root.join("third_party").join("ffmpeg").join("bin"),
-        root.join("third_party").join("ffmpeg"),
-    ] {
-        if dir.join(ffmpeg_exe).exists() && dir.join(ffprobe_exe).exists() {
-            additions.push(dir);
-            break;
-        }
-    }
-
-    let trt = root.join("third_party").join("tensorrt");
-    if trt.join("nvinfer_10.dll").exists() {
-        additions.push(trt);
-    }
-
-    if additions.is_empty() {
-        return;
-    }
-
-    let current = env::var_os("PATH").unwrap_or_default();
-    let mut paths: Vec<PathBuf> = env::split_paths(&current).collect();
-    for dir in additions {
-        if dir.is_dir() && !paths.iter().any(|p| p == &dir) {
-            paths.insert(0, dir);
-        }
-    }
-    if let Ok(joined) = env::join_paths(paths) {
-        // SAFETY: process-local PATH setup for smoke prerequisites/runtime.
-        unsafe { env::set_var("PATH", joined) };
-    }
 }
 
 fn check_python_env() -> Option<(String, String)> {
@@ -1150,7 +1104,7 @@ async fn main() {
         .try_init();
 
     let args = parse_args();
-    configure_repo_runtime_path();
+    configure_repo_tool_runtime_path();
 
     println!();
     println!("=== VideoForge Smoke Test ===");

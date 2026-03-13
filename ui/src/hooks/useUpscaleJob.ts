@@ -11,7 +11,7 @@ import type { useRaveIntegration } from "./useRaveIntegration";
 import { useJobStore } from "../Store/useJobStore";
 import type { PanelId } from "../Store/viewLayoutStore";
 import { getScaleFromModel, inferNativePrecision } from "../utils/modelRuntime";
-import { cancelJob, completeJob, failJob, updateJobById } from "../utils/jobState";
+import { completeJob, failJob, updateJobById } from "../utils/jobState";
 import type {
     ExportRequestArgs,
     ExportRequestResult,
@@ -345,19 +345,14 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
         if (!job) return;
 
         if (job.status === 'running') {
-            try {
-                setJobs(prev => updateJobById(prev, id, jobToCancel => cancelJob(jobToCancel)));
-                setLogs(prev => [...prev, `[SYSTEM] Job ${id} cancelled by user.`]);
-                if (activeJob?.id === id) setActiveJob(null);
-                setIsProcessing(false);
-            } catch {
-                addToast("Failed to cancel job", "error");
-            }
+            addToast("Stopping an active backend job is not supported yet.", "warning");
+            setLogs(prev => [...prev, `[SYSTEM] Stop requested for ${id}, but backend stop control is not implemented.`]);
+            return;
         } else {
             setJobs(prev => prev.filter(j => j.id !== id));
             if (activeJob?.id === id) setActiveJob(null);
         }
-    }, [jobs, activeJob, setJobs, setActiveJob, setIsProcessing, setLogs, addToast]);
+    }, [jobs, activeJob, setJobs, setActiveJob, setLogs, addToast]);
 
     return {
         startUpscale,

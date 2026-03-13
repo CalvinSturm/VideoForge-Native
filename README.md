@@ -62,6 +62,19 @@ VideoForge is a local-first desktop application for AI-powered image and video u
 | **Job Queue** | Batch processing with per-job progress and ETA estimation |
 | **Professional UI** | Tiled mosaic layout (react-mosaic), video preview with crop overlay, interactive timeline |
 
+### Shipped Support Matrix
+
+| Engine / route | Media | Model formats | Practical model support | Relative speed |
+|---|---|---|---|---|
+| **Python sidecar** | Image, video | PyTorch weights, broad local model support | RCAN, EDSR, RealESRGAN, SwinIR, HAT, Swin2SR, diffusion, lightweight models, research/blending path | Broadest compatibility, generally slower than native direct for eligible video jobs |
+| **Native direct** | Video only | ONNX only | Compatible ONNX video models routed through `engine-v2` | Fastest expected path for supported video jobs |
+| **Native CLI-backed** | Video only | ONNX only | Compatible ONNX video models routed through the `rave` adapter | Native-family compatibility route; typically less ideal than native direct |
+
+Notes:
+- The UI only attempts the native family for video jobs when native mode is enabled and the selected model is ONNX.
+- Research/blending features are part of the Python path, not the native contract.
+- Speed comparisons should always be read with route, cache state, batch, and fallback status in mind.
+
 ---
 
 ## Architecture
@@ -295,7 +308,10 @@ Current repo state, based on the canonical docs and checked-in code:
 - Python remains the default engine path.
 - Native direct and native-cli now share a larger control plane and result contract.
 - The direct native path has removed the main temp-file boundaries in favor of streamed demux/mux.
-- Remaining work is architecture-contract hardening, benchmark/tool alignment, and selective native productization.
+- The canonical architecture, capability, routing, persistence, and metrics docs are now in place.
+- The cleanup follow-up refactor tracks are complete and the maintained validation matrix is green.
+- Optional run manifests now have parity across Python and native command paths through the shared artifact system.
+- Remaining work is focused on selective native productization and refining user-facing status/support language, not on broad cleanup recovery.
 
 For current planning detail, start with:
 

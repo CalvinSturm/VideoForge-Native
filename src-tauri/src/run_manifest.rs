@@ -54,12 +54,28 @@ pub struct RunManifestV1 {
     pub job_id: String,
     pub input_path: String,
     pub output_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_id: Option<String>,
     pub scale: u32,
     pub precision: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<String>,
     pub worker_caps: WorkerCapsSnapshot,
     pub protocol: ProtocolSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_executor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executed_executor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_preserved: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trt_cache_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trt_cache_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_version: Option<String>,
 }
@@ -68,13 +84,31 @@ pub struct RunManifestV1 {
 pub struct RunManifestInputs<'a> {
     pub input_path: &'a str,
     pub output_path: &'a str,
+    pub engine_family: Option<&'a str>,
+    pub route_id: Option<&'a str>,
     pub scale: u32,
     pub precision: &'a str,
     pub model_key: Option<&'a str>,
-    pub worker_caps: &'a WorkerCaps,
+    pub model_path: Option<&'a str>,
+    pub worker_caps: WorkerCapsSnapshot,
     pub ipc_protocol_version: Option<u32>,
     pub shm_protocol_version: Option<u32>,
+    pub requested_executor: Option<&'a str>,
+    pub executed_executor: Option<&'a str>,
+    pub audio_preserved: Option<bool>,
+    pub trt_cache_enabled: Option<bool>,
+    pub trt_cache_dir: Option<&'a str>,
     pub app_version: Option<&'a str>,
+}
+
+pub fn run_artifacts_enabled_from_env() -> bool {
+    match std::env::var("VIDEOFORGE_ENABLE_RUN_ARTIFACTS") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
 }
 
 pub fn normalize_path_for_id(path: &str) -> String {
@@ -108,7 +142,7 @@ pub fn compute_job_id(
 }
 
 pub fn build_run_manifest_v1(inputs: &RunManifestInputs<'_>) -> Result<RunManifestV1> {
-    let worker_caps = WorkerCapsSnapshot::from(inputs.worker_caps);
+    let worker_caps = inputs.worker_caps.clone();
     let created_at_utc = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .context("formatting manifest timestamp")?;
@@ -127,14 +161,22 @@ pub fn build_run_manifest_v1(inputs: &RunManifestInputs<'_>) -> Result<RunManife
         job_id,
         input_path: inputs.input_path.to_string(),
         output_path: inputs.output_path.to_string(),
+        engine_family: inputs.engine_family.map(str::to_string),
+        route_id: inputs.route_id.map(str::to_string),
         scale: inputs.scale,
         precision: inputs.precision.to_string(),
         model_key: inputs.model_key.map(str::to_string),
+        model_path: inputs.model_path.map(str::to_string),
         worker_caps,
         protocol: ProtocolSnapshot {
             ipc_protocol_version: inputs.ipc_protocol_version,
             shm_protocol_version: inputs.shm_protocol_version,
         },
+        requested_executor: inputs.requested_executor.map(str::to_string),
+        executed_executor: inputs.executed_executor.map(str::to_string),
+        audio_preserved: inputs.audio_preserved,
+        trt_cache_enabled: inputs.trt_cache_enabled,
+        trt_cache_dir: inputs.trt_cache_dir.map(str::to_string),
         app_version: inputs.app_version.map(str::to_string),
     })
 }
@@ -186,12 +228,20 @@ mod tests {
         RunManifestInputs {
             input_path: r"C:\input\clip.mp4",
             output_path,
+            engine_family: Some("python"),
+            route_id: Some("python_sidecar"),
             scale: 4,
             precision: "fp16",
             model_key: Some("RCAN_x4"),
-            worker_caps: caps,
+            model_path: None,
+            worker_caps: WorkerCapsSnapshot::from(caps),
             ipc_protocol_version: Some(1),
             shm_protocol_version: None,
+            requested_executor: None,
+            executed_executor: None,
+            audio_preserved: None,
+            trt_cache_enabled: None,
+            trt_cache_dir: None,
             app_version: Some("0.1.0"),
         }
     }

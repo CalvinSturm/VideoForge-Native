@@ -10,6 +10,7 @@ use app_lib::commands::native_engine::{
     native_benchmark_done_json, native_benchmark_result_json,
     native_benchmark_warmup_start_json, run_native_tool_request, NativeToolRunRequest,
 };
+use app_lib::commands::native_runtime::configure_repo_tool_runtime_path;
 use app_lib::control::ResearchConfig;
 use app_lib::edit_config::EditConfig;
 use app_lib::models;
@@ -66,6 +67,7 @@ fn python_benchmark_done_json(
 #[tokio::main]
 async fn main() {
     init_tracing();
+    configure_repo_tool_runtime_path();
 
     let args = match parse_args(env::args().skip(1).collect()) {
         Ok(args) => args,

@@ -21,10 +21,10 @@ Interpretation rules:
 | Compile-time feature required | No | No | Yes | Command surface exists; direct implementation feature only |
 | Audio preservation contract | N/A | Not explicitly surfaced in result | Supported with caveats | Supported with caveats |
 | Direct-to-CLI fallback | No | No | Supported for selected error classes | N/A |
-| Run manifest support | Not documented | Optional | No equivalent canonical artifact in current code | No equivalent canonical artifact in current code |
+| Run manifest support | Optional via shared artifact opt-in | Optional via shared artifact opt-in | Optional via shared artifact opt-in | Optional via shared artifact opt-in |
 | Stage metrics contract | Limited | Limited | Richer | Moderate, adapter-derived |
 | Pause/resume | Not supported | Not supported | Not supported | Not supported |
-| Cancel | UI-local only, not a true backend stop contract | UI-local only, not a true backend stop contract | UI-local only, not a true backend stop contract | UI-local only, not a true backend stop contract |
+| Cancel | Not supported as a running-job control | Not supported as a running-job control | Not supported as a running-job control | Not supported as a running-job control |
 | Research/blending features | Supported with Python-path caveats | Supported with Python-path caveats | Not represented as native contract | Not represented as native contract |
 
 ## UI Capability Claims
@@ -32,6 +32,7 @@ Interpretation rules:
 | UI concept | Current truth | Source |
 |---|---|---|
 | Queue pause/resume | Not presented as a supported queue control | `ui/src/components/JobsPanel.tsx`, `ui/src/App.tsx` |
+| Queue stop/cancel | Not presented as a supported running-job control; completed/error rows are dismiss-only | `ui/src/components/JobsPanel.tsx`, `ui/src/hooks/useUpscaleJob.ts` |
 | Native engine toggle | Intent flag, not runtime proof | `ui/src/Store/useJobStore.tsx`, `ui/src/hooks/useUpscaleJob.ts` |
 | Native result details | UI can display backend-reported route/result metadata after completion | `ui/src/types.ts`, `ui/src/components/JobsPanel.tsx` |
 

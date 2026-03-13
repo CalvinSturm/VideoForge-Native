@@ -8,6 +8,10 @@ use crate::runtime_truth::{
     RuntimeConfigSnapshot, RuntimeEngineFamily, RuntimeFallbackInfo, RuntimeMetricsExtensions,
     RuntimeSnapshotKind,
 };
+#[cfg(feature = "native_engine")]
+use crate::run_manifest::{
+    maybe_write_run_manifest, run_artifacts_enabled_from_env, RunManifestInputs, WorkerCapsSnapshot,
+};
 
 #[cfg(feature = "native_engine")]
 use crate::commands::native_engine::{
@@ -426,6 +430,45 @@ pub(crate) fn build_native_observed_metrics(
 }
 
 #[cfg(feature = "native_engine")]
+fn maybe_write_native_run_manifest(
+    job: &NativeJobSpec,
+    result: &NativeUpscaleResult,
+) -> Result<(), String> {
+    if let Some(manifest_path) = maybe_write_run_manifest(
+        run_artifacts_enabled_from_env(),
+        &RunManifestInputs {
+            input_path: &job.input_path,
+            output_path: &result.output_path,
+            engine_family: Some("native"),
+            route_id: result
+                .perf
+                .executed_executor
+                .as_deref()
+                .map(route_id_for_executor),
+            scale: job.scale,
+            precision: &job.precision,
+            model_key: None,
+            model_path: Some(&job.model_path),
+            worker_caps: WorkerCapsSnapshot::default(),
+            ipc_protocol_version: None,
+            shm_protocol_version: None,
+            requested_executor: result.perf.requested_executor.as_deref(),
+            executed_executor: result.perf.executed_executor.as_deref(),
+            audio_preserved: Some(result.audio_preserved),
+            trt_cache_enabled: Some(result.perf.trt_cache_enabled),
+            trt_cache_dir: result.perf.trt_cache_dir.as_deref(),
+            app_version: Some(env!("CARGO_PKG_VERSION")),
+        },
+    )
+    .map_err(|e| format!("Failed to write native run manifest: {e}"))?
+    {
+        tracing::info!(path = %manifest_path.display(), "Native run manifest written");
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "native_engine")]
 fn trt_cache_runtime(model_path: &str) -> (bool, Option<String>) {
     let enabled = std::env::var("VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE")
         .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True"))
@@ -572,6 +615,7 @@ async fn run_native_via_rave_cli(
     result.runtime_snapshot = Some(runtime_snapshot);
     result.observed_metrics = Some(observed_metrics.clone());
     log_run_observed_metrics(&observed_metrics);
+    maybe_write_native_run_manifest(job, &result)?;
 
     Ok(result)
 }
@@ -624,7 +668,10 @@ async fn run_direct_with_fallback(job: NativeJobSpec) -> Result<NativeUpscaleRes
     let direct_result = run_native_pipeline(&job).await;
 
     match direct_result {
-        Ok(result) => Ok(result),
+        Ok(result) => {
+            maybe_write_native_run_manifest(&job, &result)?;
+            Ok(result)
+        }
         Err(err_json) => {
             let Some(err) = decode_native_error(&err_json) else {
                 return Err(err_json);

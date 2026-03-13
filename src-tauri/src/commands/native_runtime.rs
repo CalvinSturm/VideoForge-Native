@@ -24,7 +24,6 @@ pub(crate) fn workspace_root() -> Option<PathBuf> {
         .ok()
 }
 
-#[cfg(feature = "native_engine")]
 fn prepend_path_dirs(dirs: &[PathBuf]) {
     let current = std::env::var_os("PATH").unwrap_or_default();
     let mut paths: Vec<PathBuf> = std::env::split_paths(&current).collect();
@@ -37,6 +36,11 @@ fn prepend_path_dirs(dirs: &[PathBuf]) {
         // SAFETY: process-local env mutation before worker/process launches.
         unsafe { std::env::set_var("PATH", joined) };
     }
+}
+
+pub fn configure_repo_tool_runtime_path() {
+    let runtime_paths = resolve_native_runtime_paths(workspace_root().as_deref(), None);
+    prepend_path_dirs(&runtime_paths.path_additions);
 }
 
 pub(crate) fn find_file_under(root: &Path, file_name: &str, max_depth: usize) -> Option<PathBuf> {
