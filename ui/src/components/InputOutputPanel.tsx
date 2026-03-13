@@ -1,14 +1,7 @@
-import React, { useMemo, useState, useRef, useEffect, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import React, { useMemo, useState, useRef, useEffect } from "react";
 import type { EditState, VideoState, UpscaleMode } from "../types";
 import { SignalSummary } from "./SignalSummary";
 import { AIUpscaleNode } from "./AIUpscaleNode";
-import {
-  HF_METHODS,
-  RESEARCH_DEFAULTS,
-  RESEARCH_PRESETS,
-  type ResearchConfig,
-} from "./inputOutputPanel/researchConfig";
 import {
   useJobStore,
   type UpscaleScale,
@@ -54,7 +47,6 @@ import {
   SmartPath,
   Tooltip,
 } from "./inputOutputPanel/panelPrimitives";
-import { ResearchControlsSection } from "./inputOutputPanel/ResearchControlsSection";
 import { InputSourceSection } from "./inputOutputPanel/InputSourceSection";
 import { GeometryControlsSection } from "./inputOutputPanel/GeometryControlsSection";
 import { PostProcessingSection } from "./inputOutputPanel/PostProcessingSection";
@@ -222,7 +214,6 @@ interface InputOutputPanelProps {
   onRunValidate: () => void;
   videoState: VideoState; editState: EditState; setEditState: (state: EditState) => void;
   onExportEdited: () => void; showTech: boolean;
-  showResearchParams?: boolean;
   viewMode: 'edit' | 'preview'; setViewMode: (mode: 'edit' | 'preview') => void;
 }
 
@@ -230,7 +221,7 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
   mode, setMode, pickInput, inputPath, pickOutput, outputPath,
   model, setModel, loadModel, availableModels, loadingModel,
   startUpscale, isValidPaths, onRunValidate, videoState, editState, setEditState, onExportEdited,
-  showTech, showResearchParams = true,
+  showTech,
 }) => {
 
   const panelRef = useRef<HTMLDivElement>(null);
@@ -250,33 +241,11 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
 
   // Local UI state (not persisted)
   const [toastState, setToastState] = useState<{ msg: string; visible: boolean }>({ msg: '', visible: false });
-  const [researchConfig, setResearchConfigLocal] = useState<ResearchConfig>(RESEARCH_DEFAULTS);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const showToast = (msg: string) => {
     setToastState({ msg, visible: true });
     setTimeout(() => setToastState(s => ({ ...s, visible: false })), 4000);
   };
-
-  // Fetch research config from backend on mount
-  useEffect(() => {
-    invoke<ResearchConfig>("get_research_config")
-      .then(setResearchConfigLocal)
-      .catch(() => { });
-  }, []);
-
-  const updateResearchParam = useCallback((key: keyof ResearchConfig, value: number | string | boolean) => {
-    setResearchConfigLocal(prev => ({ ...prev, [key]: value }));
-    invoke("update_research_param", { key, value }).catch(() => { });
-  }, []);
-
-  const applyResearchPreset = useCallback((presetName: string) => {
-    const preset = RESEARCH_PRESETS[presetName];
-    if (!preset) return;
-    const newConfig = { ...researchConfig, ...preset };
-    setResearchConfigLocal(newConfig);
-    invoke("set_research_config", { config: newConfig }).catch(() => { });
-  }, [researchConfig]);
 
   // --- DERIVED STATE ---
   const activeScale = upscaleFactor;
@@ -606,28 +575,8 @@ export const InputOutputPanel: React.FC<InputOutputPanelProps> = ({
             loadModel={loadModel}
             isLoading={loadingModel}
             showTech={showTech}
-            showResearchParams={showResearchParams}
-            pipelineFeatures={{
-              adr_enabled: researchConfig.adr_enabled,
-              temporal_enabled: researchConfig.temporal_enabled,
-              luma_only: researchConfig.luma_only,
-              sharpen_strength: researchConfig.sharpen_strength,
-            }}
-            onPipelineToggle={(key, value) => updateResearchParam(key as keyof ResearchConfig, value)}
           />
         </PipelineNode>
-
-        <ResearchControlsSection
-          advancedOpen={advancedOpen}
-          applyResearchPreset={applyResearchPreset}
-          availableModels={availableModels}
-          isAIActive={isAIActive}
-          mode={mode}
-          researchConfig={researchConfig}
-          setAdvancedOpen={setAdvancedOpen}
-          showResearchParams={showResearchParams}
-          updateResearchParam={updateResearchParam}
-        />
 
         <PipelineConnector isActive={isAIActive} />
 

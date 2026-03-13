@@ -162,7 +162,6 @@ const App: React.FC = () => {
   const [modelInfoMap, setModelInfoMap] = useState<Map<string, ModelInfo>>(new Map());
   const [loadingModel, setLoadingModel] = useState(false);
   const [showTechSpecs, setShowTechSpecs] = useState(false);
-  const [showResearchParams, setShowResearchParams] = useState(true);
   const [darkMode, setDarkMode] = useState(true);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [activeJob, setActiveJob] = useState<Job | null>(null);
@@ -353,13 +352,13 @@ const App: React.FC = () => {
   const tileComponents = useMemo(() => {
     const completeVideoState = { ...videoState, renderSample: renderPreviewSample };
     return {
-      SETTINGS: <InputOutputPanel mode={mode} setMode={setMode} pickInput={pickInput} inputPath={inputPath} pickOutput={pickOutput} outputPath={outputPath} model={model} setModel={setModel} availableModels={availableModels} loadingModel={loadingModel} loadModel={() => { }} startUpscale={startUpscale} onRunValidate={startRaveValidate} isValidPaths={isValidPaths} showTech={showTechSpecs} showResearchParams={showResearchParams} videoState={completeVideoState} editState={editState} setEditState={setEditState} onExportEdited={onExportEdited} viewMode={viewMode} setViewMode={setViewMode} />,
+      SETTINGS: <InputOutputPanel mode={mode} setMode={setMode} pickInput={pickInput} inputPath={inputPath} pickOutput={pickOutput} outputPath={outputPath} model={model} setModel={setModel} availableModels={availableModels} loadingModel={loadingModel} loadModel={() => { }} startUpscale={startUpscale} onRunValidate={startRaveValidate} isValidPaths={isValidPaths} showTech={showTechSpecs} videoState={completeVideoState} editState={editState} setEditState={setEditState} onExportEdited={onExportEdited} viewMode={viewMode} setViewMode={setViewMode} />,
       PREVIEW: <PreviewPanel inputPreview={inputPath} activeJob={activeJob} videoState={completeVideoState} onFileDrop={handleNewInput} mode={mode} editState={editState} setEditState={setEditState} viewMode={viewMode} setViewMode={setViewMode} showTech={showTechSpecs} />,
       // Updated to pass clearCompleted
       QUEUE: <JobsPanel jobs={jobs} cancelJob={handleCancelJob} clearCompleted={clearCompletedJobs} showTech={showTechSpecs} />,
       ACTIVITY: <LogsPanel logs={logs} setLogs={setLogs} darkMode={darkMode} logsEndRef={logsEndRef} />
     };
-  }, [mode, inputPath, outputPath, model, availableModels, loadingModel, isValidPaths, showTechSpecs, showResearchParams, videoState, editState, viewMode, jobs, activeJob, logs, upscaleConfig, modelInfoMap]);
+  }, [mode, inputPath, outputPath, model, availableModels, loadingModel, isValidPaths, showTechSpecs, videoState, editState, viewMode, jobs, activeJob, logs, upscaleConfig, modelInfoMap]);
 
   const renderTile = useCallback((id: PanelId, path: any[]) => {
     return (
@@ -426,8 +425,6 @@ const App: React.FC = () => {
         darkMode={darkMode}
         showTechSpecs={showTechSpecs}
         setShowTechSpecs={setShowTechSpecs}
-        showResearchParams={showResearchParams}
-        setShowResearchParams={setShowResearchParams}
       />
     </div>
   );

@@ -9,7 +9,6 @@ const IconFolder = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="n
 const IconCpu = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="4" y="4" width="16" height="16" rx="2" /><rect x="9" y="9" width="6" height="6" /><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3" /></svg>;
 const IconActivity = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12" /></svg>;
 const IconZap = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" /></svg>;
-const IconFlask = () => <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 3h6M10 3v6.5L3.5 20.4a1 1 0 0 0 .9 1.6h15.2a1 1 0 0 0 .9-1.6L14 9.5V3" /></svg>;
 
 // --- HELPERS ---
 const fmtMem = (bytes: number) => {
@@ -23,12 +22,10 @@ interface StatusFooterProps {
   darkMode: boolean;
   showTechSpecs: boolean;
   setShowTechSpecs: (show: boolean) => void;
-  showResearchParams: boolean;
-  setShowResearchParams: (show: boolean) => void;
 }
 
 export const StatusFooter: React.FC<StatusFooterProps> = ({
-  toggleTheme, darkMode, showTechSpecs, setShowTechSpecs, showResearchParams, setShowResearchParams
+  toggleTheme, darkMode, showTechSpecs, setShowTechSpecs
 }) => {
   const { isProcessing, framesProcessed, totalFrames, progressPercent, stats, lastOutputPath } = useJobStore();
 
@@ -125,12 +122,6 @@ export const StatusFooter: React.FC<StatusFooterProps> = ({
           onClick={() => setShowTechSpecs(!showTechSpecs)}
           title="Toggle Hardware Stats"
           active={showTechSpecs}
-        />
-        <FooterButton
-          icon={<IconFlask />}
-          onClick={() => setShowResearchParams(!showResearchParams)}
-          title="Toggle Research Parameters"
-          active={showResearchParams}
         />
         <FooterButton
           icon={darkMode ? <IconMoon /> : <IconSun />}

@@ -16,7 +16,5 @@ export {
     IconChevronDown, IconPlus, IconX,
 } from "./Icons";
 
-// Config types and constants
-export type { ResearchConfig } from "./ResearchConfig";
-export { RESEARCH_DEFAULTS, RESEARCH_PRESETS, HF_METHODS } from "./ResearchConfig";
+// Shared panel constants
 export { truncateModelName, ASPECT_RATIOS, FPS_OPTIONS, getSmartResInfo } from "./constants";

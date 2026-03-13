@@ -83,14 +83,6 @@ const IconLock = () => (
 // PROPS & TYPES
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/** Pipeline feature state from ResearchConfig */
-interface PipelineFeatures {
-    adr_enabled: boolean;
-    temporal_enabled: boolean;
-    luma_only: boolean;
-    sharpen_strength: number;
-}
-
 interface AIUpscaleNodeProps {
     /** Current video state for dimension calculations */
     videoState: VideoState;
@@ -102,14 +94,8 @@ interface AIUpscaleNodeProps {
     loadModel: (modelId: string) => void;
     /** Whether a model is currently loading */
     isLoading: boolean;
-    /** Current pipeline feature toggles from research config */
-    pipelineFeatures?: PipelineFeatures;
-    /** Callback to toggle a research param */
-    onPipelineToggle?: (key: string, value: boolean | number) => void;
     /** Whether tech specs (including VRAM estimates) should be visible */
     showTech?: boolean;
-    /** Whether research/pipeline parameters should be visible */
-    showResearchParams?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -281,33 +267,6 @@ const ScaleToggle: React.FC<{
 );
 
 /**
- * Interactive pipeline feature toggle chip
- */
-const PipelineToggle: React.FC<{
-    label: string;
-    enabled: boolean;
-    onToggle: () => void;
-}> = ({ label, enabled, onToggle }) => (
-    <button
-        onClick={(e) => { e.stopPropagation(); onToggle(); }}
-        style={{
-            fontSize: '7px',
-            fontWeight: 600,
-            padding: '2px 5px',
-            borderRadius: '3px',
-            background: enabled ? 'rgba(0,255,136,0.1)' : 'rgba(255,255,255,0.05)',
-            border: enabled ? '1px solid rgba(0,255,136,0.2)' : '1px solid rgba(255,255,255,0.08)',
-            color: enabled ? 'var(--brand-primary)' : 'var(--text-muted)',
-            letterSpacing: '0.03em',
-            cursor: 'pointer',
-            transition: 'all 0.15s ease',
-        }}
-    >
-        {label}
-    </button>
-);
-
-/**
  * Resolution preset button
  */
 const ResolutionPresetButton: React.FC<{
@@ -362,10 +321,7 @@ export const AIUpscaleNode: React.FC<AIUpscaleNodeProps> = ({
     onModelChange,
     loadModel,
     isLoading,
-    pipelineFeatures,
-    onPipelineToggle,
     showTech = false,
-    showResearchParams = true,
 }) => {
     // ─── Store Access ──────────────────────────────────────────────────────────
     const { upscaleConfig, setUpscaleConfig } = useJobStore();
@@ -641,50 +597,6 @@ export const AIUpscaleNode: React.FC<AIUpscaleNodeProps> = ({
                 </CollapsibleSection>
 
                 {/* ─── PRIMARY MODEL ──────────────────────────────────────────────── */}
-                {/* ─── PIPELINE FEATURES ─────────────────────────────────────── */}
-                {pipelineFeatures && onPipelineToggle && showResearchParams && (
-                    <div style={{
-                        display: 'flex',
-                        gap: '6px',
-                        padding: '8px 10px',
-                        background: 'rgba(0,0,0,0.15)',
-                        borderRadius: '8px',
-                        border: '1px solid rgba(255,255,255,0.06)',
-                        alignItems: 'center',
-                        flexWrap: 'wrap',
-                    }}>
-                        <span style={{
-                            fontSize: '8px',
-                            color: 'var(--text-muted)',
-                            fontWeight: 600,
-                            letterSpacing: '0.05em',
-                            marginRight: '4px',
-                        }}>
-                            PIPELINE
-                        </span>
-                        <PipelineToggle
-                            label="ADR"
-                            enabled={pipelineFeatures.adr_enabled}
-                            onToggle={() => onPipelineToggle('adr_enabled', !pipelineFeatures.adr_enabled)}
-                        />
-                        <PipelineToggle
-                            label="TEMPORAL"
-                            enabled={pipelineFeatures.temporal_enabled}
-                            onToggle={() => onPipelineToggle('temporal_enabled', !pipelineFeatures.temporal_enabled)}
-                        />
-                        <PipelineToggle
-                            label="LUMA"
-                            enabled={pipelineFeatures.luma_only}
-                            onToggle={() => onPipelineToggle('luma_only', !pipelineFeatures.luma_only)}
-                        />
-                        <PipelineToggle
-                            label="SHARP"
-                            enabled={pipelineFeatures.sharpen_strength > 0}
-                            onToggle={() => onPipelineToggle('sharpen_strength', pipelineFeatures.sharpen_strength > 0 ? 0 : 0.3)}
-                        />
-                    </div>
-                )}
-
                 <CollapsibleSection
                     title="PRIMARY MODEL"
                     subtitle={currentFamily}

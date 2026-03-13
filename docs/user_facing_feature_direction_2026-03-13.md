@@ -173,6 +173,27 @@ High-value polish areas:
 - remembered panel and compare layout preferences
 - remembered zoom / preview preferences
 
+## Research Card Decision
+
+The previous research card experiment did not land as a successful core product feature.
+
+Current product decision:
+
+- the research card should remain disconnected from the main UI
+- it should not occupy primary workflow space
+- it should not shape the near-term product roadmap
+
+Reasoning:
+
+- it added complexity without improving the core enhancement/export/review workflow enough
+- it competed with more important product surface area
+- it risked exposing internal experimentation as if it were a user-facing value feature
+
+Future rule:
+
+- do not return research-facing controls to the main UI unless they clearly improve the core user outcome
+- if revived later, they should start behind an advanced or experimental surface, not in the default workflow
+
 ## Recommended Priority Order
 
 If the goal is user-facing impact rather than adding more low-level controls, the recommended order is:
