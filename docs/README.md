@@ -21,6 +21,8 @@ This directory contains the durable architecture contracts plus archived plannin
   - Resolved native direct investigation record; resume from it only if the regression returns.
 - [`product_engineering_roadmap_2026-03-13.md`](product_engineering_roadmap_2026-03-13.md)
   - Product and engineering roadmap for the next VideoForge phase.
+- [`user_facing_feature_direction_2026-03-13.md`](user_facing_feature_direction_2026-03-13.md)
+  - Current UX strengths and next user-facing feature priorities.
 - [`release_hygiene_checklist.md`](release_hygiene_checklist.md)
   - Release and packaging metadata checklist.
 - [`next_phase_direction_2026-03-13.md`](next_phase_direction_2026-03-13.md)
