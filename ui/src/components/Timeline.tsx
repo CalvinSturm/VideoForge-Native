@@ -1,5 +1,18 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
 
+interface TimelineProps {
+  duration: number;
+  currentTime: number;
+  trimStart: number;
+  trimEnd: number;
+  renderedRange?: { start: number; end: number } | null | undefined;
+  onSeek: (time: number) => void;
+  onTrimChange: (start: number, end: number) => void;
+  hasAudio?: boolean;
+  onInteractionStart?: () => void;
+  onInteractionEnd?: () => void;
+}
+
 // --- CONSTANTS ---
 const FRAME_RATE = 30; // Assumed frame rate for frame-based navigation
 const FRAME_DURATION = 1 / FRAME_RATE;
@@ -24,7 +37,7 @@ const parseTimeInput = (str: string, maxDuration: number) => {
   const parts = str.split(':');
   let seconds = 0;
   if (parts.length === 2) {
-    seconds = parseInt(parts[0]) * 60 + parseFloat(parts[1]);
+    seconds = parseInt(parts[0] ?? "0", 10) * 60 + parseFloat(parts[1] ?? "0");
   } else {
     seconds = parseFloat(str);
   }
@@ -175,7 +188,7 @@ const ZoomButton = ({ type, onClick, disabled }: { type: 'in' | 'out' | 'fit', o
 
 // --- MAIN COMPONENT ---
 
-export const Timeline: React.FC<any> = ({ duration, currentTime, trimStart, trimEnd, onSeek, onTrimChange, hasAudio = true, onInteractionStart, onInteractionEnd }) => {
+export const Timeline: React.FC<TimelineProps> = ({ duration, currentTime, trimStart, trimEnd, onSeek, onTrimChange, hasAudio = true, onInteractionStart, onInteractionEnd }) => {
   const trackRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -248,7 +261,7 @@ export const Timeline: React.FC<any> = ({ duration, currentTime, trimStart, trim
     const targetInterval = visibleSeconds / 10;
 
     const intervals = [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
-    let majorStep = intervals.find(i => i >= targetInterval) || intervals[intervals.length - 1];
+    const majorStep = intervals.find(i => i >= targetInterval) ?? intervals[intervals.length - 1] ?? 300;
 
     let minorStep = majorStep / 5;
     if (majorStep <= 0.1) minorStep = majorStep / 2;

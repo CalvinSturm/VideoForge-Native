@@ -1,7 +1,9 @@
 {
   "name": "videoforge",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "private": true,
+  "description": "VideoForge desktop shell and workspace scripts for local-first AI super-resolution",
+  "license": "LicenseRef-Proprietary",
   "scripts": {
     "dev": "npx --prefix ui tauri dev",
     "dev:native": "npx --prefix ui tauri dev --features native_engine",

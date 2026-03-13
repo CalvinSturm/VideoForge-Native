@@ -1,9 +1,10 @@
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { RaveEnvironmentJson, RaveErrorPayload, ParsedRaveError } from "../types";
+import type { RaveEnvironmentJson, RaveErrorPayload, ParsedRaveError, ToastType } from "../types";
+import type { RaveEnvironmentResult } from "../tauri/contracts";
 
 interface UseRaveIntegrationOptions {
-    addToast: (msg: string, type: string) => void;
+    addToast: (msg: string, type: ToastType) => void;
     setLogs: React.Dispatch<React.SetStateAction<string[]>>;
 }
 
@@ -136,7 +137,7 @@ export function useRaveIntegration({ addToast, setLogs }: UseRaveIntegrationOpti
     const fetchRaveEnvironment = useCallback(async (showToastOnResult: boolean): Promise<RaveEnvironmentJson | null> => {
         setRaveEnvironmentLoading(true);
         try {
-            const env = await invoke<RaveEnvironmentJson>("rave_environment");
+            const env = await invoke<RaveEnvironmentResult>("rave_environment");
             setRaveEnvironment(env);
             const ffmpegStatus = env.ffmpeg.layout_ok && env.ffmpeg.abi_ok ? "ok" : "bad";
             const cudnnStatus = env.providers.cudnn_found ? "ok" : "missing";

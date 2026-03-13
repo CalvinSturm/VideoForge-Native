@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 
-use crate::commands::native_engine::resolve_native_runtime_paths;
+use crate::commands::native_runtime::resolve_native_runtime_paths;
 
 #[derive(Debug, Clone)]
 pub struct RaveCliConfig {
@@ -113,7 +113,7 @@ pub enum RaveCliError {
 #[cfg(test)]
 mod runtime_path_tests {
     use super::*;
-    use crate::commands::native_engine::workspace_root;
+    use crate::commands::native_runtime::workspace_root;
 
     #[test]
     fn runtime_path_resolver_keeps_cli_bin_dir() {

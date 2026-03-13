@@ -28,6 +28,7 @@ use crate::runtime_truth::{
 use crate::run_manifest::{
     maybe_write_run_manifest, RunManifestInputs, WorkerCapsSnapshot,
 };
+use crate::tauri_contracts::{UpscaleProgressEventPayload, UpscaleRequest};
 use crate::video_pipeline;
 #[cfg(windows)]
 use crate::win_events::{create_named_event, format_event_name, NamedEvent};
@@ -100,29 +101,21 @@ pub struct JobProgress {
 
 pub type JobProgressFn = Arc<dyn Fn(JobProgress) + Send + Sync + 'static>;
 
-fn progress_to_event_payload(p: &JobProgress) -> serde_json::Value {
-    let mut j = json!({
-        "jobId": "active",
-        "progress": p.pct,
-        "message": p.message,
-        "eta": p.eta_secs
-    });
-    if let Some(op) = &p.output_path {
-        j["outputPath"] = json!(op);
+fn progress_to_event_payload(p: &JobProgress) -> UpscaleProgressEventPayload {
+    UpscaleProgressEventPayload {
+        job_id: "active".to_string(),
+        progress: p.pct,
+        message: p.message.clone(),
+        output_path: p.output_path.clone(),
+        eta: p.eta_secs,
+        frames_decoded: p.frames_decoded,
+        frames_processed: p.frames_processed,
+        frames_encoded: p.frames_encoded,
+        stage_ms: p
+            .stage_ms
+            .as_ref()
+            .and_then(|stage| serde_json::to_value(stage).ok()),
     }
-    if let Some(v) = p.frames_decoded {
-        j["frames_decoded"] = json!(v);
-    }
-    if let Some(v) = p.frames_processed {
-        j["frames_processed"] = json!(v);
-    }
-    if let Some(v) = p.frames_encoded {
-        j["frames_encoded"] = json!(v);
-    }
-    if let Some(stage) = &p.stage_ms {
-        j["stage_ms"] = serde_json::to_value(stage).unwrap_or_default();
-    }
-    j
 }
 
 fn build_python_observed_metrics(
@@ -1297,8 +1290,17 @@ pub async fn upscale_request(
     scale: u32,
     #[allow(unused_variables)] precision: Option<String>,
 ) -> Result<String, String> {
-    if !Path::new(&input_path).exists() {
-        return Err(format!("Input file not found: {}", input_path));
+    let request = UpscaleRequest {
+        input_path,
+        output_path,
+        model,
+        edit_config,
+        scale,
+        precision,
+    };
+
+    if !Path::new(&request.input_path).exists() {
+        return Err(format!("Input file not found: {}", request.input_path));
     }
 
     let (python_bin, script_path) = resolve_python_environment().map_err(|e| e.to_string())?;
@@ -1312,12 +1314,12 @@ pub async fn upscale_request(
     let job_config = UpscaleJobConfig {
         python_bin,
         script_path,
-        input_path,
-        output_path,
-        model,
-        scale,
-        precision: precision.unwrap_or_else(|| "fp32".to_string()),
-        edit_config,
+        input_path: request.input_path,
+        output_path: request.output_path,
+        model: request.model,
+        scale: request.scale,
+        precision: request.precision.unwrap_or_else(|| "fp32".to_string()),
+        edit_config: request.edit_config,
         research_config: research_state.inner().clone(),
         zenoh_timeout_secs: 60,
         enable_run_artifacts: false,

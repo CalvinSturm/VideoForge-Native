@@ -3,14 +3,27 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
     Job,
     RavePolicy,
-    RaveCommandJson,
-    NativeUpscaleResultJson,
-    ModelInfo
+    ModelInfo,
+    ToastType
 } from "../types";
 import type { useVideoState } from "./useVideoState";
 import type { useRaveIntegration } from "./useRaveIntegration";
 import { useJobStore } from "../Store/useJobStore";
 import type { PanelId } from "../Store/viewLayoutStore";
+import { getScaleFromModel, inferNativePrecision } from "../utils/modelRuntime";
+import { cancelJob, completeJob, failJob, updateJobById } from "../utils/jobState";
+import type {
+    ExportRequestArgs,
+    ExportRequestResult,
+    NativeUpscaleRequestArgs,
+    NativeUpscaleRequestResult,
+    RaveBenchmarkArgs,
+    RaveBenchmarkResult,
+    RaveValidateArgs,
+    RaveValidateResult,
+    UpscaleRequestArgs,
+    UpscaleRequestResult,
+} from "../tauri/contracts";
 
 interface UseUpscaleJobOptions {
     // Video state
@@ -29,25 +42,10 @@ interface UseUpscaleJobOptions {
     setActiveJob: React.Dispatch<React.SetStateAction<Job | null>>;
     // Logs / toasts
     setLogs: React.Dispatch<React.SetStateAction<string[]>>;
-    addToast: (msg: string, type: string) => void;
+    addToast: (msg: string, type: ToastType) => void;
     // Panel control
     panels: Record<PanelId, boolean>;
     openPanel: (id: PanelId) => void;
-}
-
-// Helper: Extract scale factor from model string (robust fallback)
-function getScaleFromModel(modelId?: string): number {
-    if (!modelId) return 4;
-    const match = modelId.match(/x(\d)/);
-    return match?.[1] ? parseInt(match[1], 10) : 4;
-}
-
-function inferNativePrecision(modelPath: string): "fp16" | "fp32" {
-    const lower = modelPath.toLowerCase();
-    if (lower.includes("_fp16") || lower.includes("-fp16") || lower.includes("half")) {
-        return "fp16";
-    }
-    return "fp32";
 }
 
 export function useUpscaleJob(opts: UseUpscaleJobOptions) {
@@ -78,7 +76,7 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
         if (!panels.QUEUE) openPanel('QUEUE');
 
         const activeScale = upscaleConfig.scaleFactor || getScaleFromModel(model);
-        const upscalePayload = {
+        const upscalePayload: UpscaleRequestArgs = {
             inputPath: video.inputPath,
             outputPath: video.outputPath,
             model: upscaleConfig.primaryModelId || model,
@@ -124,17 +122,18 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
 
                     if (showTechSpecs) {
                         try {
-                            const benchmark = await invoke<RaveCommandJson>("rave_benchmark", {
+                            const benchmarkArgs: RaveBenchmarkArgs = {
                                 args: rave.buildRaveBenchmarkArgs({ input: video.inputPath, modelPath: info.path, maxBatch: upscaleConfig.maxBatch, architectureClass: upscaleConfig.architectureClass }),
                                 strictAudit: true, mockRun: false, uiOptIn: true
-                            });
-                            setLogs(prev => [...prev, `[RAVE] benchmark dry-run fps=${String((benchmark as any).fps ?? "n/a")} policy=${JSON.stringify(benchmark.policy ?? {})}`]);
+                            };
+                            const benchmark = await invoke<RaveBenchmarkResult>("rave_benchmark", benchmarkArgs);
+                            setLogs(prev => [...prev, `[RAVE] benchmark dry-run fps=${String(benchmark.fps ?? "n/a")} policy=${JSON.stringify(benchmark.policy ?? {})}`]);
                         } catch (benchErr) {
                             setLogs(prev => [...prev, `[RAVE] benchmark dry-run failed: ${benchErr}`]);
                         }
                     }
 
-                    const nativeResult = await invoke<NativeUpscaleResultJson>("upscale_request_native", {
+                    const nativeRequest: NativeUpscaleRequestArgs = {
                         inputPath: video.inputPath,
                         outputPath: resolvedOutputPath,
                         modelPath: info.path,
@@ -142,7 +141,8 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
                         precision: inferNativePrecision(info.path),
                         audio: true,
                         maxBatch: upscaleConfig.maxBatch
-                    });
+                    };
+                    const nativeResult = await invoke<NativeUpscaleRequestResult>("upscale_request_native", nativeRequest);
                     if (!nativeResult.output_path || typeof nativeResult.output_path !== "string") throw new Error("upscale_request_native did not return a valid output path");
                     resultPath = nativeResult.output_path;
                     nativeEngine = nativeResult.engine;
@@ -171,15 +171,15 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
                     ]);
                 } else {
                     addToast(`Native engine requires an ONNX model. "${selectedModel}" is PyTorch-only — using Python pipeline.`, "warning");
-                    resultPath = await invoke<string>("upscale_request", upscalePayload);
+                    resultPath = await invoke<UpscaleRequestResult>("upscale_request", upscalePayload);
                 }
             } else {
-                resultPath = await invoke<string>("upscale_request", upscalePayload);
+                resultPath = await invoke<UpscaleRequestResult>("upscale_request", upscalePayload);
             }
 
             setLogs(prev => [...prev, `[SYSTEM] Job ${jobId} finished.`]);
-            const finishedJob: Job = {
-                ...newJob, status: 'done', progress: 100, outputPath: resultPath, eta: 0, completedAt: Date.now(),
+            const finishedJob = completeJob(newJob, {
+                outputPath: resultPath,
                 ...(policy ? { policy } : {}),
                 ...(typeof hostCopyAuditEnabled === "boolean" ? { hostCopyAuditEnabled } : {}),
                 ...(hostCopyAuditDisableReason !== undefined ? { hostCopyAuditDisableReason } : {}),
@@ -196,8 +196,8 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
                 ...(typeof fallbackUsed === "boolean" ? { fallbackUsed } : {}),
                 ...(fallbackReasonCode !== undefined ? { fallbackReasonCode } : {}),
                 ...(fallbackReasonMessage !== undefined ? { fallbackReasonMessage } : {})
-            };
-            setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
+            });
+            setJobs(prev => updateJobById(prev, jobId, () => finishedJob));
             setActiveJob(finishedJob);
             setLastOutputPath(resultPath);
         } catch (err) {
@@ -205,12 +205,7 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
             const msg = `[${normalized.category}] ${normalized.message}`;
             addToast(`Error: ${msg}`, "error");
             setLogs(prev => [...prev, `[ERROR][RAVE][${normalized.category}] Job ${jobId} failed: ${normalized.message}`]);
-            setJobs(prev => prev.map(j => j.id === jobId ? {
-                ...j, status: 'error' as const, statusMessage: msg, errorCategory: normalized.category,
-                ...(normalized.nextAction ? { errorHint: normalized.nextAction } : {}),
-                errorMessage: normalized.detail ? `${normalized.message} :: ${normalized.detail}` : normalized.message,
-                completedAt: Date.now()
-            } : j));
+            setJobs(prev => updateJobById(prev, jobId, job => failJob(job, normalized)));
         } finally { setIsProcessing(false); }
     }, [video, model, modelInfoMap, showTechSpecs, rave, upscaleConfig, setJobs, setActiveJob, setIsProcessing, setLastOutputPath, setLogs, addToast, panels, openPanel]);
 
@@ -229,14 +224,15 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
         if (!panels.QUEUE) openPanel('QUEUE');
 
         try {
-            const resultPath = await invoke<string>("export_request", {
+            const exportRequest: ExportRequestArgs = {
                 inputPath: video.inputPath, outputPath: video.outputPath,
                 editConfig: video.getRustEditConfig(), scale: 1
-            });
+            };
+            const resultPath = await invoke<ExportRequestResult>("export_request", exportRequest);
             setLogs(prev => [...prev, `[SYSTEM] Export ${jobId} complete.`]);
             addToast("Export Completed", "success");
-            const finishedJob: Job = { ...newJob, status: 'done', progress: 100, outputPath: resultPath, eta: 0, completedAt: Date.now() };
-            setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
+            const finishedJob = completeJob(newJob, { outputPath: resultPath });
+            setJobs(prev => updateJobById(prev, jobId, () => finishedJob));
             setActiveJob(finishedJob);
             setLastOutputPath(resultPath);
         } catch (err) {
@@ -244,12 +240,7 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
             const msg = `[${normalized.category}] ${normalized.message}`;
             addToast(`Error: ${msg}`, "error");
             setLogs(prev => [...prev, `[ERROR][${normalized.category}] Export ${jobId} failed: ${normalized.message}`]);
-            setJobs(prev => prev.map(j => j.id === jobId ? {
-                ...j, status: 'error' as const, statusMessage: msg, errorCategory: normalized.category,
-                ...(normalized.nextAction ? { errorHint: normalized.nextAction } : {}),
-                errorMessage: normalized.detail ? `${normalized.message} :: ${normalized.detail}` : normalized.message,
-                completedAt: Date.now()
-            } : j));
+            setJobs(prev => updateJobById(prev, jobId, job => failJob(job, normalized)));
         } finally { setIsProcessing(false); }
     }, [video, rave, setJobs, setActiveJob, setIsProcessing, setLastOutputPath, setLogs, addToast, panels, openPanel]);
 
@@ -267,36 +258,28 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
         if (!panels.QUEUE) openPanel('QUEUE');
 
         try {
-            const result = await invoke<RaveCommandJson>("rave_validate", {
+            const validateRequest: RaveValidateArgs = {
                 fixture: null, profile: "production_strict", bestEffort: true, strictAudit: true, mockRun: true
-            });
+            };
+            const result = await invoke<RaveValidateResult>("rave_validate", validateRequest);
             const policy = result.policy;
             const hostCopyAuditEnabled = result.host_copy_audit_enabled;
             const hostCopyAuditDisableReason = result.host_copy_audit_disable_reason;
-            const skipped = (result as any).skipped === true;
+            const skipped = result.skipped === true;
 
-            const finishedJob: Job = {
-                ...newJob, status: "done", progress: 100,
+            const finishedJob = completeJob(newJob, {
                 statusMessage: skipped ? "Validation skipped" : "Validation passed",
-                completedAt: Date.now(),
                 ...(policy ? { policy } : {}),
                 ...(typeof hostCopyAuditEnabled === "boolean" ? { hostCopyAuditEnabled } : {}),
                 ...(hostCopyAuditDisableReason !== undefined ? { hostCopyAuditDisableReason } : {})
-            };
-            setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
+            });
+            setJobs(prev => updateJobById(prev, jobId, () => finishedJob));
             setActiveJob(finishedJob);
-            setLogs(prev => [...prev, `[RAVE] validate ok=${String((result as any).ok ?? "unknown")} skipped=${String(skipped)} policy=${JSON.stringify(policy ?? {})}`]);
+            setLogs(prev => [...prev, `[RAVE] validate ok=${String(result.ok ?? "unknown")} skipped=${String(skipped)} policy=${JSON.stringify(policy ?? {})}`]);
             addToast(skipped ? "Validate completed (skipped)" : "Validate passed", skipped ? "warning" : "success");
         } catch (err) {
             const normalized = rave.parseRaveError(err);
-            setJobs(prev => prev.map(j => j.id === jobId ? {
-                ...j, status: "error" as const,
-                statusMessage: `[${normalized.category}] ${normalized.message}`,
-                errorCategory: normalized.category,
-                ...(normalized.nextAction ? { errorHint: normalized.nextAction } : {}),
-                errorMessage: normalized.detail ? `${normalized.message} :: ${normalized.detail}` : normalized.message,
-                completedAt: Date.now()
-            } : j));
+            setJobs(prev => updateJobById(prev, jobId, job => failJob(job, normalized)));
             setLogs(prev => [...prev, `[RAVE][${normalized.category}] validate failed: ${normalized.message}`]);
             addToast(`Validate failed: [${normalized.category}] ${normalized.message}`, "error");
         } finally { setIsProcessing(false); }
@@ -321,7 +304,7 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
         };
         setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
 
-        const previewPayload = {
+        const previewPayload: UpscaleRequestArgs = {
             inputPath: video.inputPath, outputPath: "",
             model: upscaleConfig.primaryModelId || model,
             editConfig: previewConfig, scale: activeScale,
@@ -333,16 +316,21 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
         };
 
         try {
-            const resultPath = await invoke<string>("upscale_request", previewPayload);
+            const resultPath = await invoke<UpscaleRequestResult>("upscale_request", previewPayload);
             video.setPreviewFile(resultPath);
             video.setRenderedRange({ start, end });
             addToast("Sample ready.", "success");
-            const finishedJob: Job = { ...newJob, status: 'done', progress: 100, outputPath: resultPath, eta: 0, completedAt: Date.now() };
-            setJobs(prev => prev.map(j => j.id === jobId ? finishedJob : j));
+            const finishedJob = completeJob(newJob, { outputPath: resultPath });
+            setJobs(prev => updateJobById(prev, jobId, () => finishedJob));
             setActiveJob(finishedJob);
         } catch (err) {
             addToast(`Sample failed: ${err}`, "error");
-            setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'error' as const, statusMessage: String(err), completedAt: Date.now() } : j));
+            setJobs(prev => updateJobById(prev, jobId, job => ({
+                ...job,
+                status: "error",
+                statusMessage: String(err),
+                completedAt: Date.now()
+            })));
         } finally { setIsProcessing(false); }
     }, [video, model, upscaleConfig, setJobs, setActiveJob, setIsProcessing, addToast]);
 
@@ -358,7 +346,7 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
 
         if (job.status === 'running') {
             try {
-                setJobs(prev => prev.map(j => j.id === id ? { ...j, status: 'cancelled' as const, progress: 0, eta: 0, completedAt: Date.now() } : j));
+                setJobs(prev => updateJobById(prev, id, jobToCancel => cancelJob(jobToCancel)));
                 setLogs(prev => [...prev, `[SYSTEM] Job ${id} cancelled by user.`]);
                 if (activeJob?.id === id) setActiveJob(null);
                 setIsProcessing(false);
@@ -378,6 +366,5 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
         renderPreviewSample,
         clearCompletedJobs,
         handleCancelJob,
-        getScaleFromModel,
     };
 }

@@ -1,5 +1,6 @@
 export type UpscaleMode = "image" | "batch" | "video";
 export type JobStatus = "queued" | "running" | "done" | "cancelled" | "error";
+export type ToastType = "success" | "error" | "info" | "warning";
 
 export interface RavePolicy {
   profile?: string;
@@ -12,10 +13,59 @@ export interface RavePolicy {
 
 export interface RaveCommandJson {
   output?: string;
+  ok?: boolean;
+  skipped?: boolean;
+  fps?: number;
   policy?: RavePolicy;
   host_copy_audit_enabled?: boolean;
   host_copy_audit_disable_reason?: string | null;
   [key: string]: unknown;
+}
+
+export interface ModelInfo {
+  id: string;
+  scale: number;
+  filename: string;
+  format: string;
+  path: string;
+}
+
+export interface RaveErrorPayload {
+  category?: string;
+  message?: string;
+  detail?: string;
+  next_action?: string;
+}
+
+export interface ParsedRaveError {
+  category: string;
+  message: string;
+  detail?: string;
+  nextAction?: string;
+}
+
+export interface RaveEnvironmentJson {
+  ready: boolean;
+  profile: string;
+  hints: string[];
+  rave_bin: {
+    exists: boolean;
+    path?: string | null;
+  };
+  ffmpeg: {
+    layout_ok: boolean;
+    abi_ok: boolean;
+  };
+  providers: {
+    cudnn_found: boolean;
+    cudnn_probe?: string;
+    tensorrt_found: boolean;
+    tensorrt_probe?: string;
+    tensorrt_parser_found: boolean;
+    tensorrt_parser_probe?: string;
+    tensorrt_plugin_found: boolean;
+    tensorrt_plugin_probe?: string;
+  };
 }
 
 export interface NativeUpscaleResultJson {
@@ -89,7 +139,15 @@ export interface Job {
 export interface Toast {
   id: string;
   message: string;
-  type: "success" | "error" | "info" | "warning";
+  type: ToastType;
+}
+
+export interface UpscaleProgressEventPayload {
+  jobId: string;
+  progress: number;
+  message: string;
+  outputPath?: string;
+  eta?: number;
 }
 
 export interface VideoState {

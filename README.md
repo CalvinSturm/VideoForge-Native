@@ -32,6 +32,7 @@
 - [`docs/audits/video_upscaler_audit_2026-03-07.md`](docs/audits/video_upscaler_audit_2026-03-07.md) — workspace audit and bottleneck review.
 - [`docs/plans/video_upscaler_patch_plan_2026-03-07.md`](docs/plans/video_upscaler_patch_plan_2026-03-07.md) — PR-shaped cleanup and measurement plan.
 - [`docs/plans/video_upscaler_benchmark_plan_2026-03-07.md`](docs/plans/video_upscaler_benchmark_plan_2026-03-07.md) — benchmark policy and fixture plan.
+- [`docs/release_hygiene_checklist.md`](docs/release_hygiene_checklist.md) — metadata/version alignment checklist for release and packaging changes.
 
 ---
 
@@ -212,10 +213,18 @@ npm run build
 | Command | Description |
 |---------|-------------|
 | `npm run dev` | Launch Tauri + Vite dev server with hot-reload |
+| `npm run dev:native` | Launch Tauri + Vite with the `native_engine` feature enabled |
 | `npm run build` | Production build (compiles Rust + bundles UI) |
+| `npm run build:native` | Production build with the `native_engine` feature enabled |
 | `npm run ui-install` | Install UI npm dependencies |
-| `cd src-tauri && cargo test` | Run Rust unit tests |
+| `cd src-tauri && cargo test --workspace` | Run Rust workspace tests |
 | `cd ui && npx tsc --noEmit` | Type-check the TypeScript UI |
+
+### Metadata Alignment
+
+- Version source of truth is shared across `package.json`, `ui/package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`.
+- Package ids remain lowercase for tooling compatibility, while the user-facing product name is `VideoForge`.
+- Use [`docs/release_hygiene_checklist.md`](docs/release_hygiene_checklist.md) before release or packaging changes.
 
 ### Project Structure
 

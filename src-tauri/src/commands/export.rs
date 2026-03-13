@@ -9,6 +9,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::Instant;
 
 use crate::edit_config::{build_ffmpeg_filters, EditConfig};
+use crate::tauri_contracts::ExportRequest;
 use crate::video_pipeline;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -58,27 +59,34 @@ pub fn is_image_file(path: &str) -> bool {
 pub async fn export_request(
     app: AppHandle,
     input_path: String,
-    mut output_path: String,
+    output_path: String,
     edit_config: EditConfig,
     _scale: u32,
 ) -> Result<String, String> {
-    let is_img = is_image_file(&input_path);
+    let request = ExportRequest {
+        input_path,
+        output_path,
+        edit_config,
+        scale: _scale,
+    };
+    let is_img = is_image_file(&request.input_path);
+    let mut output_path = request.output_path;
 
     if output_path.trim().is_empty() {
-        output_path = get_smart_output_path(&input_path, !is_img);
+        output_path = get_smart_output_path(&request.input_path, !is_img);
     }
 
     tracing::info!(
-        input = %input_path,
+        input = %request.input_path,
         output = %output_path,
         is_image = is_img,
         "Export request"
     );
 
-    let probe_res = video_pipeline::probe_video(&input_path).map_err(|e| e.to_string())?;
+    let probe_res = video_pipeline::probe_video(&request.input_path).map_err(|e| e.to_string())?;
     let (width, height, duration, fps, _total_frames) = probe_res;
 
-    let filter_str = build_ffmpeg_filters(&edit_config, width, height);
+    let filter_str = build_ffmpeg_filters(&request.edit_config, width, height);
 
     // ── Image export ─────────────────────────────────────────────────────────
     if is_img {
@@ -88,7 +96,7 @@ pub async fn export_request(
             "-loglevel".to_string(),
             "warning".to_string(),
             "-i".to_string(),
-            input_path,
+            request.input_path.clone(),
         ];
 
         if !filter_str.is_empty() {
@@ -136,23 +144,23 @@ pub async fn export_request(
     }
 
     // ── Video export ─────────────────────────────────────────────────────────
-    let start_time = edit_config.trim_start;
-    let end_time = if edit_config.trim_end > 0.0 {
-        edit_config.trim_end
+    let start_time = request.edit_config.trim_start;
+    let end_time = if request.edit_config.trim_end > 0.0 {
+        request.edit_config.trim_end
     } else {
         duration
     };
     let export_duration = (end_time - start_time).max(0.1);
 
-    let target_fps_val = if edit_config.fps > 0 {
-        edit_config.fps as f64
+    let target_fps_val = if request.edit_config.fps > 0 {
+        request.edit_config.fps as f64
     } else {
         fps
     };
     let expected_frames = (export_duration * target_fps_val).round() as u64;
 
     let mut video_filter_str = filter_str;
-    let target_fps = edit_config.fps;
+    let target_fps = request.edit_config.fps;
     let source_fps = fps as u32;
     if target_fps > 0 && target_fps != source_fps {
         let interp = format!(
@@ -183,7 +191,7 @@ pub async fn export_request(
     }
 
     args.push("-i".to_string());
-    args.push(input_path);
+    args.push(request.input_path.clone());
 
     if !video_filter_str.is_empty() {
         args.push("-vf".to_string());

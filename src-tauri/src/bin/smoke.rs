@@ -168,35 +168,69 @@ fn print_runtime_truth(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::runtime_truth_lines;
-    use app_lib::runtime_truth::{
-        RunObservedMetrics, RunStatus, RuntimeConfigSnapshot, RuntimeEngineFamily,
-    };
+#[derive(Debug, Clone)]
+struct PythonSharedArgs {
+    model: Option<String>,
+    precision: String,
+    timeout_secs: u64,
+}
 
-    #[test]
-    fn runtime_truth_lines_embed_runtime_owned_snapshot_and_metrics() {
-        let snapshot = RuntimeConfigSnapshot::new(
-            "run-smoke-1",
-            "python_sidecar",
-            RuntimeEngineFamily::Python,
-            "in.mp4",
-            "out.mp4",
-        );
-        let metrics = RunObservedMetrics::new(
-            "run-smoke-1",
-            "python_sidecar",
-            RunStatus::Succeeded,
-        );
+#[derive(Debug, Clone)]
+struct ShmRoundtripMode {
+    width: u32,
+    height: u32,
+    scale: u32,
+    roundtrip_timeout_ms: u64,
+}
 
-        let lines = runtime_truth_lines(&snapshot, Some(&metrics));
+#[derive(Debug, Clone)]
+struct PythonE2eMode {
+    input: Option<String>,
+    output: Option<String>,
+    model: String,
+    scale: u32,
+    timeout_ms: u64,
+    keep_temp: bool,
+}
 
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("\"run_id\":\"run-smoke-1\""));
-        assert!(lines[0].contains("\"route_id\":\"python_sidecar\""));
-        assert!(lines[1].contains("\"status\":\"succeeded\""));
+#[derive(Debug, Clone)]
+struct PythonSmokeMode {
+    shared: PythonSharedArgs,
+    shm_roundtrip: Option<ShmRoundtripMode>,
+    e2e: Option<PythonE2eMode>,
+}
+
+impl PythonSmokeMode {
+    fn enabled(&self) -> bool {
+        self.shared.model.is_some() || self.shm_roundtrip.is_some() || self.e2e.is_some()
     }
+}
+
+#[cfg(feature = "native_engine")]
+#[derive(Debug, Clone)]
+struct NativeE2eMode {
+    input: Option<String>,
+    output: Option<String>,
+    model_path: Option<String>,
+    scale: u32,
+    precision: String,
+    native_direct: bool,
+    keep_temp: bool,
+}
+
+#[cfg(feature = "native_engine")]
+#[derive(Debug, Clone)]
+struct NativeSmokeMode {
+    e2e: Option<NativeE2eMode>,
+}
+
+#[derive(Debug, Clone)]
+struct SmokeArgs {
+    python: PythonSmokeMode,
+    #[cfg(feature = "native_engine")]
+    native: NativeSmokeMode,
+    #[cfg(not(feature = "native_engine"))]
+    native_e2e_requested: bool,
 }
 
 // ─── ffprobe helpers ─────────────────────────────────────────────────────────
@@ -382,16 +416,11 @@ async fn shutdown_python(publisher: &zenoh::pubsub::Publisher<'_>, guard: &mut P
 
 // ─── SHM Roundtrip ───────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)] // TODO(clippy): keep explicit smoke-test knobs; refactor after hygiene pass if needed.
 async fn check_shm_roundtrip(
     python_bin: &str,
     script_path: &str,
-    precision: &str,
-    handshake_timeout_secs: u64,
-    width: u32,
-    height: u32,
-    scale: u32,
-    roundtrip_timeout_ms: u64,
+    mode: &ShmRoundtripMode,
+    shared: &PythonSharedArgs,
 ) -> bool {
     use app_lib::shm::{VideoShm, RING_SIZE, SLOT_READY_FOR_AI};
 
@@ -432,7 +461,7 @@ async fn check_shm_roundtrip(
     cmd.arg(script_path);
     cmd.arg("--port").arg(port.to_string());
     cmd.arg("--parent-pid").arg(std::process::id().to_string());
-    cmd.arg("--precision").arg(precision);
+    cmd.arg("--precision").arg(&shared.precision);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::inherit());
     #[cfg(target_os = "windows")]
@@ -452,7 +481,7 @@ async fn check_shm_roundtrip(
 
     // ── Handshake ────────────────────────────────────────────────────────────
     let handshake_ok = timeout(
-        Duration::from_secs(handshake_timeout_secs),
+        Duration::from_secs(shared.timeout_secs),
         subscriber.recv_async(),
     )
     .await
@@ -460,7 +489,7 @@ async fn check_shm_roundtrip(
     if !check(
         "Python Zenoh handshake",
         handshake_ok,
-        &format!("no message received within {}s", handshake_timeout_secs),
+        &format!("no message received within {}s", shared.timeout_secs),
     ) {
         shutdown_python(&publisher, &mut guard).await;
         return false;
@@ -474,9 +503,9 @@ async fn check_shm_roundtrip(
             "create_shm",
             &job_id,
             json!({
-                "width": width,
-                "height": height,
-                "scale": scale,
+                "width": mode.width,
+                "height": mode.height,
+                "scale": mode.scale,
                 "ring_size": RING_SIZE
             }),
         ),
@@ -543,7 +572,12 @@ async fn check_shm_roundtrip(
     check("SHM created", true, &format!("path: {}", shm_path));
 
     // ── Open SHM ─────────────────────────────────────────────────────────────
-    let mut shm = match VideoShm::open(&shm_path, width as usize, height as usize, scale as usize) {
+    let mut shm = match VideoShm::open(
+        &shm_path,
+        mode.width as usize,
+        mode.height as usize,
+        mode.scale as usize,
+    ) {
         Ok(s) => s,
         Err(e) => {
             check(
@@ -565,7 +599,7 @@ async fn check_shm_roundtrip(
             *b = (i % 256) as u8;
         }
     }
-    shm.set_slot_frame_bytes(0, width * height * 3);
+    shm.set_slot_frame_bytes(0, mode.width * mode.height * 3);
     shm.set_slot_write_index(0, 1);
     shm.set_slot_state(0, SLOT_READY_FOR_AI);
     check(
@@ -590,7 +624,7 @@ async fn check_shm_roundtrip(
 
     // Wait for FRAME_DONE
     let frame_ok = match timeout(
-        Duration::from_millis(roundtrip_timeout_ms),
+        Duration::from_millis(mode.roundtrip_timeout_ms),
         subscriber.recv_async(),
     )
     .await
@@ -601,7 +635,7 @@ async fn check_shm_roundtrip(
                 false,
                 &format!(
                     "FRAME_DONE_TIMEOUT: no response within {}ms",
-                    roundtrip_timeout_ms
+                    mode.roundtrip_timeout_ms
                 ),
             );
             shutdown_python(&publisher, &mut guard).await;
@@ -629,7 +663,7 @@ async fn check_shm_roundtrip(
     }
 
     // ── Validate output ───────────────────────────────────────────────────────
-    let expected_len = (width * scale * height * scale * 3) as usize;
+    let expected_len = (mode.width * mode.scale * mode.height * mode.scale * 3) as usize;
     let output_ok = match shm.output_slot(0) {
         Err(e) => {
             check(
@@ -679,17 +713,11 @@ async fn check_shm_roundtrip(
 
 // ─── Python E2E (FFmpeg path) ─────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)] // TODO(clippy): CLI smoke entry mirrors user flags directly.
 async fn check_e2e_python(
     python_bin: &str,
     script_path: &str,
-    input_path: &str,
-    output_path: Option<&str>,
-    model: &str,
-    scale: u32,
-    precision: &str,
-    timeout_ms: u64,
-    keep_temp: bool,
+    mode: &PythonE2eMode,
+    shared: &PythonSharedArgs,
 ) -> bool {
     use app_lib::commands::upscale::{
         run_upscale_job, JobProgress, JobProgressFn, UpscaleJobConfig,
@@ -700,6 +728,7 @@ async fn check_e2e_python(
     use tokio::sync::Mutex;
 
     // A) Input prereq checks
+    let input_path = mode.input.as_deref().unwrap_or("");
     if !std::path::Path::new(input_path).exists() {
         return check(
             "Input file exists",
@@ -719,18 +748,18 @@ async fn check_e2e_python(
 
     // B) Build config
     let research_config = Arc::new(Mutex::new(ResearchConfig::default()));
-    let out = output_path.unwrap_or("").to_string();
+    let out = mode.output.clone().unwrap_or_default();
     let config = UpscaleJobConfig {
         python_bin: python_bin.to_string(),
         script_path: script_path.to_string(),
         input_path: input_path.to_string(),
         output_path: out,
-        model: model.to_string(),
-        scale,
-        precision: precision.to_string(),
+        model: mode.model.clone(),
+        scale: mode.scale,
+        precision: shared.precision.clone(),
         edit_config: EditConfig::default(),
         research_config,
-        zenoh_timeout_secs: (timeout_ms / 1000).max(60),
+        zenoh_timeout_secs: (mode.timeout_ms / 1000).max(60),
         enable_run_artifacts: false,
         use_shm_proto_v2: false,
         shm_ring_size_override: None,
@@ -751,7 +780,7 @@ async fn check_e2e_python(
 
     // D) Run job with timeout
     let result = tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
+        Duration::from_millis(mode.timeout_ms),
         run_upscale_job(config, progress),
     )
     .await;
@@ -761,7 +790,7 @@ async fn check_e2e_python(
             return check(
                 "Job completed",
                 false,
-                &format!("E2E_TIMEOUT: exceeded {}ms", timeout_ms),
+                &format!("E2E_TIMEOUT: exceeded {}ms", mode.timeout_ms),
             );
         }
         Ok(Err(e)) => return check("Job completed", false, &e),
@@ -790,8 +819,8 @@ async fn check_e2e_python(
         Some(d) => d,
         None => return check("Output dimensions", false, "E2E_FFPROBE_VALIDATE"),
     };
-    let exp_w = in_w * scale as usize;
-    let exp_h = in_h * scale as usize;
+    let exp_w = in_w * mode.scale as usize;
+    let exp_h = in_h * mode.scale as usize;
     if out_w != exp_w || out_h != exp_h {
         return check(
             "Output dimensions",
@@ -815,7 +844,7 @@ async fn check_e2e_python(
     check(&format!("Output duration ({:.2}s > 0)", dur), true, "");
 
     // F) Cleanup
-    if !keep_temp {
+    if !mode.keep_temp {
         let _ = std::fs::remove_file(actual_out);
     } else {
         println!("  → kept: {}", actual_out);
@@ -828,18 +857,15 @@ async fn check_e2e_python(
 
 #[cfg(feature = "native_engine")]
 async fn check_e2e_native(
-    input_path: &str,
-    output_path: Option<&str>,
-    model_path: &str,
-    scale: u32,
-    precision: &str,
-    native_direct: bool,
-    keep_temp: bool,
+    mode: &NativeE2eMode,
 ) -> bool {
     use app_lib::commands::native_engine::{
         native_smoke_success_lines, native_tool_run_banner, run_native_tool_request,
         NativeToolRunRequest,
     };
+
+    let input_path = mode.input.as_deref().unwrap_or("");
+    let model_path = mode.model_path.as_deref().unwrap_or("");
 
     // A) Input prereq checks
     if !std::path::Path::new(input_path).exists() {
@@ -871,12 +897,12 @@ async fn check_e2e_native(
     let request = NativeToolRunRequest::new(
         input_path.to_string(),
         model_path.to_string(),
-        scale,
-        precision.to_string(),
+        mode.scale,
+        mode.precision.clone(),
     )
-    .with_optional_output_path(output_path.map(str::to_string))
+    .with_optional_output_path(mode.output.clone())
     .with_max_batch(Some(1))
-    .with_native_direct(native_direct);
+    .with_native_direct(mode.native_direct);
     println!("{}", native_tool_run_banner(&request));
     let result = run_native_tool_request(request).await;
 
@@ -921,8 +947,8 @@ async fn check_e2e_native(
         Some(d) => d,
         None => return check("Output dimensions", false, "E2E_FFPROBE_VALIDATE"),
     };
-    let exp_w = in_w * scale as usize;
-    let exp_h = in_h * scale as usize;
+    let exp_w = in_w * mode.scale as usize;
+    let exp_h = in_h * mode.scale as usize;
     if out_w != exp_w || out_h != exp_h {
         return check(
             "Output dimensions",
@@ -946,7 +972,7 @@ async fn check_e2e_native(
     check(&format!("Output duration ({:.2}s > 0)", dur), true, "");
 
     // D) Cleanup
-    if !keep_temp {
+    if !mode.keep_temp {
         let _ = std::fs::remove_file(actual_out);
     } else {
         println!("  → kept: {}", actual_out);
@@ -957,30 +983,7 @@ async fn check_e2e_native(
 
 // ─── Argument parsing ────────────────────────────────────────────────────────
 
-struct Args {
-    model: Option<String>,
-    precision: String,
-    timeout_secs: u64,
-    shm_roundtrip: bool,
-    shm_width: u32,
-    shm_height: u32,
-    shm_scale: u32,
-    roundtrip_timeout_ms: u64,
-    // E2E Python mode
-    e2e_python: bool,
-    e2e_input: Option<String>,
-    e2e_output: Option<String>,
-    e2e_model: String,
-    e2e_scale: u32,
-    e2e_timeout_ms: u64,
-    keep_temp: bool,
-    // E2E Native mode
-    e2e_native: bool,
-    native_direct: bool,
-    e2e_onnx: Option<String>,
-}
-
-fn parse_args() -> Args {
+fn parse_args() -> SmokeArgs {
     let mut args = std::env::args().skip(1).peekable();
     let mut model = None;
     let mut precision = "fp32".to_string();
@@ -997,8 +1000,10 @@ fn parse_args() -> Args {
     let mut e2e_scale = 1u32;
     let mut e2e_timeout_ms = 600_000u64;
     let mut keep_temp = false;
-    let mut e2e_native = false;
+    let mut native_e2e_enabled = false;
+    #[cfg(feature = "native_engine")]
     let mut native_direct = false;
+    #[cfg(feature = "native_engine")]
     let mut e2e_onnx: Option<String> = None;
 
     while let Some(arg) = args.next() {
@@ -1067,36 +1072,62 @@ fn parse_args() -> Args {
                 keep_temp = true;
             }
             "--e2e-native" => {
-                e2e_native = true;
+                native_e2e_enabled = true;
             }
             "--native-direct" => {
-                native_direct = true;
+                #[cfg(feature = "native_engine")]
+                {
+                    native_direct = true;
+                }
             }
             "--e2e-onnx" => {
-                e2e_onnx = args.next();
+                #[cfg(feature = "native_engine")]
+                {
+                    e2e_onnx = args.next();
+                }
             }
             _ => {}
         }
     }
-    Args {
-        model,
-        precision,
-        timeout_secs,
-        shm_roundtrip,
-        shm_width,
-        shm_height,
-        shm_scale,
-        roundtrip_timeout_ms,
-        e2e_python,
-        e2e_input,
-        e2e_output,
-        e2e_model,
-        e2e_scale,
-        e2e_timeout_ms,
-        keep_temp,
-        e2e_native,
-        native_direct,
-        e2e_onnx,
+
+    let python = PythonSmokeMode {
+        shared: PythonSharedArgs {
+            model,
+            precision: precision.clone(),
+            timeout_secs,
+        },
+        shm_roundtrip: shm_roundtrip.then_some(ShmRoundtripMode {
+            width: shm_width,
+            height: shm_height,
+            scale: shm_scale,
+            roundtrip_timeout_ms,
+        }),
+        e2e: e2e_python.then_some(PythonE2eMode {
+            input: e2e_input.clone(),
+            output: e2e_output.clone(),
+            model: e2e_model,
+            scale: e2e_scale,
+            timeout_ms: e2e_timeout_ms,
+            keep_temp,
+        }),
+    };
+
+    SmokeArgs {
+        python,
+        #[cfg(feature = "native_engine")]
+        native: NativeSmokeMode {
+            e2e: native_e2e_enabled.then_some(NativeE2eMode {
+                input: e2e_input,
+                output: e2e_output,
+                model_path: e2e_onnx,
+                scale: e2e_scale,
+                precision,
+                native_direct,
+                keep_temp,
+            }),
+        },
+        #[cfg(not(feature = "native_engine"))]
+        native_e2e_requested: native_e2e_enabled,
     }
 }
 
@@ -1127,8 +1158,11 @@ async fn main() {
 
     // 2. Python environment
     // Only verify Python if we're running Python tests or NOT running native-only
-    let run_python_tests = args.model.is_some() || args.shm_roundtrip || args.e2e_python;
-    let native_only = args.e2e_native && !run_python_tests;
+    let run_python_tests = args.python.enabled();
+    #[cfg(feature = "native_engine")]
+    let native_only = args.native.e2e.is_some() && !run_python_tests;
+    #[cfg(not(feature = "native_engine"))]
+    let native_only = args.native_e2e_requested && !run_python_tests;
 
     let mut python_env = None;
     if !native_only {
@@ -1146,43 +1180,34 @@ async fn main() {
             let ipc_ok = check_python_ipc(
                 &python_bin,
                 &script_path,
-                args.model.as_deref(),
-                &args.precision,
-                args.timeout_secs,
+                args.python.shared.model.as_deref(),
+                &args.python.shared.precision,
+                args.python.shared.timeout_secs,
             )
             .await;
             all_passed &= ipc_ok;
 
-            if args.shm_roundtrip {
+            if let Some(shm_mode) = &args.python.shm_roundtrip {
                 println!();
                 println!("── SHM Roundtrip ─────────────────────────────────────────────");
                 let ok = check_shm_roundtrip(
                     &python_bin,
                     &script_path,
-                    &args.precision,
-                    args.timeout_secs,
-                    args.shm_width,
-                    args.shm_height,
-                    args.shm_scale,
-                    args.roundtrip_timeout_ms,
+                    shm_mode,
+                    &args.python.shared,
                 )
                 .await;
                 all_passed &= ok;
             }
 
-            if args.e2e_python {
+            if let Some(python_e2e) = &args.python.e2e {
                 println!();
                 println!("── Python E2E (FFmpeg path) ──────────────────────────────────");
                 let ok = check_e2e_python(
                     &python_bin,
                     &script_path,
-                    args.e2e_input.as_deref().unwrap_or(""),
-                    args.e2e_output.as_deref(),
-                    &args.e2e_model,
-                    args.e2e_scale,
-                    &args.precision,
-                    args.e2e_timeout_ms,
-                    args.keep_temp,
+                    python_e2e,
+                    &args.python.shared,
                 )
                 .await;
                 all_passed &= ok;
@@ -1196,25 +1221,16 @@ async fn main() {
     #[cfg(feature = "native_engine")]
     {
         println!("[INFO] native_engine feature: ENABLED");
-        if args.e2e_native {
+        if let Some(native_e2e) = &args.native.e2e {
             println!();
             println!("── Native E2E (engine-v2) ────────────────────────────────────");
-            let input = args.e2e_input.as_deref().unwrap_or("");
-            let model = args.e2e_onnx.as_deref().unwrap_or("");
+            let input = native_e2e.input.as_deref().unwrap_or("");
+            let model = native_e2e.model_path.as_deref().unwrap_or("");
             if input.is_empty() || model.is_empty() {
                 eprintln!("[FAIL] --e2e-native requires --input and --e2e-onnx");
                 all_passed = false;
             } else {
-                let ok = check_e2e_native(
-                    input,
-                    args.e2e_output.as_deref(),
-                    model,
-                    args.e2e_scale,
-                    &args.precision,
-                    args.native_direct,
-                    args.keep_temp,
-                )
-                .await;
+                let ok = check_e2e_native(native_e2e).await;
                 all_passed &= ok;
             }
         }
@@ -1222,7 +1238,7 @@ async fn main() {
     #[cfg(not(feature = "native_engine"))]
     {
         println!("[SKIP] native_engine feature: BLOCKED / DISABLED.");
-        if args.e2e_native {
+        if args.native_e2e_requested {
             eprintln!("[FAIL] --e2e-native requested but feature is disabled.");
             all_passed = false;
         }
@@ -1239,5 +1255,36 @@ async fn main() {
         eprintln!("Result: ONE OR MORE CHECKS FAILED");
         eprintln!();
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::runtime_truth_lines;
+    use app_lib::runtime_truth::{
+        RunObservedMetrics, RunStatus, RuntimeConfigSnapshot, RuntimeEngineFamily,
+    };
+
+    #[test]
+    fn runtime_truth_lines_embed_runtime_owned_snapshot_and_metrics() {
+        let snapshot = RuntimeConfigSnapshot::new(
+            "run-smoke-1",
+            "python_sidecar",
+            RuntimeEngineFamily::Python,
+            "in.mp4",
+            "out.mp4",
+        );
+        let metrics = RunObservedMetrics::new(
+            "run-smoke-1",
+            "python_sidecar",
+            RunStatus::Succeeded,
+        );
+
+        let lines = runtime_truth_lines(&snapshot, Some(&metrics));
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"run_id\":\"run-smoke-1\""));
+        assert!(lines[0].contains("\"route_id\":\"python_sidecar\""));
+        assert!(lines[1].contains("\"status\":\"succeeded\""));
     }
 }

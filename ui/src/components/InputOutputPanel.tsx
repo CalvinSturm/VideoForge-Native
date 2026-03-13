@@ -5,169 +5,54 @@ import type { EditState, VideoState, UpscaleMode } from "../types";
 import { SignalSummary } from "./SignalSummary";
 import { AIUpscaleNode } from "./AIUpscaleNode";
 import {
+  HF_METHODS,
+  RESEARCH_DEFAULTS,
+  RESEARCH_PRESETS,
+  type ResearchConfig,
+} from "./inputOutputPanel/researchConfig";
+import {
   useJobStore,
   type UpscaleScale,
 } from "../Store/useJobStore";
 import { extractFamily, extractScale } from "../utils/modelClassification";
-
-// --- RESEARCH CONFIG ---
-interface ResearchConfig {
-  alpha_structure: number;
-  alpha_texture: number;
-  alpha_perceptual: number;
-  alpha_diffusion: number;
-  low_freq_strength: number;
-  mid_freq_strength: number;
-  high_freq_strength: number;
-  h_sensitivity: number;
-  h_blend_reduction: number;
-  edge_model_bias: number;
-  texture_model_bias: number;
-  flat_region_suppression: number;
-  hf_method: string;
-  preset: string;
-  freq_low_sigma: number;
-  freq_mid_sigma: number;
-  edge_threshold: number;
-  texture_threshold: number;
-  spatial_freq_mix: number;
-  // SR Pipeline
-  adr_enabled: boolean;
-  detail_strength: number;
-  luma_only: boolean;
-  edge_strength: number;
-  sharpen_strength: number;
-  temporal_enabled: boolean;
-  temporal_alpha: number;
-  secondary_model: string;
-  return_gpu_tensor: boolean;
-}
-
-const RESEARCH_DEFAULTS: ResearchConfig = {
-  alpha_structure: 0.5,
-  alpha_texture: 0.3,
-  alpha_perceptual: 0.15,
-  alpha_diffusion: 0.05,
-  low_freq_strength: 1.0,
-  mid_freq_strength: 1.0,
-  high_freq_strength: 1.0,
-  h_sensitivity: 1.0,
-  h_blend_reduction: 0.5,
-  edge_model_bias: 0.7,
-  texture_model_bias: 0.7,
-  flat_region_suppression: 0.3,
-  hf_method: "laplacian",
-  preset: "balanced",
-  freq_low_sigma: 4.0,
-  freq_mid_sigma: 1.5,
-  edge_threshold: 0.5,
-  texture_threshold: 0.2,
-  spatial_freq_mix: 0.5,
-  // SR Pipeline
-  adr_enabled: false,
-  detail_strength: 0.5,
-  luma_only: true,
-  edge_strength: 0.3,
-  sharpen_strength: 0.0,
-  temporal_enabled: true,
-  temporal_alpha: 0.9,
-  secondary_model: "None",
-  return_gpu_tensor: true,
-};
-
-const RESEARCH_PRESETS: Record<string, Partial<ResearchConfig>> = {
-  performance: {
-    alpha_structure: 0.6, alpha_texture: 0.25, alpha_perceptual: 0.1, alpha_diffusion: 0.05,
-    low_freq_strength: 1.2, mid_freq_strength: 0.8, high_freq_strength: 0.6,
-    h_sensitivity: 0.5, h_blend_reduction: 0.3,
-    edge_model_bias: 0.5, texture_model_bias: 0.5, flat_region_suppression: 0.5,
-    preset: "performance",
-  },
-  balanced: {
-    alpha_structure: 0.5, alpha_texture: 0.3, alpha_perceptual: 0.15, alpha_diffusion: 0.05,
-    low_freq_strength: 1.0, mid_freq_strength: 1.0, high_freq_strength: 1.0,
-    h_sensitivity: 1.0, h_blend_reduction: 0.5,
-    edge_model_bias: 0.7, texture_model_bias: 0.7, flat_region_suppression: 0.3,
-    preset: "balanced",
-  },
-  quality: {
-    alpha_structure: 0.4, alpha_texture: 0.35, alpha_perceptual: 0.2, alpha_diffusion: 0.05,
-    low_freq_strength: 0.8, mid_freq_strength: 1.2, high_freq_strength: 1.4,
-    h_sensitivity: 1.5, h_blend_reduction: 0.7,
-    edge_model_bias: 0.8, texture_model_bias: 0.8, flat_region_suppression: 0.2,
-    preset: "quality",
-  },
-};
-
-const HF_METHODS = ["laplacian", "sobel", "highpass", "fft"] as const;
-
-// --- ICONS ---
-const IconCamera = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" /><circle cx="12" cy="13" r="4" /></svg>;
-const IconRotateCW = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" /></svg>;
-const IconRotateCCW = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 1 0 2.12-9.36L1 10" /></svg>;
-const IconFlipH = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v18" /><path d="M16 7l4 5-4 5" /><path d="M8 7l-4 5 4 5" /></svg>;
-const IconFlipV = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12h18" /><path d="M7 8L12 4l5 4" /><path d="M7 16l5 4 5-4" /></svg>;
-const IconImport = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>;
-const IconSave = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" /></svg>;
-const IconPlay = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="5 3 19 12 5 21 5 3" /></svg>;
-const IconFlash = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" /></svg>;
-const IconFile = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" /><polyline points="13 2 13 9 20 9" /></svg>;
-const IconFilm = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18" /><line x1="7" y1="2" x2="7" y2="22" /><line x1="17" y1="2" x2="17" y2="22" /><line x1="2" y1="12" x2="22" y2="12" /><line x1="2" y1="7" x2="7" y2="7" /><line x1="2" y1="17" x2="7" y2="17" /><line x1="17" y1="17" x2="22" y2="17" /><line x1="17" y1="7" x2="22" y2="7" /></svg>;
-const IconShield = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /></svg>;
-const IconSparkles = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3z" /><path d="M5 19l.5 1.5L7 21l-1.5.5L5 23l-.5-1.5L3 21l1.5-.5L5 19z" /><path d="M19 12l.5 1.5L21 14l-1.5.5L19 16l-.5-1.5L17 14l1.5-.5L19 12z" /></svg>;
-const IconLock = () => <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></svg>;
-const IconInfo = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="12" y1="16" x2="12" y2="12" /><line x1="12" y1="8" x2="12.01" y2="8" /></svg>;
-const IconCheck = () => <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>;
-const IconCrop = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M6 2v14a2 2 0 0 0 2 2h14" /><path d="M18 22V8a2 2 0 0 0-2-2H2" /></svg>;
-const IconPalette = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor" /><circle cx="17.5" cy="10.5" r=".5" fill="currentColor" /><circle cx="8.5" cy="7.5" r=".5" fill="currentColor" /><circle cx="6.5" cy="12.5" r=".5" fill="currentColor" /><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.555C21.965 6.012 17.461 2 12 2z" /></svg>;
-const IconMove = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="5 9 2 12 5 15" /><polyline points="9 5 12 2 15 5" /><polyline points="15 19 12 22 9 19" /><polyline points="19 9 22 12 19 15" /><line x1="2" y1="12" x2="22" y2="12" /><line x1="12" y1="2" x2="12" y2="22" /></svg>;
-const IconClock = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>;
-const IconCpu = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="4" width="16" height="16" rx="2" ry="2" /><rect x="9" y="9" width="6" height="6" /><line x1="9" y1="1" x2="9" y2="4" /><line x1="15" y1="1" x2="15" y2="4" /><line x1="9" y1="20" x2="9" y2="23" /><line x1="15" y1="20" x2="15" y2="23" /><line x1="20" y1="9" x2="23" y2="9" /><line x1="20" y1="14" x2="23" y2="14" /><line x1="1" y1="9" x2="4" y2="9" /><line x1="1" y1="14" x2="4" y2="14" /></svg>;
-const IconExport = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></svg>;
-const IconChevronDown = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9" /></svg>;
-const IconPlus = () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>;
-const IconX = () => <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>;
+import {
+  ASPECT_RATIOS,
+  FPS_OPTIONS,
+  getSmartResInfo,
+  truncateModelName,
+} from "./inputOutputPanel/panelHelpers";
+import {
+  IconCamera,
+  IconCheck,
+  IconChevronDown,
+  IconClock,
+  IconCpu,
+  IconCrop,
+  IconExport,
+  IconFile,
+  IconFilm,
+  IconFlash,
+  IconFlipH,
+  IconFlipV,
+  IconImport,
+  IconInfo,
+  IconLock,
+  IconMove,
+  IconPalette,
+  IconPlay,
+  IconPlus,
+  IconRotateCCW,
+  IconRotateCW,
+  IconSave,
+  IconShield,
+  IconSparkles,
+  IconX,
+} from "./inputOutputPanel/panelIcons";
 
 // --- CONFIGURATION ---
 // Model families and IDs are now derived dynamically from availableModels.
 // NOTE: extractFamily and extractScale are now imported from ../utils/modelClassification
 
-// Helper: truncate model name for button display
-function truncateModelName(id: string, maxLen = 12): string {
-  if (id.length <= maxLen) return id;
-  let short = id.replace('RealESRGAN_', 'ESRGAN-').replace('_x4plus', '').replace('_anime_6B', '-ANI');
-  if (short.length <= maxLen) return short;
-  return short.slice(0, maxLen - 1) + '\u2026';
-}
-
-const ASPECT_RATIOS = [
-  { label: "FREE", value: null },
-  { label: "16:9", value: 16 / 9 },
-  { label: "9:16", value: 9 / 16 },
-  { label: "4:5", value: 0.8 },
-  { label: "1:1", value: 1 },
-  { label: "2.35:1", value: 2.35 },
-];
-
-const FPS_OPTIONS = [
-  { value: 0, label: "NATIVE", sub: "SOURCE" },
-  { value: 30, label: "30 FPS", sub: "STD" },
-  { value: 60, label: "60 FPS", sub: "SMOOTH" },
-  { value: 120, label: "120 FPS", sub: "SLOW-MO" },
-];
-
-const getSmartResInfo = (w: number, h: number) => {
-  if (w === 0 || h === 0) return { label: "---", detail: "" };
-  const min = Math.min(w, h);
-  const dims = `${w} × ${h}`;
-  if (min >= 4320) return { label: "8K UHD", detail: dims };
-  if (min >= 2160) return { label: "4K UHD", detail: dims };
-  if (min >= 1440) return { label: "1440p QHD", detail: dims };
-  if (min >= 1080) return { label: "1080p FHD", detail: dims };
-  if (min >= 720) return { label: "720p HD", detail: dims };
-  if (min >= 480) return { label: "480p SD", detail: dims };
-  return { label: dims, detail: "" };
-};
 
 // --- TOOLTIP COMPONENT (Portal-based with viewport boundary detection) ---
 const TOOLTIP_WIDTH = 200;

@@ -60,6 +60,7 @@ export interface UpscaleConfig {
   // true = GPU-native pipeline (engine-v2: NVDEC → TensorRT → NVENC, ONNX models only)
   // false = Python pipeline (default, works with all model formats)
   useNativeEngine: boolean;
+  maxBatch: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -81,6 +82,7 @@ const DEFAULT_UPSCALE_CONFIG: UpscaleConfig = {
   resolutionPreset: null,
 
   useNativeEngine: false,
+  maxBatch: 1,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════

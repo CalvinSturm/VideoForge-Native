@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 
-use crate::commands::native_engine::{native_engine_runtime_enabled, workspace_root};
+use crate::commands::native_engine::native_engine_runtime_enabled;
+use crate::commands::native_runtime::workspace_root;
 use crate::rave_cli::{
     run_benchmark, run_upscale, run_validate, RaveCliConfig, RaveCliError, RaveResult,
 };
+use crate::tauri_contracts::{RaveBenchmarkRequest, RaveValidateRequest};
 
 fn default_profile() -> &'static str {
     if cfg!(debug_assertions) {
@@ -320,19 +322,27 @@ pub async fn rave_validate(
     strict_audit: Option<bool>,
     mock_run: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    let request = RaveValidateRequest {
+        fixture,
+        profile,
+        best_effort,
+        strict_audit,
+        mock_run,
+    };
     let root = workspace_root().ok_or_else(|| "Failed to resolve workspace root".to_string())?;
     let config = RaveCliConfig::from_workspace_root(root);
-    let fixture_path = fixture
+    let fixture_path = request
+        .fixture
         .as_deref()
         .filter(|p| !p.trim().is_empty())
         .map(PathBuf::from);
     let res = run_validate(
         &config,
         fixture_path.as_deref(),
-        profile.as_deref().unwrap_or("production_strict"),
-        best_effort.unwrap_or(false),
-        strict_audit.unwrap_or(true),
-        mock_run.unwrap_or(false),
+        request.profile.as_deref().unwrap_or("production_strict"),
+        request.best_effort.unwrap_or(false),
+        request.strict_audit.unwrap_or(true),
+        request.mock_run.unwrap_or(false),
     )
     .await
     .map_err(map_rave_error)?;
@@ -511,11 +521,17 @@ pub async fn rave_benchmark(
     mock_run: Option<bool>,
     ui_opt_in: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    Ok(run_rave_benchmark_internal(
+    let request = RaveBenchmarkRequest {
         args,
-        strict_audit.unwrap_or(true),
-        mock_run.unwrap_or(false),
-        ui_opt_in.unwrap_or(false),
+        strict_audit,
+        mock_run,
+        ui_opt_in,
+    };
+    Ok(run_rave_benchmark_internal(
+        request.args,
+        request.strict_audit.unwrap_or(true),
+        request.mock_run.unwrap_or(false),
+        request.ui_opt_in.unwrap_or(false),
     )
     .await?
     .json)

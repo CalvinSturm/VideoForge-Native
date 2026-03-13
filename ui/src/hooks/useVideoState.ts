@@ -1,5 +1,6 @@
 import { useState, useMemo, useCallback } from "react";
 import type { UpscaleMode, VideoState, EditState } from "../types";
+import type { TauriEditConfig } from "../tauri/contracts";
 
 const INITIAL_EDIT_STATE: EditState = {
     trimStart: 0, trimEnd: 0, crop: null, rotation: 0, flipH: false, flipV: false, fps: 0,
@@ -54,7 +55,7 @@ export function useVideoState() {
         renderedRange
     }), [inputPath, videoTime, videoDuration, editState, inputDims, previewFile, renderedRange]);
 
-    const getRustEditConfig = useCallback(() => ({
+    const getRustEditConfig = useCallback((): TauriEditConfig => ({
         trim_start: editState.trimStart,
         trim_end: editState.trimEnd,
         crop: editState.crop,

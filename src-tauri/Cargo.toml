@@ -1,11 +1,11 @@
 [package]
 name = "videoforge"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
-license = ""
-repository = ""
+description = "Local-first AI super-resolution desktop app"
+authors = ["VideoForge contributors"]
+license = "LicenseRef-Proprietary"
 edition = "2021"
+publish = false
 default-run = "videoforge"
 
 # --- THIS SECTION IS CRITICAL FOR "app_lib" ERROR ---

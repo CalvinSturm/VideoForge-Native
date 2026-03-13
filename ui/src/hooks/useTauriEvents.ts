@@ -1,14 +1,13 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
-import type { Job } from "../types";
+import type { Job, SystemStats, UpscaleProgressEventPayload } from "../types";
 import { useJobStore } from "../Store/useJobStore";
+import { updateActiveJob, updateJobs } from "../utils/jobState";
 
 interface UseTauriEventsProps {
   setJobs: React.Dispatch<React.SetStateAction<Job[]>>;
   setLogs: React.Dispatch<React.SetStateAction<string[]>>;
   setActiveJob: React.Dispatch<React.SetStateAction<Job | null>>;
-  setLoadingModel: React.Dispatch<React.SetStateAction<boolean>>;
-  addToast: (message: string, type: "success" | "error" | "info" | "warning") => void;
 }
 
 export const useTauriEvents = ({
@@ -26,7 +25,7 @@ export const useTauriEvents = ({
 
     const setup = async () => {
       // 1. Progress Listener
-      unlistenProgress = await listen("upscale-progress", (event: any) => {
+      unlistenProgress = await listen<UpscaleProgressEventPayload>("upscale-progress", (event) => {
         if (isCleanedUp) return;
         const { jobId, progress, message, outputPath, eta } = event.payload;
 
@@ -35,8 +34,8 @@ export const useTauriEvents = ({
         let totalFrames = 0;
         const frameMatch = message.match(/Frame\s+(\d+)\/(\d+)/);
         if (frameMatch) {
-            framesProcessed = parseInt(frameMatch[1]);
-            totalFrames = parseInt(frameMatch[2]);
+            framesProcessed = parseInt(frameMatch[1] ?? "0", 10);
+            totalFrames = parseInt(frameMatch[2] ?? "0", 10);
             // Update Global Store
             setProgress(progress, framesProcessed, totalFrames);
         } else if (progress === 100) {
@@ -54,9 +53,9 @@ export const useTauriEvents = ({
              return {
                  ...j,
                  progress,
-                 framesProcessed: framesProcessed || j.framesProcessed,
-                 totalFrames: totalFrames || j.totalFrames,
                  statusMessage: message,
+                 ...(framesProcessed > 0 ? { framesProcessed } : {}),
+                 ...(totalFrames > 0 ? { totalFrames } : {}),
                  ...(outputPath ? { outputPath } : {}),
                  eta: eta ?? 0,
                  status: isFinished ? 'done' : j.status
@@ -65,13 +64,16 @@ export const useTauriEvents = ({
           return j;
         };
 
-        setJobs((prev: Job[]) => prev.map(updateJobLogic));
-        setActiveJob((prev) => {
-          if (!prev) return null;
-          const updated = updateJobLogic(prev);
-          if (updated !== prev) return updated;
-          return prev;
-        });
+        setJobs((prev: Job[]) => updateJobs(prev, (job) => {
+          const isIdMatch = job.id === jobId;
+          const isActiveTarget = (jobId === 'active' || jobId === 'export') && job.status === 'running';
+          return isIdMatch || isActiveTarget;
+        }, updateJobLogic));
+        setActiveJob((prev) => updateActiveJob(prev, (job) => {
+          const isIdMatch = job.id === jobId;
+          const isActiveTarget = (jobId === 'active' || jobId === 'export') && job.status === 'running';
+          return isIdMatch || isActiveTarget;
+        }, updateJobLogic));
 
         // Log significant events
         if (progress === 0 || progress === 100 || (framesProcessed > 0 && framesProcessed % 50 === 0)) {
@@ -80,7 +82,7 @@ export const useTauriEvents = ({
       });
 
       // 2. Stats Listener
-      unlistenStats = await listen("system-stats", (event: any) => {
+      unlistenStats = await listen<SystemStats>("system-stats", (event) => {
          if (isCleanedUp) return;
          setStats(event.payload);
       });

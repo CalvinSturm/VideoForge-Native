@@ -25,6 +25,7 @@ pub mod run_manifest;
 pub mod shm;
 pub mod spatial_map;
 pub mod spatial_publisher;
+pub mod tauri_contracts;
 mod utils;
 mod video_pipeline;
 pub mod win_events;
@@ -44,12 +45,12 @@ fn spawn_system_monitor(app: AppHandle) {
 
             let _ = app.emit(
                 "system-stats",
-                serde_json::json!({
-                    "cpu": cpu_usage,
-                    "ramUsed": ram_used,
-                    "ramTotal": ram_total,
-                    "gpuName": "NVIDIA CUDA:0"
-                }),
+                crate::tauri_contracts::SystemStatsPayload {
+                    cpu: cpu_usage,
+                    ram_used,
+                    ram_total,
+                    gpu_name: "NVIDIA CUDA:0".to_string(),
+                },
             );
 
             tokio::time::sleep(Duration::from_secs(2)).await;
