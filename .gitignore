@@ -3,11 +3,19 @@ __pycache__/
 *.py[cod]
 *.pyo
 venv/
+.venv/
 .env
+.env.*
+!.env.example
 *.pth                 # Ignore .pth files (sometimes created in site-packages)
 *.egg-info/           # Ignore Python egg info
 pip-log.txt           # Pip logs
 *.egg                 # Egg files
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Byte-compiled / optimized / DLL files
 *.so
@@ -35,6 +43,10 @@ node_modules/
 dist/
 build/
 *.log
+coverage/
+*.tsbuildinfo
+.vite/
+.turbo/
 
 # VSCode and OS
 .vscode/
@@ -45,19 +57,21 @@ Thumbs.db
 /python-runtime/
 
 # Agent Dev
-.agents/
+/.agents/
 .agent/
 .cursor/
 .gemini/
 .opencode/
-.claude/
+/.claude/
 CLAUDE.md
 weights/
 
 # Large runtime/build outputs
 artifacts/*.json
 artifacts/trt_cache*/
+artifacts/trt_cache_bench*/
 artifacts/**/*.engine
+artifacts/**/*.plan
 artifacts/**/*.profile
 artifacts/downloads/
 artifacts/benchmarks/
