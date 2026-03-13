@@ -1,7 +1,7 @@
 #[cfg(feature = "native_engine")]
-use crate::commands::native_runtime::configure_native_probe_cmd;
-#[cfg(feature = "native_engine")]
 use crate::commands::native_routing::{NativeJobSpec, NativeOutputPathStyle};
+#[cfg(feature = "native_engine")]
+use crate::commands::native_runtime::configure_native_probe_cmd;
 #[cfg(feature = "native_engine")]
 use crate::commands::native_streaming_io::StreamingCodecHint;
 
@@ -13,6 +13,8 @@ fn probe_video_coded_geometry(
     path: &str,
 ) -> Result<
     (
+        usize,
+        usize,
         usize,
         usize,
         f64,
@@ -70,7 +72,11 @@ fn probe_video_coded_geometry(
     let fps = if let Some((num, den)) = fps_str.split_once('/') {
         let num = num.parse::<f64>().unwrap_or(30.0);
         let den = den.parse::<f64>().unwrap_or(1.0);
-        if den == 0.0 { 30.0 } else { num / den }
+        if den == 0.0 {
+            30.0
+        } else {
+            num / den
+        }
     } else {
         fps_str.parse::<f64>().unwrap_or(30.0)
     };
@@ -98,12 +104,23 @@ fn probe_video_coded_geometry(
         }
     };
 
-    Ok((coded_width, coded_height, duration, fps, total_frames, codec))
+    Ok((
+        display_width,
+        display_height,
+        coded_width,
+        coded_height,
+        duration,
+        fps,
+        total_frames,
+        codec,
+    ))
 }
 
 #[cfg(feature = "native_engine")]
 #[derive(Debug, Clone)]
 pub(crate) struct NativeVideoSourceProfile {
+    pub width: usize,
+    pub height: usize,
     pub coded_width: usize,
     pub coded_height: usize,
     pub fps: f64,
@@ -115,12 +132,14 @@ pub(crate) struct NativeVideoSourceProfile {
 impl NativeVideoSourceProfile {
     pub(crate) fn probe(input_path: &str) -> Result<Self, String> {
         tracing::info!(path = %input_path, "Probing input video dimensions");
-        let (coded_width, coded_height, _duration, fps, total_frames, codec) =
+        let (width, height, coded_width, coded_height, _duration, fps, total_frames, codec) =
             probe_video_coded_geometry(input_path).map_err(|e| {
                 serde_json::to_string(&NativeUpscaleError::new("PROBE_FAILED", &e)).unwrap()
             })?;
 
         tracing::info!(
+            width,
+            height,
             coded_width,
             coded_height,
             fps,
@@ -130,6 +149,8 @@ impl NativeVideoSourceProfile {
         );
 
         Ok(Self {
+            width,
+            height,
             coded_width,
             coded_height,
             fps,
@@ -147,8 +168,8 @@ impl NativeVideoSourceProfile {
     }
 
     pub(crate) fn scaled_output(&self, scale: u32) -> NativeVideoOutputProfile {
-        let width = self.coded_width.saturating_mul(scale as usize);
-        let height = self.coded_height.saturating_mul(scale as usize);
+        let width = self.width.saturating_mul(scale as usize);
+        let height = self.height.saturating_mul(scale as usize);
         NativeVideoOutputProfile {
             width,
             height,
@@ -233,8 +254,10 @@ impl NativeDirectPlan {
         let output = source.scaled_output(job.scale);
 
         tracing::info!(
-            input_w = source.coded_width,
-            input_h = source.coded_height,
+            input_w = source.width,
+            input_h = source.height,
+            coded_w = source.coded_width,
+            coded_h = source.coded_height,
             output_w = output.width,
             output_h = output.height,
             encoder_nv12_pitch = output.nv12_pitch,
@@ -276,6 +299,8 @@ mod tests {
     #[test]
     fn source_profile_maps_codec_to_mux_hint() {
         let h264 = NativeVideoSourceProfile {
+            width: 1920,
+            height: 1080,
             coded_width: 1920,
             coded_height: 1080,
             fps: 30.0,

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, DevicePtr, DeviceSlice};
 
-use crate::codecs::sys::{check_cu, cuMemcpyDtoH_v2, CUdeviceptr};
+use crate::codecs::sys::{CUdeviceptr, check_cu, cuMemcpyDtoH_v2};
 use crate::core::context::{GpuContext, RawGpuAllocation};
 use crate::error::Result;
 

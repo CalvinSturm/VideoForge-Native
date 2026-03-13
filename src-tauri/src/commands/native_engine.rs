@@ -30,14 +30,16 @@
 //! implementation; this module no longer relies on the older temp elementary
 //! stream handoff described in prior docs.
 
-use serde::{Deserialize, Serialize};
-use std::path::Path;
-use crate::runtime_truth::{RunObservedMetrics, RuntimeConfigSnapshot};
-use crate::tauri_contracts::NativeUpscaleRequest;
 #[cfg(feature = "native_engine")]
-pub(crate) use crate::commands::native_probe::{NativeVideoOutputProfile, NativeVideoSourceProfile};
+pub(crate) use crate::commands::native_probe::{
+    NativeVideoOutputProfile, NativeVideoSourceProfile,
+};
 #[cfg(feature = "native_engine")]
 use crate::commands::native_routing::{run_native_job, NativeJobSpec};
+use crate::runtime_truth::{RunObservedMetrics, RuntimeConfigSnapshot};
+use crate::tauri_contracts::NativeUpscaleRequest;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 #[cfg(feature = "native_engine")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -117,21 +119,19 @@ impl NativeUpscaleError {
 
 #[cfg(feature = "native_engine")]
 pub use crate::commands::native_tooling::{
-    default_native_tool_trt_cache_dir, native_benchmark_done_json,
-    native_benchmark_result_json, native_benchmark_warmup_start_json,
-    native_result_summary_json, native_smoke_success_lines, native_tool_run_banner,
-    run_native_tool_request, NativeRuntimeOverrides, NativeToolRunRequest,
+    default_native_tool_trt_cache_dir, native_benchmark_done_json, native_benchmark_result_json,
+    native_benchmark_warmup_start_json, native_result_summary_json, native_smoke_success_lines,
+    native_tool_run_banner, run_native_tool_request, NativeRuntimeOverrides, NativeToolRunRequest,
 };
 
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "native_engine")]
     use super::{
-        default_native_tool_trt_cache_dir,
-        native_benchmark_done_json, native_result_summary_json, native_smoke_success_lines,
-        native_tool_run_banner,
-        NativeJobSpec, NativePerfReport, NativeRuntimeOverrides, NativeToolRunRequest,
-        NativeUpscaleError, NativeUpscaleResult, NativeVideoOutputProfile, NativeVideoSourceProfile,
+        default_native_tool_trt_cache_dir, native_benchmark_done_json, native_result_summary_json,
+        native_smoke_success_lines, native_tool_run_banner, NativeJobSpec, NativePerfReport,
+        NativeRuntimeOverrides, NativeToolRunRequest, NativeUpscaleError, NativeUpscaleResult,
+        NativeVideoOutputProfile, NativeVideoSourceProfile,
     };
     #[cfg(feature = "native_engine")]
     use crate::commands::native_routing::{
@@ -213,6 +213,8 @@ mod tests {
     #[test]
     fn source_profile_derives_expected_output_profile() {
         let source = NativeVideoSourceProfile {
+            width: 1920,
+            height: 1080,
             coded_width: 1920,
             coded_height: 1080,
             fps: 23.976,
@@ -253,7 +255,10 @@ mod tests {
                 std::env::var("VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE").as_deref(),
                 Ok("1")
             );
-            assert_eq!(std::env::var("VIDEOFORGE_TRT_CACHE_DIR").as_deref(), Ok("cache-dir"));
+            assert_eq!(
+                std::env::var("VIDEOFORGE_TRT_CACHE_DIR").as_deref(),
+                Ok("cache-dir")
+            );
         }
     }
 
@@ -279,10 +284,7 @@ mod tests {
             .with_output_path("results/final.mp4")
             .with_default_benchmark_trt_cache(true);
         assert_eq!(req.warmup_output_path(2), "results\\final.warmup2.mp4");
-        assert_eq!(
-            req.trt_cache_dir,
-            Some(default_native_tool_trt_cache_dir())
-        );
+        assert_eq!(req.trt_cache_dir, Some(default_native_tool_trt_cache_dir()));
     }
 
     #[cfg(feature = "native_engine")]
@@ -408,8 +410,8 @@ mod tests {
     #[cfg(feature = "native_engine")]
     #[test]
     fn native_tool_helpers_shape_smoke_output() {
-        let request = NativeToolRunRequest::new("in.mp4", "model.onnx", 2, "fp16")
-            .with_native_direct(true);
+        let request =
+            NativeToolRunRequest::new("in.mp4", "model.onnx", 2, "fp16").with_native_direct(true);
         assert_eq!(
             native_tool_run_banner(&request),
             "  Running native pipeline via direct engine-v2 path (this may take time)..."
@@ -483,7 +485,10 @@ mod tests {
         assert_eq!(value["output_path"], "explicit.mp4");
         assert_eq!(value["model_path"], "model.onnx");
         assert_eq!(value["model_format"], "onnx");
-        assert_eq!(value["extensions"]["native"]["requested_output_path"], "explicit.mp4");
+        assert_eq!(
+            value["extensions"]["native"]["requested_output_path"],
+            "explicit.mp4"
+        );
         assert_eq!(value["extensions"]["native"]["preserve_audio"], false);
         assert!(value.get("fallback").is_none());
     }
@@ -520,10 +525,7 @@ mod tests {
         assert_eq!(value["fallback"]["from_route_id"], "native_direct");
         assert_eq!(value["fallback"]["to_route_id"], "native_via_rave_cli");
         assert_eq!(value["fallback"]["reason_code"], "PIPELINE");
-        assert_eq!(
-            value["extensions"]["native"]["trt_cache_enabled"],
-            true
-        );
+        assert_eq!(value["extensions"]["native"]["trt_cache_enabled"], true);
     }
 
     #[cfg(feature = "native_engine")]
@@ -554,8 +556,13 @@ mod tests {
             vram_current_mb: None,
             vram_peak_mb: Some(4096),
         };
-        let metrics =
-            build_native_observed_metrics("run-456", "native_direct", RunStatus::Succeeded, Some(&perf), None);
+        let metrics = build_native_observed_metrics(
+            "run-456",
+            "native_direct",
+            RunStatus::Succeeded,
+            Some(&perf),
+            None,
+        );
         let value = serde_json::to_value(&metrics).expect("serialize native observed metrics");
 
         assert_eq!(value["schema_version"], RUN_OBSERVED_METRICS_SCHEMA_V1);
@@ -565,7 +572,10 @@ mod tests {
         assert_eq!(value["total_elapsed_ms"], 3210);
         assert_eq!(value["work_units_processed"], 120);
         assert_eq!(value["extensions"]["native"]["frames_preprocessed"], 120);
-        assert_eq!(value["extensions"]["native"]["inference_frame_avg_us"], 5100);
+        assert_eq!(
+            value["extensions"]["native"]["inference_frame_avg_us"],
+            5100
+        );
         assert_eq!(value["extensions"]["native"]["encode_avg_us"], 1400);
         assert!(value["extensions"]["native"]
             .get("preprocess_avg_us")
@@ -701,4 +711,3 @@ pub async fn upscale_request_native(
         run_native_job(job).await
     }
 }
-

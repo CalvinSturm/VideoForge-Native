@@ -47,9 +47,11 @@
 //! `PipelineMetrics` tracks per-stage frame counts with atomic counters.
 //! Stage latency is tracked via wall-clock `Instant` timing.
 
+use std::fs;
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -65,6 +67,9 @@ use crate::core::kernels::{ModelPrecision, PreprocessKernels, PreprocessPipeline
 use crate::core::types::{FrameEnvelope, GpuTexture, PixelFormat};
 use crate::error::{EngineError, Result};
 
+static PREPROCESS_DEBUG_DUMP_WRITTEN: AtomicBool = AtomicBool::new(false);
+static POSTPROCESS_DEBUG_DUMP_WRITTEN: AtomicBool = AtomicBool::new(false);
+
 // ─── Panic formatting helper ────────────────────────────────────────────────
 
 /// Format a panic payload into a human-readable string.
@@ -78,11 +83,305 @@ fn format_panic(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+fn prefer_pipeline_error(
+    current: Option<EngineError>,
+    candidate: EngineError,
+) -> Option<EngineError> {
+    match (current, candidate) {
+        (None, candidate) => Some(candidate),
+        (Some(EngineError::ChannelClosed), candidate @ EngineError::Encode(_)) => Some(candidate),
+        (Some(EngineError::ChannelClosed), candidate @ EngineError::Decode(_)) => Some(candidate),
+        (Some(EngineError::ChannelClosed), candidate @ EngineError::DimensionMismatch(_)) => {
+            Some(candidate)
+        }
+        (Some(existing), EngineError::ChannelClosed) => Some(existing),
+        (Some(existing), _) => Some(existing),
+    }
+}
+
 // ─── Pipeline stage traits ──────────────────────────────────────────────────
 
 /// Video frame decoder producing GPU-resident NV12 frames.
 pub trait FrameDecoder: Send + 'static {
     fn decode_next(&mut self) -> Result<Option<DecodedFrameEnvelope>>;
+}
+
+fn preprocess_debug_dump_enabled() -> bool {
+    std::env::var_os("VIDEOFORGE_PIPELINE_DEBUG_DUMP").as_deref() == Some("1".as_ref())
+}
+
+fn claim_preprocess_debug_dump_slot() -> bool {
+    preprocess_debug_dump_enabled()
+        && PREPROCESS_DEBUG_DUMP_WRITTEN
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+}
+
+fn claim_postprocess_debug_dump_slot() -> bool {
+    preprocess_debug_dump_enabled()
+        && POSTPROCESS_DEBUG_DUMP_WRITTEN
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+}
+
+fn debug_dump_dir() -> PathBuf {
+    if let Some(override_dir) = std::env::var_os("VIDEOFORGE_NVDEC_DEBUG_DUMP_DIR") {
+        return PathBuf::from(override_dir);
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let base = if cwd.file_name().and_then(|name| name.to_str()) == Some("src-tauri") {
+        cwd.parent().map(PathBuf::from).unwrap_or(cwd)
+    } else {
+        cwd
+    };
+
+    base.join("artifacts").join("nvdec_debug")
+}
+
+fn f32_to_u8(v: f32) -> u8 {
+    let scaled = (v.clamp(0.0, 1.0) * 255.0).round();
+    scaled as u8
+}
+
+fn write_ppm_preview(texture: &GpuTexture, host: &[u8], path: &PathBuf) -> Result<()> {
+    let w = texture.width as usize;
+    let h = texture.height as usize;
+    let plane_bytes = w * h * std::mem::size_of::<f32>();
+    let expected = plane_bytes * 3;
+    if host.len() < expected {
+        return Err(EngineError::FormatMismatch {
+            expected: PixelFormat::RgbPlanarF32,
+            actual: texture.format,
+        });
+    }
+
+    let (r_plane, rest) = host.split_at(plane_bytes);
+    let (g_plane, b_plane) = rest.split_at(plane_bytes);
+    let mut ppm = Vec::with_capacity(32 + w * h * 3);
+    ppm.extend_from_slice(format!("P6\n{} {}\n255\n", w, h).as_bytes());
+
+    for idx in 0..(w * h) {
+        let r = f32::from_le_bytes(r_plane[idx * 4..idx * 4 + 4].try_into().unwrap());
+        let g = f32::from_le_bytes(g_plane[idx * 4..idx * 4 + 4].try_into().unwrap());
+        let b = f32::from_le_bytes(b_plane[idx * 4..idx * 4 + 4].try_into().unwrap());
+        ppm.push(f32_to_u8(r));
+        ppm.push(f32_to_u8(g));
+        ppm.push(f32_to_u8(b));
+    }
+
+    fs::write(path, ppm).map_err(|e| {
+        EngineError::Decode(format!(
+            "Failed to write preprocess preview '{}': {e}",
+            path.display()
+        ))
+    })
+}
+
+fn write_nv12_luma_preview(texture: &GpuTexture, host: &[u8], path: &PathBuf) -> Result<()> {
+    let w = texture.width as usize;
+    let h = texture.height as usize;
+    let expected = texture.pitch * h;
+    if host.len() < expected {
+        return Err(EngineError::FormatMismatch {
+            expected: PixelFormat::Nv12,
+            actual: texture.format,
+        });
+    }
+
+    let mut pgm = Vec::with_capacity(32 + w * h);
+    pgm.extend_from_slice(format!("P5\n{} {}\n255\n", w, h).as_bytes());
+    for y in 0..h {
+        let row_start = y * texture.pitch;
+        pgm.extend_from_slice(&host[row_start..row_start + w]);
+    }
+
+    fs::write(path, pgm).map_err(|e| {
+        EngineError::Decode(format!(
+            "Failed to write postprocess luma preview '{}': {e}",
+            path.display()
+        ))
+    })
+}
+
+fn write_nv12_uv_preview(texture: &GpuTexture, host: &[u8], path: &PathBuf) -> Result<()> {
+    let w = texture.width as usize;
+    let h = texture.height as usize;
+    let uv_rows = h / 2;
+    let uv_base = texture.pitch * h;
+    let expected = uv_base + texture.pitch * uv_rows;
+    if host.len() < expected {
+        return Err(EngineError::FormatMismatch {
+            expected: PixelFormat::Nv12,
+            actual: texture.format,
+        });
+    }
+
+    let mut ppm = Vec::with_capacity(32 + w * uv_rows * 3);
+    ppm.extend_from_slice(format!("P6\n{} {}\n255\n", w, uv_rows).as_bytes());
+    for y in 0..uv_rows {
+        let row_start = uv_base + y * texture.pitch;
+        for x in 0..(w / 2) {
+            let u = host[row_start + x * 2];
+            let v = host[row_start + x * 2 + 1];
+            ppm.push(u);
+            ppm.push(128);
+            ppm.push(v);
+            ppm.push(u);
+            ppm.push(128);
+            ppm.push(v);
+        }
+    }
+
+    fs::write(path, ppm).map_err(|e| {
+        EngineError::Decode(format!(
+            "Failed to write postprocess UV preview '{}': {e}",
+            path.display()
+        ))
+    })
+}
+
+fn write_preprocess_debug_dump(
+    texture: &GpuTexture,
+    ctx: &GpuContext,
+    frame_index: u64,
+) -> Result<()> {
+    let dump_dir = debug_dump_dir();
+    fs::create_dir_all(&dump_dir).map_err(|e| {
+        EngineError::Decode(format!(
+            "Failed to create preprocess debug dump dir '{}': {e}",
+            dump_dir.display()
+        ))
+    })?;
+
+    let base = format!(
+        "preprocess_{frame_index:05}_{}x{}_pitch{}_fmt_{:?}",
+        texture.width, texture.height, texture.pitch, texture.format
+    );
+    let raw_path = dump_dir.join(format!("{base}.bin"));
+    let meta_path = dump_dir.join(format!("{base}.txt"));
+
+    let host = texture.data.copy_to_host_sync(ctx)?;
+    fs::write(&raw_path, &host).map_err(|e| {
+        EngineError::Decode(format!(
+            "Failed to write preprocess raw dump '{}': {e}",
+            raw_path.display()
+        ))
+    })?;
+
+    let mut metadata = format!(
+        concat!(
+            "frame_index={frame_index}\n",
+            "texture_width={texture_width}\n",
+            "texture_height={texture_height}\n",
+            "texture_pitch={texture_pitch}\n",
+            "texture_format={texture_format:?}\n",
+            "raw_path={raw_path}\n"
+        ),
+        frame_index = frame_index,
+        texture_width = texture.width,
+        texture_height = texture.height,
+        texture_pitch = texture.pitch,
+        texture_format = texture.format,
+        raw_path = raw_path.display(),
+    );
+
+    if texture.format == PixelFormat::RgbPlanarF32 {
+        let preview_path = dump_dir.join(format!("{base}.ppm"));
+        write_ppm_preview(texture, &host, &preview_path)?;
+        metadata.push_str(&format!("preview_path={}\n", preview_path.display()));
+    }
+
+    fs::write(&meta_path, metadata).map_err(|e| {
+        EngineError::Decode(format!(
+            "Failed to write preprocess metadata '{}': {e}",
+            meta_path.display()
+        ))
+    })?;
+
+    info!(
+        frame_index,
+        raw_path = %raw_path.display(),
+        meta_path = %meta_path.display(),
+        format = ?texture.format,
+        "Preprocess debug dump written"
+    );
+    Ok(())
+}
+
+fn write_postprocess_debug_dump(
+    texture: &GpuTexture,
+    ctx: &GpuContext,
+    frame_index: u64,
+) -> Result<()> {
+    let dump_dir = debug_dump_dir();
+    fs::create_dir_all(&dump_dir).map_err(|e| {
+        EngineError::Decode(format!(
+            "Failed to create postprocess debug dump dir '{}': {e}",
+            dump_dir.display()
+        ))
+    })?;
+
+    let base = format!(
+        "postprocess_{frame_index:05}_{}x{}_pitch{}_fmt_{:?}",
+        texture.width, texture.height, texture.pitch, texture.format
+    );
+    let raw_path = dump_dir.join(format!("{base}.bin"));
+    let meta_path = dump_dir.join(format!("{base}.txt"));
+
+    let host = texture.data.copy_to_host_sync(ctx)?;
+    fs::write(&raw_path, &host).map_err(|e| {
+        EngineError::Decode(format!(
+            "Failed to write postprocess raw dump '{}': {e}",
+            raw_path.display()
+        ))
+    })?;
+
+    let mut metadata = format!(
+        concat!(
+            "frame_index={frame_index}\n",
+            "texture_width={texture_width}\n",
+            "texture_height={texture_height}\n",
+            "texture_pitch={texture_pitch}\n",
+            "texture_format={texture_format:?}\n",
+            "raw_path={raw_path}\n",
+            "note=raw NVENC-input texture after RGB->NV12 postprocess\n"
+        ),
+        frame_index = frame_index,
+        texture_width = texture.width,
+        texture_height = texture.height,
+        texture_pitch = texture.pitch,
+        texture_format = texture.format,
+        raw_path = raw_path.display(),
+    );
+
+    if texture.format == PixelFormat::Nv12 {
+        let luma_preview_path = dump_dir.join(format!("{base}_luma.pgm"));
+        let uv_preview_path = dump_dir.join(format!("{base}_uv.ppm"));
+        write_nv12_luma_preview(texture, &host, &luma_preview_path)?;
+        write_nv12_uv_preview(texture, &host, &uv_preview_path)?;
+        metadata.push_str(&format!(
+            "luma_preview_path={}\n",
+            luma_preview_path.display()
+        ));
+        metadata.push_str(&format!("uv_preview_path={}\n", uv_preview_path.display()));
+    }
+
+    fs::write(&meta_path, metadata).map_err(|e| {
+        EngineError::Decode(format!(
+            "Failed to write postprocess metadata '{}': {e}",
+            meta_path.display()
+        ))
+    })?;
+
+    info!(
+        frame_index,
+        raw_path = %raw_path.display(),
+        meta_path = %meta_path.display(),
+        format = ?texture.format,
+        "Postprocess debug dump written"
+    );
+    Ok(())
 }
 
 /// Video frame encoder consuming GPU-resident NV12 frames.
@@ -125,7 +424,10 @@ impl StreamReadyEvent {
                 &format!("cuEventCreate ({context})"),
             )?;
             crate::codecs::sys::check_cu(
-                crate::codecs::sys::cuEventRecord(event, crate::codecs::nvdec::get_raw_stream(stream)),
+                crate::codecs::sys::cuEventRecord(
+                    event,
+                    crate::codecs::nvdec::get_raw_stream(stream),
+                ),
                 &format!("cuEventRecord ({context})"),
             )?;
         }
@@ -178,7 +480,10 @@ pub struct DecodedFrameEnvelope {
 
 impl DecodedFrameEnvelope {
     pub fn new(frame: FrameEnvelope, decode_ready: Option<StreamReadyEvent>) -> Self {
-        Self { frame, decode_ready }
+        Self {
+            frame,
+            decode_ready,
+        }
     }
 
     pub fn without_event(frame: FrameEnvelope) -> Self {
@@ -550,18 +855,15 @@ impl UpscalePipeline {
                 Ok(Err(e)) => {
                     error!(%e, "Pipeline stage failed");
                     cancel.cancel();
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
+                    first_error = prefer_pipeline_error(first_error, e);
                 }
                 Err(join_err) => {
                     error!(%join_err, "Pipeline task panicked");
                     cancel.cancel();
-                    if first_error.is_none() {
-                        first_error = Some(EngineError::DimensionMismatch(format!(
-                            "Task panic: {join_err}"
-                        )));
-                    }
+                    first_error = prefer_pipeline_error(
+                        first_error,
+                        EngineError::DimensionMismatch(format!("Task panic: {join_err}")),
+                    );
                 }
             }
         }
@@ -1154,7 +1456,8 @@ async fn preprocess_stage(
             "PIPELINE-BND: preprocess_stage decode dependency satisfied"
         );
         if profiler_ctx.is_some() && frame.frame_index % 8 == 0 {
-            ctx.overlap_timer.mark_preprocess_start(&ctx.preprocess_stream)?;
+            ctx.overlap_timer
+                .mark_preprocess_start(&ctx.preprocess_stream)?;
             if let Err(err) = ctx.overlap_timer.sample() {
                 warn!(
                     frame_index = frame.frame_index,
@@ -1175,8 +1478,17 @@ async fn preprocess_stage(
             out_format = ?model_input.texture.format,
             "PIPELINE-BND: preprocess_stage prepare complete"
         );
-        let preprocess_ready =
-            Some(StreamReadyEvent::record(&ctx.preprocess_stream, "preprocess_ready")?);
+        let preprocess_ready = Some(StreamReadyEvent::record(
+            &ctx.preprocess_stream,
+            "preprocess_ready",
+        )?);
+
+        if claim_preprocess_debug_dump_slot() {
+            if let Some(event) = &preprocess_ready {
+                event.synchronize()?;
+            }
+            write_preprocess_debug_dump(&model_input.texture, ctx, frame.frame_index)?;
+        }
 
         let elapsed_us = t_start.elapsed().as_micros() as u64;
         metrics
@@ -1417,6 +1729,9 @@ async fn inference_stage<B: UpscaleBackend>(
                 nv12_pitch = upscaled_nv12.pitch,
                 "PIPELINE-BND: inference_stage postprocess complete"
             );
+            if claim_postprocess_debug_dump_slot() {
+                write_postprocess_debug_dump(&upscaled_nv12, ctx, frame_index)?;
+            }
             outbound.push(FrameEnvelope {
                 texture: upscaled_nv12,
                 frame_index,
@@ -1425,8 +1740,10 @@ async fn inference_stage<B: UpscaleBackend>(
             });
         }
 
-        let postprocess_ready =
-            Some(StreamReadyEvent::record(&ctx.inference_stream, "postprocess_ready")?);
+        let postprocess_ready = Some(StreamReadyEvent::record(
+            &ctx.inference_stream,
+            "postprocess_ready",
+        )?);
         let post_us = t_post.elapsed().as_micros() as u64;
         metrics
             .postprocess_total_us
@@ -1453,15 +1770,18 @@ async fn inference_stage<B: UpscaleBackend>(
             } else {
                 None
             };
-            if tx.send(UpscaledFrameEnvelope::new(frame, ready)).await.is_err() {
+            if tx
+                .send(UpscaledFrameEnvelope::new(frame, ready))
+                .await
+                .is_err()
+            {
                 debug!("Inference: downstream closed");
-                ctx.queue_depth.inference.fetch_sub(pending, Ordering::Relaxed);
+                ctx.queue_depth
+                    .inference
+                    .fetch_sub(pending, Ordering::Relaxed);
                 return Err(EngineError::ChannelClosed);
             }
-            debug!(
-                frame_index,
-                "PIPELINE-BND: inference_stage sent frame"
-            );
+            debug!(frame_index, "PIPELINE-BND: inference_stage sent frame");
             pending -= 1;
             metrics.frames_inferred.fetch_add(1, Ordering::Release);
             ctx.queue_depth.inference.fetch_sub(1, Ordering::Relaxed);

@@ -279,10 +279,8 @@ pub type PFNVIDOPPOINTCALLBACK = unsafe extern "system" fn(
 ) -> c_int;
 
 /// Callback: parser reports parsed SEI message batch.
-pub type PFNVIDSEIMSGCALLBACK = unsafe extern "system" fn(
-    user_data: *mut c_void,
-    sei_info: *mut CUVIDSEIMESSAGEINFO,
-) -> c_int;
+pub type PFNVIDSEIMSGCALLBACK =
+    unsafe extern "system" fn(user_data: *mut c_void, sei_info: *mut CUVIDSEIMESSAGEINFO) -> c_int;
 
 /// Parser creation params.
 #[repr(C)]
@@ -395,16 +393,15 @@ mod nvenc_generated {
 }
 
 pub use nvenc_generated::{
-    GUID, NVENCSTATUS, NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE, NVENCAPI_MAJOR_VERSION,
-    NVENCAPI_MINOR_VERSION, NVENCAPI_VERSION, NV_ENCODE_API_FUNCTION_LIST, NV_ENC_BUFFER_FORMAT,
-    NV_ENC_BUFFER_USAGE,
-    NV_ENC_CODEC_CONFIG, NV_ENC_CONFIG, NV_ENC_CONFIG_HEVC, NV_ENC_CREATE_BITSTREAM_BUFFER,
-    NV_ENC_CREATE_INPUT_BUFFER, NV_ENC_DEVICE_TYPE, NV_ENC_INITIALIZE_PARAMS,
-    NV_ENC_INPUT_RESOURCE_TYPE, NV_ENC_LOCK_BITSTREAM, NV_ENC_LOCK_INPUT_BUFFER,
-    NV_ENC_MAP_INPUT_RESOURCE, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
-    NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_PARAMS, NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE,
-    NV_ENC_PRESET_CONFIG, NV_ENC_RC_PARAMS, NV_ENC_REGISTER_RESOURCE, NV_ENC_TUNING_INFO,
-    NvEncodeAPICreateInstance, NvEncodeAPIGetMaxSupportedVersion,
+    GUID, NV_ENC_BUFFER_FORMAT, NV_ENC_BUFFER_USAGE, NV_ENC_CODEC_CONFIG, NV_ENC_CONFIG,
+    NV_ENC_CONFIG_HEVC, NV_ENC_CREATE_BITSTREAM_BUFFER, NV_ENC_CREATE_INPUT_BUFFER,
+    NV_ENC_DEVICE_TYPE, NV_ENC_INITIALIZE_PARAMS, NV_ENC_INPUT_RESOURCE_TYPE,
+    NV_ENC_LOCK_BITSTREAM, NV_ENC_LOCK_INPUT_BUFFER, NV_ENC_MAP_INPUT_RESOURCE,
+    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_PARAMS,
+    NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE, NV_ENC_PRESET_CONFIG, NV_ENC_RC_PARAMS,
+    NV_ENC_REGISTER_RESOURCE, NV_ENC_TUNING_INFO, NV_ENCODE_API_FUNCTION_LIST,
+    NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE, NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION,
+    NVENCAPI_VERSION, NVENCSTATUS, NvEncodeAPICreateInstance, NvEncodeAPIGetMaxSupportedVersion,
 };
 
 pub const NV_ENC_SUCCESS: NVENCSTATUS = nvenc_generated::_NVENCSTATUS_NV_ENC_SUCCESS;
@@ -432,22 +429,19 @@ pub const NV_ENC_ERR_ENCODER_NOT_INITIALIZED: NVENCSTATUS =
     nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_ENCODER_NOT_INITIALIZED;
 pub const NV_ENC_ERR_UNSUPPORTED_PARAM: NVENCSTATUS =
     nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_UNSUPPORTED_PARAM;
-pub const NV_ENC_ERR_LOCK_BUSY: NVENCSTATUS =
-    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_LOCK_BUSY;
+pub const NV_ENC_ERR_LOCK_BUSY: NVENCSTATUS = nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_LOCK_BUSY;
 pub const NV_ENC_ERR_NOT_ENOUGH_BUFFER: NVENCSTATUS =
     nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_NOT_ENOUGH_BUFFER;
 pub const NV_ENC_ERR_INVALID_VERSION: NVENCSTATUS =
     nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_INVALID_VERSION;
-pub const NV_ENC_ERR_MAP_FAILED: NVENCSTATUS =
-    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_MAP_FAILED;
+pub const NV_ENC_ERR_MAP_FAILED: NVENCSTATUS = nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_MAP_FAILED;
 pub const NV_ENC_ERR_NEED_MORE_INPUT: NVENCSTATUS =
     nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_NEED_MORE_INPUT;
 pub const NV_ENC_ERR_ENCODER_BUSY: NVENCSTATUS =
     nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_ENCODER_BUSY;
 pub const NV_ENC_ERR_EVENT_NOT_REGISTERD: NVENCSTATUS =
     nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_EVENT_NOT_REGISTERD;
-pub const NV_ENC_ERR_GENERIC: NVENCSTATUS =
-    nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_GENERIC;
+pub const NV_ENC_ERR_GENERIC: NVENCSTATUS = nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_GENERIC;
 pub const NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY: NVENCSTATUS =
     nvenc_generated::_NVENCSTATUS_NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY;
 pub const NV_ENC_ERR_UNIMPLEMENTED: NVENCSTATUS =
@@ -583,8 +577,11 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
-    pub fn cuMemcpyDtoH_v2(dstHost: *mut c_void, srcDevice: CUdeviceptr, ByteCount: usize)
-    -> CUresult;
+    pub fn cuMemcpyDtoH_v2(
+        dstHost: *mut c_void,
+        srcDevice: CUdeviceptr,
+        ByteCount: usize,
+    ) -> CUresult;
     pub fn cuMemcpy2D_v2(pCopy: *const CUDA_MEMCPY2D) -> CUresult;
     pub fn cuMemcpy2DAsync_v2(pCopy: *const CUDA_MEMCPY2D, hStream: CUstream) -> CUresult;
 }
@@ -689,4 +686,3 @@ pub fn check_nvenc(status: NVENCSTATUS, context: &str) -> crate::error::Result<(
         )))
     }
 }
-

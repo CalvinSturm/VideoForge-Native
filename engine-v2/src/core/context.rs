@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, DeviceSlice};
 use tracing::{debug, info, warn};
 
-use crate::codecs::sys::{check_cu, cuMemAlloc_v2, cuMemFree_v2, CUdeviceptr};
+use crate::codecs::sys::{CUdeviceptr, check_cu, cuMemAlloc_v2, cuMemFree_v2};
 use crate::error::Result;
 
 /// Hardware-preferred alignment for tensor buffers (512 B — matches

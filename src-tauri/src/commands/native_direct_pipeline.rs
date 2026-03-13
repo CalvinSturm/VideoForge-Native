@@ -104,14 +104,24 @@ async fn run_engine_pipeline(
     tracing::info!(path = %job.input_path, codec = ?plan.source.codec, "Creating NVDEC decoder");
     let model_prec = match backend
         .metadata()
-        .map_err(|e| make_err("BACKEND_INIT", &format!("Model metadata unavailable: {}", e)))?
+        .map_err(|e| {
+            make_err(
+                "BACKEND_INIT",
+                &format!("Model metadata unavailable: {}", e),
+            )
+        })?
         .input_format
     {
         videoforge_engine::core::types::PixelFormat::RgbPlanarF16 => ModelPrecision::F16,
         _ => ModelPrecision::F32,
     };
     let source = FfmpegBitstreamSource::spawn(&plan.ffmpeg_cmd, &job.input_path, plan.source.codec)
-        .map_err(|e| make_err("SOURCE_OPEN", &format!("Cannot stream elementary input: {}", e)))?;
+        .map_err(|e| {
+            make_err(
+                "SOURCE_OPEN",
+                &format!("Cannot stream elementary input: {}", e),
+            )
+        })?;
     let decoder = NvDecoder::new(ctx.clone(), Box::new(source), plan.source.codec)
         .map_err(|e| make_err("DECODER_INIT", &format!("NVDEC decoder init failed: {}", e)))?;
 
@@ -122,6 +132,11 @@ async fn run_engine_pipeline(
         &plan.ffmpeg_cmd,
         &plan.output_path,
         &job.input_path,
+        plan.output.width as u32,
+        plan.output.height as u32,
+        plan.output.fps_num,
+        plan.output.fps_den,
+        enc_config.b_frames,
         job.preserve_audio,
         plan.mux_codec_hint.clone(),
     )
@@ -175,7 +190,9 @@ async fn run_engine_pipeline(
     }
 
     let metrics = pipeline.metrics();
-    let frames = metrics.frames_encoded.load(std::sync::atomic::Ordering::Relaxed);
+    let frames = metrics
+        .frames_encoded
+        .load(std::sync::atomic::Ordering::Relaxed);
     let encoder_mode = encoder_mode.as_str().to_string();
     let encoder_detail = encoder_detail.get();
     let (vram_current, vram_peak) = ctx.vram_usage();
@@ -355,11 +372,15 @@ impl videoforge_engine::engine::pipeline::FrameEncoder for SoftwareBitstreamEnco
         }
 
         self.ctx.sync_all()?;
-        let host = frame.texture.data.copy_to_host_sync(&self.ctx).map_err(|e| {
-            videoforge_engine::error::EngineError::Encode(format!(
-                "Software fallback DtoH readback failed: {e}"
-            ))
-        })?;
+        let host = frame
+            .texture
+            .data
+            .copy_to_host_sync(&self.ctx)
+            .map_err(|e| {
+                videoforge_engine::error::EngineError::Encode(format!(
+                    "Software fallback DtoH readback failed: {e}"
+                ))
+            })?;
 
         let payload: Vec<u8> = if frame.texture.pitch == self.width {
             let tight = self.tight_size_bytes();
@@ -570,7 +591,8 @@ impl videoforge_engine::engine::pipeline::FrameEncoder for NativeVideoEncoderWra
                         output = %self.fallback.output_path.display(),
                         "NVENC encode failed before first frame; refusing in-process software fallback"
                     );
-                    self.detail.set(format!("nvenc_first_frame_encode_failed: {err}"));
+                    self.detail
+                        .set(format!("nvenc_first_frame_encode_failed: {err}"));
                     drop(enc);
                     Err(videoforge_engine::error::EngineError::Encode(format!(
                         "NVENC first-frame encode failed for direct native path: {err}"

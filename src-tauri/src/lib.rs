@@ -18,10 +18,12 @@ pub mod control;
 pub mod edit_config;
 pub mod ipc;
 pub mod models;
+#[cfg(feature = "native_engine")]
+mod native_ffmpeg_sys;
 pub mod python_env;
 pub mod rave_cli;
-pub mod runtime_truth;
 pub mod run_manifest;
+pub mod runtime_truth;
 pub mod shm;
 pub mod spatial_map;
 pub mod spatial_publisher;
@@ -86,6 +88,7 @@ pub fn run() {
             // Native engine (always registered; returns FEATURE_DISABLED if not compiled in)
             commands::native_engine::upscale_request_native,
             // RAVE pipeline integration
+            commands::rave::rave_environment,
             commands::rave::rave_validate,
             commands::rave::rave_upscale,
             commands::rave::rave_benchmark,

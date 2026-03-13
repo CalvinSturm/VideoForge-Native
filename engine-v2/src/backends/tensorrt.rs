@@ -39,6 +39,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use ort::AsPointer;
 use ort::execution_providers::{
     CUDAExecutionProvider as CudaEP, TensorRTExecutionProvider as TrtEP,
 };
@@ -47,7 +48,6 @@ use ort::session::Session;
 use ort::sys as ort_sys;
 use ort::tensor::TensorElementType;
 use ort::value::{DynValueTypeMarker, Value as OrtValue};
-use ort::AsPointer;
 
 use cudarc::driver::{CudaSlice, DevicePtr};
 
@@ -705,13 +705,13 @@ impl TensorRtBackend {
                         .map(|&d| if d < 0 { None } else { Some(d) })
                         .collect(),
                 ),
-            other => {
-                return Err(EngineError::ModelMetadata(format!(
-                    "Expected tensor input, got {:?}",
-                    other
-                )));
-            }
-        };
+                other => {
+                    return Err(EngineError::ModelMetadata(format!(
+                        "Expected tensor input, got {:?}",
+                        other
+                    )));
+                }
+            };
 
         let (output_elem_type, output_dims): (TensorElementType, Vec<Option<i64>>) =
             match output_info.dtype() {
@@ -722,13 +722,13 @@ impl TensorRtBackend {
                         .map(|&d| if d < 0 { None } else { Some(d) })
                         .collect(),
                 ),
-            other => {
-                return Err(EngineError::ModelMetadata(format!(
-                    "Expected tensor output, got {:?}",
-                    other
-                )));
-            }
-        };
+                other => {
+                    return Err(EngineError::ModelMetadata(format!(
+                        "Expected tensor output, got {:?}",
+                        other
+                    )));
+                }
+            };
 
         if input_dims.len() != 4 || output_dims.len() != 4 {
             return Err(EngineError::ModelMetadata(format!(
@@ -1060,7 +1060,9 @@ impl UpscaleBackend for TensorRtBackend {
                 }
             }
         } else {
-            info!("TensorRT engine cache disabled (set VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE=1 to enable)");
+            info!(
+                "TensorRT engine cache disabled (set VIDEOFORGE_TRT_ENABLE_ENGINE_CACHE=1 to enable)"
+            );
         }
 
         // Phase 8: Apply precision policy.
@@ -1128,10 +1130,9 @@ impl UpscaleBackend for TensorRtBackend {
             });
         }
         let mut guard = self.state.lock().await;
-        self.ctx
-            .device()
-            .bind_to_thread()
-            .map_err(|e| EngineError::ModelMetadata(format!("bind_to_thread (backend process): {:?}", e)))?;
+        self.ctx.device().bind_to_thread().map_err(|e| {
+            EngineError::ModelMetadata(format!("bind_to_thread (backend process): {:?}", e))
+        })?;
         let state = guard.as_mut().ok_or(EngineError::NotInitialized)?;
 
         // Lazy ring init / realloc.
@@ -1230,7 +1231,9 @@ impl UpscaleBackend for TensorRtBackend {
 
         let first = &inputs[0];
         if inputs.iter().any(|input| {
-            input.width != first.width || input.height != first.height || input.format != first.format
+            input.width != first.width
+                || input.height != first.height
+                || input.format != first.format
         }) {
             warn!(
                 batch_size = inputs.len(),
@@ -1398,7 +1401,9 @@ mod tests {
             Some(2)
         );
         assert_eq!(
-            TensorRtBackend::infer_scale_from_model_path(Path::new("weights/RealESRGAN_x4plus.onnx")),
+            TensorRtBackend::infer_scale_from_model_path(Path::new(
+                "weights/RealESRGAN_x4plus.onnx"
+            )),
             Some(4)
         );
     }
@@ -1422,23 +1427,26 @@ mod tests {
         assert!(TensorRtBackend::supports_runtime_batching(None, None));
         assert!(!TensorRtBackend::supports_runtime_batching(Some(1), None));
         assert!(!TensorRtBackend::supports_runtime_batching(None, Some(1)));
-        assert!(!TensorRtBackend::supports_runtime_batching(Some(1), Some(1)));
+        assert!(!TensorRtBackend::supports_runtime_batching(
+            Some(1),
+            Some(1)
+        ));
     }
 
     #[test]
     fn validated_runtime_batching_allowlist_matches_current_models() {
-        assert!(TensorRtBackend::validated_runtime_batching_model(Path::new(
-            "weights/2x_SPAN_soft.onnx"
-        )));
-        assert!(TensorRtBackend::validated_runtime_batching_model(Path::new(
-            "weights/4xNomos2_hq_dat2_fp32.onnx"
-        )));
-        assert!(!TensorRtBackend::validated_runtime_batching_model(Path::new(
-            "weights/4x_APISR_GRL_GAN_generator_fp16.fp16.onnx"
-        )));
-        assert!(!TensorRtBackend::validated_runtime_batching_model(Path::new(
-            "weights/4xRealWebPhoto_v4_dat2_fp32_opset17.onnx"
-        )));
+        assert!(TensorRtBackend::validated_runtime_batching_model(
+            Path::new("weights/2x_SPAN_soft.onnx")
+        ));
+        assert!(TensorRtBackend::validated_runtime_batching_model(
+            Path::new("weights/4xNomos2_hq_dat2_fp32.onnx")
+        ));
+        assert!(!TensorRtBackend::validated_runtime_batching_model(
+            Path::new("weights/4x_APISR_GRL_GAN_generator_fp16.fp16.onnx")
+        ));
+        assert!(!TensorRtBackend::validated_runtime_batching_model(
+            Path::new("weights/4xRealWebPhoto_v4_dat2_fp32_opset17.onnx")
+        ));
     }
 
     #[test]

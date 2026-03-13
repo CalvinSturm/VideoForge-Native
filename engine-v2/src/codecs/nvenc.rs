@@ -35,7 +35,10 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::fs;
+use std::path::PathBuf;
 use std::ptr;
+use std::sync::OnceLock;
 
 use tracing::{debug, info, warn};
 
@@ -44,13 +47,151 @@ use crate::core::types::{FrameEnvelope, PixelFormat};
 use crate::engine::pipeline::FrameEncoder;
 use crate::error::{EngineError, Result};
 
+static NVENC_DEBUG_DUMP_LIMIT: OnceLock<u32> = OnceLock::new();
+
+fn nvenc_debug_dump_enabled() -> bool {
+    std::env::var_os("VIDEOFORGE_NVENC_DEBUG_DUMP_FRAMES").is_some()
+}
+
+fn parse_nvenc_debug_dump_limit(raw: &str) -> Option<u32> {
+    raw.trim().parse::<u32>().ok()
+}
+
+fn nvenc_debug_dump_limit() -> u32 {
+    *NVENC_DEBUG_DUMP_LIMIT.get_or_init(|| {
+        if !nvenc_debug_dump_enabled() {
+            return 0;
+        }
+
+        match std::env::var("VIDEOFORGE_NVENC_DEBUG_DUMP_FRAMES") {
+            Ok(raw) => match parse_nvenc_debug_dump_limit(&raw) {
+                Some(limit) => limit,
+                None => {
+                    warn!(
+                        raw_value = %raw,
+                        "Invalid VIDEOFORGE_NVENC_DEBUG_DUMP_FRAMES; defaulting to 1"
+                    );
+                    1
+                }
+            },
+            Err(_) => 0,
+        }
+    })
+}
+
+fn should_dump_nvenc_handoff(frame_index: u32) -> bool {
+    let limit = nvenc_debug_dump_limit();
+    limit > 0 && frame_index < limit
+}
+
+fn should_dump_nvenc_packet(packet_index: u32) -> bool {
+    let limit = nvenc_debug_dump_limit();
+    limit > 0 && packet_index < limit
+}
+
+fn nvenc_all_intra_debug_enabled() -> bool {
+    std::env::var_os("VIDEOFORGE_NVENC_ALL_INTRA").as_deref() == Some("1".as_ref())
+}
+
+fn debug_dump_dir() -> PathBuf {
+    if let Some(override_dir) = std::env::var_os("VIDEOFORGE_NVDEC_DEBUG_DUMP_DIR") {
+        return PathBuf::from(override_dir);
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let base = if cwd.file_name().and_then(|name| name.to_str()) == Some("src-tauri") {
+        cwd.parent().map(PathBuf::from).unwrap_or(cwd)
+    } else {
+        cwd
+    };
+
+    base.join("artifacts").join("nvdec_debug")
+}
+
+fn write_nv12_luma_preview(
+    width: u32,
+    height: u32,
+    pitch: usize,
+    host: &[u8],
+    path: &PathBuf,
+) -> Result<()> {
+    let w = width as usize;
+    let h = height as usize;
+    let expected = pitch * h;
+    if host.len() < expected {
+        return Err(EngineError::Encode(format!(
+            "NVENC luma preview host buffer too small: have {} need at least {}",
+            host.len(),
+            expected
+        )));
+    }
+
+    let mut pgm = Vec::with_capacity(32 + w * h);
+    pgm.extend_from_slice(format!("P5\n{} {}\n255\n", w, h).as_bytes());
+    for y in 0..h {
+        let row_start = y * pitch;
+        pgm.extend_from_slice(&host[row_start..row_start + w]);
+    }
+
+    fs::write(path, pgm).map_err(|e| {
+        EngineError::Encode(format!(
+            "Failed to write NVENC luma preview '{}': {e}",
+            path.display()
+        ))
+    })
+}
+
+fn write_nv12_uv_preview(
+    width: u32,
+    height: u32,
+    pitch: usize,
+    host: &[u8],
+    path: &PathBuf,
+) -> Result<()> {
+    let w = width as usize;
+    let h = height as usize;
+    let uv_rows = h / 2;
+    let uv_base = pitch * h;
+    let expected = uv_base + pitch * uv_rows;
+    if host.len() < expected {
+        return Err(EngineError::Encode(format!(
+            "NVENC UV preview host buffer too small: have {} need at least {}",
+            host.len(),
+            expected
+        )));
+    }
+
+    let mut ppm = Vec::with_capacity(32 + w * uv_rows * 3);
+    ppm.extend_from_slice(format!("P6\n{} {}\n255\n", w, uv_rows).as_bytes());
+    for y in 0..uv_rows {
+        let row_start = uv_base + y * pitch;
+        for x in 0..(w / 2) {
+            let u = host[row_start + x * 2];
+            let v = host[row_start + x * 2 + 1];
+            ppm.push(u);
+            ppm.push(128);
+            ppm.push(v);
+            ppm.push(u);
+            ppm.push(128);
+            ppm.push(v);
+        }
+    }
+
+    fs::write(path, ppm).map_err(|e| {
+        EngineError::Encode(format!(
+            "Failed to write NVENC UV preview '{}': {e}",
+            path.display()
+        ))
+    })
+}
+
 // ─── Bitstream sink trait ────────────────────────────────────────────────
 
 /// Receives encoded bitstream output.
 ///
 /// Implementations: file writer, muxer, network sender, etc.
 pub trait BitstreamSink: Send + 'static {
-    fn write_packet(&mut self, data: &[u8], pts: i64, is_keyframe: bool) -> Result<()>;
+    fn write_packet(&mut self, data: &[u8], pts: i64, dts: i64, is_keyframe: bool) -> Result<()>;
     fn flush(&mut self) -> Result<()>;
 }
 
@@ -177,6 +318,10 @@ pub struct NvEncoder {
     frame_idx: u32,
     /// Number of bitstream packets successfully written to the sink.
     packets_written: u32,
+    /// Monotonic DTS counter used for mux integration.
+    dts_counter: i64,
+    /// Frame duration in microseconds derived from encoder FPS.
+    frame_duration_us: i64,
     /// Selected output codec label for mux/container integration.
     codec_label: &'static str,
 }
@@ -287,6 +432,7 @@ impl NvEncoder {
         sink: Box<dyn BitstreamSink>,
         config: NvEncConfig,
     ) -> Result<Self> {
+        let force_all_intra = nvenc_all_intra_debug_enabled();
         let target_cuda_ctx = cuda_context as CUcontext;
         let mut api_version = NVENCAPI_VERSION;
         let mut max_supported_version = 0u32;
@@ -299,8 +445,7 @@ impl NvEncoder {
         if api_version > max_supported_version {
             info!(
                 requested_api_version = api_version,
-                max_supported_version,
-                "NVENC API version exceeds driver support; downgrading"
+                max_supported_version, "NVENC API version exceeds driver support; downgrading"
             );
             api_version = max_supported_version;
         }
@@ -347,9 +492,7 @@ impl NvEncoder {
             "NVENC open-session diagnostics"
         );
         if current_ctx_ptr.is_null() {
-            warn!(
-                "No current CUDA context bound on this thread before nvEncOpenEncodeSessionEx"
-            );
+            warn!("No current CUDA context bound on this thread before nvEncOpenEncodeSessionEx");
         }
         let _ctx_guard = CudaContextGuard::make_current(target_cuda_ctx)?;
 
@@ -460,7 +603,10 @@ impl NvEncoder {
                 .copied()
                 .any(|fmt| fmt == NV_ENC_BUFFER_FORMAT_NV12)
             {
-                info!(codec = codec.label, "Skipping codec without NV12 input format support");
+                info!(
+                    codec = codec.label,
+                    "Skipping codec without NV12 input format support"
+                );
                 continue;
             }
 
@@ -496,11 +642,19 @@ impl NvEncoder {
             preset_guids.truncate(returned_preset_guid_count as usize);
             let runtime_preset_attempts: Vec<PresetAttempt> = preset_attempts()
                 .into_iter()
-                .filter(|attempt| preset_guids.iter().copied().any(|g| guid_eq(g, attempt.preset)))
+                .filter(|attempt| {
+                    preset_guids
+                        .iter()
+                        .copied()
+                        .any(|g| guid_eq(g, attempt.preset))
+                })
                 .collect();
 
             if runtime_preset_attempts.is_empty() {
-                info!(codec = codec.label, "Skipping codec with no supported P7/P4 presets");
+                info!(
+                    codec = codec.label,
+                    "Skipping codec with no supported P7/P4 presets"
+                );
                 continue;
             }
 
@@ -614,6 +768,11 @@ impl NvEncoder {
             enc_config.frameIntervalP = (config.b_frames + 1) as i32;
             enc_config.rcParams.set_enableLookahead(0);
             enc_config.rcParams.set_zeroReorderDelay(1);
+            if force_all_intra {
+                enc_config.gopLength = 1;
+                enc_config.frameIntervalP = 1;
+                info!("NVENC all-intra debug mode enabled");
+            }
 
             if config.bitrate > 0 {
                 // VBR mode.
@@ -732,6 +891,11 @@ impl NvEncoder {
         let bitstream_buf = bs_params.bitstreamBuffer;
         debug!("NVENC bitstream buffer created");
 
+        let fps_num = config.fps_num.max(1) as i64;
+        let fps_den = config.fps_den.max(1) as i64;
+        let frame_duration_us = 1_000_000 * fps_den / fps_num;
+        let dts_counter = -(config.b_frames as i64);
+
         Ok(Self {
             encoder,
             fns,
@@ -746,6 +910,8 @@ impl NvEncoder {
             use_legacy_staging: false,
             frame_idx: 0,
             packets_written: 0,
+            dts_counter,
+            frame_duration_us,
             codec_label: selected_codec_name,
         })
     }
@@ -846,8 +1012,14 @@ impl NvEncoder {
         };
 
         unsafe {
-            check_cu_encode(cuMemcpy2D_v2(&y_copy as *const _), "cuMemcpy2D_v2 Y (nvenc)")?;
-            if let Err(err) = check_cu_encode(cuMemcpy2D_v2(&uv_copy as *const _), "cuMemcpy2D_v2 UV (nvenc)") {
+            check_cu_encode(
+                cuMemcpy2D_v2(&y_copy as *const _),
+                "cuMemcpy2D_v2 Y (nvenc)",
+            )?;
+            if let Err(err) = check_cu_encode(
+                cuMemcpy2D_v2(&uv_copy as *const _),
+                "cuMemcpy2D_v2 UV (nvenc)",
+            ) {
                 return Err(EngineError::Encode(format!(
                     "cuMemcpy2D_v2 UV (nvenc) failed: {err} [src_pitch={}, dst_pitch={}, width={}, uv_row_bytes={}, height={}, uv_height={}]",
                     src_pitch, dst_pitch, width, uv_row_bytes, height, uv_height
@@ -855,6 +1027,198 @@ impl NvEncoder {
             }
         }
         Ok(dst_dev_ptr)
+    }
+
+    fn write_handoff_debug_dump(
+        &self,
+        dev_ptr: u64,
+        pitch: u32,
+        width: u32,
+        height: u32,
+        frame_index: u32,
+        source_label: &str,
+    ) -> Result<()> {
+        let dump_dir = debug_dump_dir();
+        fs::create_dir_all(&dump_dir).map_err(|e| {
+            EngineError::Encode(format!(
+                "Failed to create NVENC debug dump dir '{}': {e}",
+                dump_dir.display()
+            ))
+        })?;
+
+        let pitch_usize = pitch as usize;
+        let byte_len = PixelFormat::Nv12.byte_size(width, height, pitch_usize);
+        let mut host = vec![0u8; byte_len];
+        unsafe {
+            check_cu_encode(
+                cuMemcpyDtoH_v2(
+                    host.as_mut_ptr() as *mut c_void,
+                    dev_ptr as CUdeviceptr,
+                    byte_len,
+                ),
+                "cuMemcpyDtoH_v2 (nvenc handoff dump)",
+            )?;
+        }
+
+        let base = format!(
+            "nvenc_handoff_{frame_index:05}_{}x{}_pitch{}_{}",
+            width, height, pitch, source_label
+        );
+        let raw_path = dump_dir.join(format!("{base}.nv12"));
+        let meta_path = dump_dir.join(format!("{base}.txt"));
+        let luma_path = dump_dir.join(format!("{base}_luma.pgm"));
+        let uv_path = dump_dir.join(format!("{base}_uv.ppm"));
+
+        fs::write(&raw_path, &host).map_err(|e| {
+            EngineError::Encode(format!(
+                "Failed to write NVENC handoff dump '{}': {e}",
+                raw_path.display()
+            ))
+        })?;
+        write_nv12_luma_preview(width, height, pitch_usize, &host, &luma_path)?;
+        write_nv12_uv_preview(width, height, pitch_usize, &host, &uv_path)?;
+
+        let metadata = format!(
+            concat!(
+                "frame_index={frame_index}\n",
+                "source_label={source_label}\n",
+                "width={width}\n",
+                "height={height}\n",
+                "pitch={pitch}\n",
+                "dev_ptr={dev_ptr:#x}\n",
+                "raw_path={raw_path}\n",
+                "luma_preview_path={luma_path}\n",
+                "uv_preview_path={uv_path}\n",
+                "note=raw NV12 surface submitted to NVENC before nvEncEncodePicture\n"
+            ),
+            frame_index = frame_index,
+            source_label = source_label,
+            width = width,
+            height = height,
+            pitch = pitch,
+            dev_ptr = dev_ptr,
+            raw_path = raw_path.display(),
+            luma_path = luma_path.display(),
+            uv_path = uv_path.display(),
+        );
+        fs::write(&meta_path, metadata).map_err(|e| {
+            EngineError::Encode(format!(
+                "Failed to write NVENC handoff metadata '{}': {e}",
+                meta_path.display()
+            ))
+        })?;
+
+        info!(
+            frame_index,
+            source_label,
+            width,
+            height,
+            pitch,
+            dev_ptr = format_args!("{:#x}", dev_ptr),
+            raw_path = %raw_path.display(),
+            meta_path = %meta_path.display(),
+            "NVENC handoff debug dump written"
+        );
+        Ok(())
+    }
+
+    fn write_bitstream_debug_dump(
+        &self,
+        packet_index: u32,
+        submitted_frame_index: u32,
+        encoded_frame_index: u32,
+        picture_type: NV_ENC_PIC_TYPE,
+        output_pts: i64,
+        dts: i64,
+        bitstream_size: usize,
+        data: &[u8],
+        input_width: u32,
+        input_height: u32,
+        input_pitch: u32,
+        buffer_fmt: NV_ENC_BUFFER_FORMAT,
+        input_time_stamp: u64,
+    ) -> Result<()> {
+        let dump_dir = debug_dump_dir();
+        fs::create_dir_all(&dump_dir).map_err(|e| {
+            EngineError::Encode(format!(
+                "Failed to create NVENC bitstream debug dump dir '{}': {e}",
+                dump_dir.display()
+            ))
+        })?;
+
+        let ext = match self.codec_label {
+            "hevc" => "h265",
+            "h264" => "h264",
+            other => other,
+        };
+        let base = format!(
+            "nvenc_bitstream_packet_{packet_index:05}_frame_{encoded_frame_index:05}_{}",
+            self.codec_label
+        );
+        let raw_path = dump_dir.join(format!("{base}.{ext}"));
+        let meta_path = dump_dir.join(format!("{base}.txt"));
+
+        fs::write(&raw_path, data).map_err(|e| {
+            EngineError::Encode(format!(
+                "Failed to write NVENC bitstream debug dump '{}': {e}",
+                raw_path.display()
+            ))
+        })?;
+
+        let metadata = format!(
+            concat!(
+                "packet_index={packet_index}\n",
+                "submitted_frame_index={submitted_frame_index}\n",
+                "encoded_frame_index={encoded_frame_index}\n",
+                "codec_label={codec_label}\n",
+                "picture_type={picture_type}\n",
+                "output_pts={output_pts}\n",
+                "dts={dts}\n",
+                "bitstream_size={bitstream_size}\n",
+                "input_width={input_width}\n",
+                "input_height={input_height}\n",
+                "input_pitch={input_pitch}\n",
+                "buffer_fmt={buffer_fmt}\n",
+                "input_time_stamp={input_time_stamp}\n",
+                "bitstream_path={bitstream_path}\n",
+                "note=elementary-stream packet produced by nvEncLockBitstream for early direct-path diagnosis\n"
+            ),
+            packet_index = packet_index,
+            submitted_frame_index = submitted_frame_index,
+            encoded_frame_index = encoded_frame_index,
+            codec_label = self.codec_label,
+            picture_type = picture_type as i32,
+            output_pts = output_pts,
+            dts = dts,
+            bitstream_size = bitstream_size,
+            input_width = input_width,
+            input_height = input_height,
+            input_pitch = input_pitch,
+            buffer_fmt = buffer_fmt as i32,
+            input_time_stamp = input_time_stamp,
+            bitstream_path = raw_path.display(),
+        );
+        fs::write(&meta_path, metadata).map_err(|e| {
+            EngineError::Encode(format!(
+                "Failed to write NVENC bitstream metadata '{}': {e}",
+                meta_path.display()
+            ))
+        })?;
+
+        info!(
+            packet_index,
+            submitted_frame_index,
+            encoded_frame_index,
+            codec = self.codec_label,
+            picture_type = picture_type as i32,
+            output_pts,
+            dts,
+            bitstream_size,
+            raw_path = %raw_path.display(),
+            meta_path = %meta_path.display(),
+            "NVENC bitstream debug dump written"
+        );
+        Ok(())
     }
 
     /// Register a CUDA device pointer as an NVENC input resource.
@@ -988,7 +1352,8 @@ impl NvEncoder {
                             "NVENC direct resource registration rejected; enabling legacy-staging fallback"
                         );
                         self.use_legacy_staging = true;
-                        dev_ptr = self.copy_to_legacy_staging(input_dev_ptr, input_pitch, width, height)?;
+                        dev_ptr =
+                            self.copy_to_legacy_staging(input_dev_ptr, input_pitch, width, height)?;
                         pitch = self.config.nv12_pitch;
                         match self.reg_cache.get(dev_ptr) {
                             Some(h) => h,
@@ -999,6 +1364,33 @@ impl NvEncoder {
                 },
             }
         };
+
+        if should_dump_nvenc_handoff(self.frame_idx) {
+            let source_label = if self.use_legacy_staging {
+                "legacy_staging"
+            } else {
+                "direct_resource"
+            };
+            info!(
+                frame_idx = self.frame_idx,
+                input_dev_ptr = format_args!("{:#x}", input_dev_ptr),
+                submitted_dev_ptr = format_args!("{:#x}", dev_ptr),
+                input_pitch,
+                submitted_pitch = pitch,
+                width,
+                height,
+                source_label,
+                "NVENC handoff snapshot"
+            );
+            self.write_handoff_debug_dump(
+                dev_ptr,
+                pitch,
+                width,
+                height,
+                self.frame_idx,
+                source_label,
+            )?;
+        }
 
         let map_fn = self
             .fns
@@ -1038,7 +1430,7 @@ impl NvEncoder {
         pic_params.inputTimeStamp = frame.pts as u64;
 
         // Force IDR on keyframes from the pipeline.
-        if frame.is_keyframe {
+        if frame.is_keyframe || nvenc_all_intra_debug_enabled() {
             pic_params.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
         }
 
@@ -1068,7 +1460,14 @@ impl NvEncoder {
             return Ok(());
         }
 
-        self.lock_and_write_packet()?;
+        self.lock_and_write_packet(
+            self.frame_idx - 1,
+            pic_params.inputWidth,
+            pic_params.inputHeight,
+            pic_params.inputPitch,
+            pic_params.bufferFmt,
+            pic_params.inputTimeStamp,
+        )?;
 
         // Unmap input resource.
         let unmap_fn = self
@@ -1087,7 +1486,15 @@ impl NvEncoder {
         Ok(())
     }
 
-    fn lock_and_write_packet(&mut self) -> Result<()> {
+    fn lock_and_write_packet(
+        &mut self,
+        submitted_frame_index: u32,
+        input_width: u32,
+        input_height: u32,
+        input_pitch: u32,
+        buffer_fmt: NV_ENC_BUFFER_FORMAT,
+        input_time_stamp: u64,
+    ) -> Result<()> {
         let lock_fn = self
             .fns
             .nvEncLockBitstream
@@ -1113,6 +1520,10 @@ impl NvEncoder {
         // Copy encoded data to sink.
         let is_idr = lock_params.pictureType == NV_ENC_PIC_TYPE_IDR;
         let output_pts = lock_params.outputTimeStamp as i64;
+        let dts = self.dts_counter * self.frame_duration_us;
+        self.dts_counter += 1;
+        let encoded_frame_index = lock_params.frameIdx;
+        let packet_index = self.packets_written;
         let data = unsafe {
             // SAFETY: bitstreamBufferPtr is valid for bitstreamSizeInBytes.
             std::slice::from_raw_parts(
@@ -1121,7 +1532,49 @@ impl NvEncoder {
             )
         };
 
-        self.sink.write_packet(data, output_pts, is_idr)?;
+        if encoded_frame_index != submitted_frame_index {
+            warn!(
+                submitted_frame_index,
+                encoded_frame_index,
+                packet_index,
+                "NVENC lock returned a different frame index than the submitted picture params"
+            );
+        }
+
+        if should_dump_nvenc_packet(packet_index) {
+            info!(
+                packet_index,
+                submitted_frame_index,
+                encoded_frame_index,
+                picture_type = lock_params.pictureType as i32,
+                output_pts,
+                dts,
+                bitstream_size = lock_params.bitstreamSizeInBytes,
+                input_width,
+                input_height,
+                input_pitch,
+                buffer_fmt = buffer_fmt as i32,
+                input_time_stamp,
+                "NVENC bitstream snapshot"
+            );
+            self.write_bitstream_debug_dump(
+                packet_index,
+                submitted_frame_index,
+                encoded_frame_index,
+                lock_params.pictureType,
+                output_pts,
+                dts,
+                lock_params.bitstreamSizeInBytes as usize,
+                data,
+                input_width,
+                input_height,
+                input_pitch,
+                buffer_fmt,
+                input_time_stamp,
+            )?;
+        }
+
+        self.sink.write_packet(data, output_pts, dts, is_idr)?;
 
         // Unlock regardless of sink result.
         // SAFETY: bitstream_buf was locked above.
@@ -1222,5 +1675,19 @@ impl Drop for NvEncoder {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_nvenc_debug_dump_limit;
+
+    #[test]
+    fn parses_nvenc_debug_dump_limit_values() {
+        assert_eq!(parse_nvenc_debug_dump_limit("8"), Some(8));
+        assert_eq!(parse_nvenc_debug_dump_limit(" 12 "), Some(12));
+        assert_eq!(parse_nvenc_debug_dump_limit("0"), Some(0));
+        assert_eq!(parse_nvenc_debug_dump_limit("abc"), None);
+        assert_eq!(parse_nvenc_debug_dump_limit("-1"), None);
     }
 }

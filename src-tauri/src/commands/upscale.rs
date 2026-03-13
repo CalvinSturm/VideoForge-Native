@@ -20,13 +20,13 @@ use crate::python_env::{
     build_worker_argv, get_free_port, resolve_python_environment, BaseWorkerArgs, ProcessGuard,
     WorkerCaps, PYTHON_PIDS,
 };
+use crate::run_manifest::{
+    maybe_write_run_manifest, run_artifacts_enabled_from_env, RunManifestInputs, WorkerCapsSnapshot,
+};
 use crate::runtime_truth::{
     log_run_observed_metrics, log_runtime_config_snapshot, PythonRuntimeConfigExtension,
     PythonRuntimeMetricsExtension, RunObservedMetrics, RunStatus, RuntimeConfigExtensions,
     RuntimeConfigSnapshot, RuntimeEngineFamily, RuntimeMediaKind, RuntimeMetricsExtensions,
-};
-use crate::run_manifest::{
-    maybe_write_run_manifest, run_artifacts_enabled_from_env, RunManifestInputs, WorkerCapsSnapshot,
 };
 use crate::tauri_contracts::{UpscaleProgressEventPayload, UpscaleRequest};
 use crate::video_pipeline;
@@ -1120,12 +1120,12 @@ mod tests {
         build_create_shm_payload, build_python_observed_metrics, resolve_shm_ring_override,
         validate_worker_protocol_version, CreateShmRequest, JobProgress, StageTimingsMs,
     };
-    use crate::runtime_truth::{
-        PythonRuntimeConfigExtension, RunStatus, RuntimeConfigExtensions,
-        RuntimeConfigSnapshot, RuntimeEngineFamily, RuntimeMediaKind,
-        RUNTIME_CONFIG_SNAPSHOT_SCHEMA_V1, RUN_OBSERVED_METRICS_SCHEMA_V1,
-    };
     use crate::run_manifest::WorkerCapsSnapshot;
+    use crate::runtime_truth::{
+        PythonRuntimeConfigExtension, RunStatus, RuntimeConfigExtensions, RuntimeConfigSnapshot,
+        RuntimeEngineFamily, RuntimeMediaKind, RUNTIME_CONFIG_SNAPSHOT_SCHEMA_V1,
+        RUN_OBSERVED_METRICS_SCHEMA_V1,
+    };
 
     #[test]
     fn test_handshake_version_match_ok() {

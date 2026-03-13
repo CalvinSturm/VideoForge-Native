@@ -118,7 +118,11 @@ mod runtime_path_tests {
     #[test]
     fn runtime_path_resolver_keeps_cli_bin_dir() {
         let root = workspace_root().expect("workspace root");
-        let fake_bin = root.join("third_party").join("rave").join("target").join("release");
+        let fake_bin = root
+            .join("third_party")
+            .join("rave")
+            .join("target")
+            .join("release");
         let runtime = resolve_native_runtime_paths(Some(&root), Some(&fake_bin));
         assert!(runtime.path_additions.iter().any(|p| p == &fake_bin));
     }
@@ -349,7 +353,9 @@ fn assert_required_contract_fields(command: &str, json: &Value) -> Result<(), Ra
 
 #[cfg(test)]
 mod tests {
-    use super::{assert_required_contract_fields, parse_json_stdout_contract, parse_progress_summary};
+    use super::{
+        assert_required_contract_fields, parse_json_stdout_contract, parse_progress_summary,
+    };
 
     #[test]
     fn parse_accepts_single_json_object() {

@@ -37,8 +37,8 @@
 use std::process::{self, Stdio};
 use std::time::Duration;
 
-use app_lib::ipc::{self, protocol::RequestEnvelope};
 use app_lib::commands::native_runtime::configure_repo_tool_runtime_path;
+use app_lib::ipc::{self, protocol::RequestEnvelope};
 use app_lib::python_env::{get_free_port, resolve_python_environment, ProcessGuard, PYTHON_PIDS};
 use serde_json::json;
 use tokio::time::timeout;
@@ -810,9 +810,7 @@ async fn check_e2e_python(
 // ─── Native Engine E2E ────────────────────────────────────────────────────────
 
 #[cfg(feature = "native_engine")]
-async fn check_e2e_native(
-    mode: &NativeE2eMode,
-) -> bool {
+async fn check_e2e_native(mode: &NativeE2eMode) -> bool {
     use app_lib::commands::native_engine::{
         native_smoke_success_lines, native_tool_run_banner, run_native_tool_request,
         NativeToolRunRequest,
@@ -872,7 +870,10 @@ async fn check_e2e_native(
     check(
         "Native pipeline completed",
         true,
-        summary_lines.first().map(String::as_str).unwrap_or("native result"),
+        summary_lines
+            .first()
+            .map(String::as_str)
+            .unwrap_or("native result"),
     );
     for line in summary_lines.iter().skip(1) {
         println!("  → {line}");
@@ -1151,26 +1152,18 @@ async fn main() {
             if let Some(shm_mode) = &args.python.shm_roundtrip {
                 println!();
                 println!("── SHM Roundtrip ─────────────────────────────────────────────");
-                let ok = check_shm_roundtrip(
-                    &python_bin,
-                    &script_path,
-                    shm_mode,
-                    &args.python.shared,
-                )
-                .await;
+                let ok =
+                    check_shm_roundtrip(&python_bin, &script_path, shm_mode, &args.python.shared)
+                        .await;
                 all_passed &= ok;
             }
 
             if let Some(python_e2e) = &args.python.e2e {
                 println!();
                 println!("── Python E2E (FFmpeg path) ──────────────────────────────────");
-                let ok = check_e2e_python(
-                    &python_bin,
-                    &script_path,
-                    python_e2e,
-                    &args.python.shared,
-                )
-                .await;
+                let ok =
+                    check_e2e_python(&python_bin, &script_path, python_e2e, &args.python.shared)
+                        .await;
                 all_passed &= ok;
             }
         }
@@ -1235,11 +1228,8 @@ mod tests {
             "in.mp4",
             "out.mp4",
         );
-        let metrics = RunObservedMetrics::new(
-            "run-smoke-1",
-            "python_sidecar",
-            RunStatus::Succeeded,
-        );
+        let metrics =
+            RunObservedMetrics::new("run-smoke-1", "python_sidecar", RunStatus::Succeeded);
 
         let lines = runtime_truth_lines(&snapshot, Some(&metrics));
 

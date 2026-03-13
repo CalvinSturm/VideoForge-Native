@@ -40,8 +40,11 @@
 
 use std::collections::VecDeque;
 use std::ffi::{c_int, c_short, c_uint, c_ulong, c_ulonglong, c_void};
+use std::fs;
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cudarc::driver::DevicePtr;
 
@@ -52,6 +55,8 @@ use crate::core::context::GpuContext;
 use crate::core::types::{FrameEnvelope, GpuBuffer, GpuTexture, PixelFormat};
 use crate::engine::pipeline::{DecodedFrameEnvelope, FrameDecoder, StreamReadyEvent};
 use crate::error::{EngineError, Result};
+
+static NVDEC_DEBUG_DUMP_WRITTEN: AtomicBool = AtomicBool::new(false);
 
 // ─── Bitstream source trait ──────────────────────────────────────────────
 
@@ -124,6 +129,132 @@ pub struct NvDecoder {
 }
 
 impl NvDecoder {
+    fn debug_dump_enabled() -> bool {
+        std::env::var_os("VIDEOFORGE_NVDEC_DEBUG_DUMP").as_deref() == Some("1".as_ref())
+    }
+
+    fn claim_debug_dump_slot() -> bool {
+        Self::debug_dump_enabled()
+            && NVDEC_DEBUG_DUMP_WRITTEN
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    fn debug_dump_dir() -> PathBuf {
+        if let Some(override_dir) = std::env::var_os("VIDEOFORGE_NVDEC_DEBUG_DUMP_DIR") {
+            return PathBuf::from(override_dir);
+        }
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let base = if cwd.file_name().and_then(|name| name.to_str()) == Some("src-tauri") {
+            cwd.parent().map(PathBuf::from).unwrap_or(cwd)
+        } else {
+            cwd
+        };
+
+        base.join("artifacts").join("nvdec_debug")
+    }
+
+    fn write_debug_dump(
+        &self,
+        texture: &GpuTexture,
+        frame_index: u64,
+        coded_width: usize,
+        coded_height: usize,
+        visible_width: usize,
+        visible_height: usize,
+        display_left: i32,
+        display_top: i32,
+        display_right: i32,
+        display_bottom: i32,
+    ) -> Result<()> {
+        let dump_dir = Self::debug_dump_dir();
+        fs::create_dir_all(&dump_dir).map_err(|e| {
+            EngineError::Decode(format!(
+                "Failed to create NVDEC debug dump dir '{}': {e}",
+                dump_dir.display()
+            ))
+        })?;
+
+        let base = format!(
+            "frame_{frame_index:05}_{}x{}_pitch{}",
+            texture.width, texture.height, texture.pitch
+        );
+        let nv12_path = dump_dir.join(format!("{base}.nv12"));
+        let meta_path = dump_dir.join(format!("{base}.txt"));
+
+        let host = texture.data.copy_to_host_sync(&self.ctx)?;
+        fs::write(&nv12_path, &host).map_err(|e| {
+            EngineError::Decode(format!(
+                "Failed to write NVDEC debug NV12 dump '{}': {e}",
+                nv12_path.display()
+            ))
+        })?;
+
+        let metadata = format!(
+            concat!(
+                "frame_index={frame_index}\n",
+                "coded_width={coded_width}\n",
+                "coded_height={coded_height}\n",
+                "visible_width={visible_width}\n",
+                "visible_height={visible_height}\n",
+                "display_left={display_left}\n",
+                "display_top={display_top}\n",
+                "display_right={display_right}\n",
+                "display_bottom={display_bottom}\n",
+                "texture_width={texture_width}\n",
+                "texture_height={texture_height}\n",
+                "texture_pitch={texture_pitch}\n",
+                "texture_format=NV12\n",
+                "note=raw NV12 dump from direct NVDEC-owned copy path\n"
+            ),
+            frame_index = frame_index,
+            coded_width = coded_width,
+            coded_height = coded_height,
+            visible_width = visible_width,
+            visible_height = visible_height,
+            display_left = display_left,
+            display_top = display_top,
+            display_right = display_right,
+            display_bottom = display_bottom,
+            texture_width = texture.width,
+            texture_height = texture.height,
+            texture_pitch = texture.pitch,
+        );
+        fs::write(&meta_path, metadata).map_err(|e| {
+            EngineError::Decode(format!(
+                "Failed to write NVDEC debug metadata '{}': {e}",
+                meta_path.display()
+            ))
+        })?;
+
+        info!(
+            frame_index,
+            nv12_path = %nv12_path.display(),
+            meta_path = %meta_path.display(),
+            "NVDEC debug dump written"
+        );
+        Ok(())
+    }
+
+    fn visible_width(format: &CUVIDEOFORMAT) -> usize {
+        let width = (format.display_area.right - format.display_area.left).max(0) as usize;
+        if width == 0 {
+            format.coded_width as usize
+        } else {
+            width.min(format.coded_width as usize)
+        }
+    }
+
+    fn visible_height(format: &CUVIDEOFORMAT) -> usize {
+        let height = (format.display_area.bottom - format.display_area.top).max(0) as usize;
+        if height == 0 {
+            format.coded_height as usize
+        } else {
+            height.min(format.coded_height as usize)
+        }
+    }
+
     fn async_copy_enabled() -> bool {
         std::env::var_os("VIDEOFORGE_NVDEC_ASYNC_COPY").as_deref() == Some("1".as_ref())
     }
@@ -324,8 +455,12 @@ impl NvDecoder {
             .as_ref()
             .ok_or_else(|| EngineError::Decode("No format received".into()))?;
 
-        let width = format.coded_width;
-        let height = format.coded_height;
+        let visible_width = Self::visible_width(format);
+        let visible_height = Self::visible_height(format);
+        let coded_width = format.coded_width as usize;
+        let coded_height = format.coded_height as usize;
+        let width = visible_width as u32;
+        let height = visible_height as u32;
 
         // Map the decoded surface to a device pointer.
         let mut src_ptr: CUdeviceptr = 0;
@@ -370,6 +505,31 @@ impl NvDecoder {
         );
 
         let src_pitch_usize = src_pitch as usize;
+        let should_dump = Self::claim_debug_dump_slot();
+
+        if should_dump {
+            info!(
+                coded_width,
+                coded_height,
+                visible_width,
+                visible_height,
+                display_left = format.display_area.left,
+                display_top = format.display_area.top,
+                display_right = format.display_area.right,
+                display_bottom = format.display_area.bottom,
+                src_pitch = src_pitch_usize,
+                y_src_x = 0usize,
+                y_src_y = 0usize,
+                y_width_bytes = width as usize,
+                y_height = height as usize,
+                uv_src_x = 0usize,
+                uv_src_y = 0usize,
+                uv_base_offset = src_pitch_usize * height as usize,
+                uv_width_bytes = width as usize,
+                uv_height = (height / 2) as usize,
+                "NVDEC debug geometry snapshot"
+            );
+        }
 
         // Allocate our destination buffer with the same pitch for NV12.
         // NV12 total: pitch * height * 3 / 2
@@ -378,8 +538,7 @@ impl NvDecoder {
         let dst_ptr = *dst_buf.device_ptr() as CUdeviceptr;
         info!(
             dst_ptr = format_args!("0x{:x}", dst_ptr),
-            dst_size,
-            "NVDEC map_and_copy allocated destination buffer"
+            dst_size, "NVDEC map_and_copy allocated destination buffer"
         );
 
         // ── D2D copy: Y plane ──
@@ -403,6 +562,9 @@ impl NvDecoder {
         };
 
         // ── D2D copy: UV plane ──
+        // The mapped NVDEC surface already reflects the decoder's configured
+        // visible display region, so the UV plane begins immediately after the
+        // visible Y plane, not after the coded frame height.
         let uv_src_offset = src_ptr + (src_pitch_usize * height as usize) as CUdeviceptr;
         let uv_dst_offset = dst_ptr + (src_pitch_usize * height as usize) as CUdeviceptr;
 
@@ -449,14 +611,8 @@ impl NvDecoder {
             decode_ready
         } else {
             unsafe {
-                check_cu(
-                    cuMemcpy2D_v2(&y_copy),
-                    "cuMemcpy2D_v2 (Y plane)",
-                )?;
-                check_cu(
-                    cuMemcpy2D_v2(&uv_copy),
-                    "cuMemcpy2D_v2 (UV plane)",
-                )?;
+                check_cu(cuMemcpy2D_v2(&y_copy), "cuMemcpy2D_v2 (Y plane)")?;
+                check_cu(cuMemcpy2D_v2(&uv_copy), "cuMemcpy2D_v2 (UV plane)")?;
             }
             debug!("NVDEC map_and_copy completed synchronous D2D copies");
 
@@ -477,6 +633,22 @@ impl NvDecoder {
             pitch: src_pitch_usize,
             format: PixelFormat::Nv12,
         };
+
+        if should_dump {
+            decode_ready.synchronize()?;
+            self.write_debug_dump(
+                &texture,
+                self.frame_index,
+                coded_width,
+                coded_height,
+                visible_width,
+                visible_height,
+                format.display_area.left,
+                format.display_area.top,
+                format.display_area.right,
+                format.display_area.bottom,
+            )?;
+        }
 
         let envelope = FrameEnvelope {
             texture,
@@ -633,15 +805,15 @@ unsafe extern "system" fn sequence_callback(
         create_info.ulMaxWidth = fmt.coded_width as c_ulong;
         create_info.ulMaxHeight = fmt.coded_height as c_ulong;
         create_info.display_area = CUVIDDECODECREATEINFO_display_area {
-            left: 0,
-            top: 0,
-            right: fmt.coded_width as c_short,
-            bottom: fmt.coded_height as c_short,
+            left: fmt.display_area.left as c_short,
+            top: fmt.display_area.top as c_short,
+            right: fmt.display_area.right as c_short,
+            bottom: fmt.display_area.bottom as c_short,
         };
         create_info.OutputFormat = cudaVideoSurfaceFormat::NV12;
         create_info.DeinterlaceMode = cudaVideoDeinterlaceMode::Adaptive;
-        create_info.ulTargetWidth = fmt.coded_width as c_ulong;
-        create_info.ulTargetHeight = fmt.coded_height as c_ulong;
+        create_info.ulTargetWidth = NvDecoder::visible_width(fmt) as c_ulong;
+        create_info.ulTargetHeight = NvDecoder::visible_height(fmt) as c_ulong;
         create_info.ulNumOutputSurfaces = 2;
 
         let result = cuvidCreateDecoder(&mut state.decoder, &mut create_info);
@@ -656,6 +828,10 @@ unsafe extern "system" fn sequence_callback(
             decoder = format_args!("{:p}", state.decoder),
             width = fmt.coded_width,
             height = fmt.coded_height,
+            display_left = fmt.display_area.left,
+            display_top = fmt.display_area.top,
+            display_right = fmt.display_area.right,
+            display_bottom = fmt.display_area.bottom,
             num_surfaces,
             "NVDEC sequence_callback decoder created"
         );

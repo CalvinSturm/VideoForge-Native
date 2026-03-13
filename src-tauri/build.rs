@@ -5,6 +5,9 @@ use std::path::Path;
 fn main() {
     // Re-run if protocol definition changes
     println!("cargo:rerun-if-changed=../ipc/shm_protocol.json");
+    println!("cargo:rerun-if-changed=src/ffmpeg_accessors.c");
+    println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
+    println!("cargo:rerun-if-env-changed=VCPKG_ROOT");
 
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("shm_constants.rs");
@@ -86,6 +89,35 @@ fn main() {
     ));
 
     fs::write(&dest_path, content).unwrap();
+
+    if env::var_os("CARGO_FEATURE_NATIVE_ENGINE").is_some() {
+        let mut build = cc::Build::new();
+        build.file("src/ffmpeg_accessors.c");
+
+        if let Ok(ffmpeg_dir) = env::var("FFMPEG_DIR") {
+            let include = Path::new(&ffmpeg_dir).join("include");
+            if include.exists() {
+                build.include(include);
+            }
+        }
+
+        if let Ok(vcpkg_root) = env::var("VCPKG_ROOT") {
+            let include = Path::new(&vcpkg_root)
+                .join("installed")
+                .join("x64-windows")
+                .join("include");
+            if include.exists() {
+                build.include(include);
+            }
+        }
+
+        let fallback_vcpkg = Path::new(r"C:\tools\vcpkg\installed\x64-windows\include");
+        if fallback_vcpkg.exists() {
+            build.include(fallback_vcpkg);
+        }
+
+        build.compile("videoforge_ffmpeg_accessors");
+    }
 
     tauri_build::build();
 }

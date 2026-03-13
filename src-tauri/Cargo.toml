@@ -17,6 +17,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 serde_json = "1.0"
 tauri-build = { version = "2.0.0", features = [] }
+cc = "1"
 
 [features]
 # Enable the GPU-native engine-v2 upscaling path.
@@ -26,7 +27,7 @@ tauri-build = { version = "2.0.0", features = [] }
 # Requires CUDA toolkit, TensorRT, and ONNX Runtime with TensorRT EP.
 # ort pinned to =2.0.0-rc.11 (latest rc on crates.io as of 2026-02).
 default = []
-native_engine = ["dep:videoforge-engine"]
+native_engine = ["dep:videoforge-engine", "dep:ffmpeg-sys-next"]
 
 [dependencies]
 serde_json = "1.0"
@@ -58,3 +59,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Native engine (optional — enabled by native_engine feature).
 videoforge-engine = { path = "../engine-v2", optional = true }
+ffmpeg-sys-next = { path = "../third_party/rave/vendor/ffmpeg-sys-next", optional = true }

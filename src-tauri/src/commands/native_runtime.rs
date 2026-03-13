@@ -78,7 +78,11 @@ pub(crate) fn resolve_native_runtime_paths(
     workspace_root: Option<&Path>,
     extra_path_dir: Option<&Path>,
 ) -> NativeRuntimePaths {
-    let ffmpeg_exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let ffmpeg_exe = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
     let ffprobe_exe = if cfg!(windows) {
         "ffprobe.exe"
     } else {

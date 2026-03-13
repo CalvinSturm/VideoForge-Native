@@ -34,7 +34,10 @@
 //! already `1×C×H×W` in memory.  [`ModelInput::from_texture`] annotates the
 //! batch dimension without any data copy.
 
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cudarc::driver::{CudaDevice, CudaFunction, CudaStream, DevicePtr, LaunchAsync, LaunchConfig};
 use tracing::info;
@@ -43,6 +46,145 @@ use crate::codecs::sys::{self, CUevent};
 use crate::core::context::GpuContext;
 use crate::core::types::{GpuBuffer, GpuTexture, PixelFormat};
 use crate::error::{EngineError, Result};
+
+static POSTPROCESS_KERNEL_DEBUG_DUMP_WRITTEN: AtomicBool = AtomicBool::new(false);
+
+fn postprocess_kernel_debug_enabled() -> bool {
+    std::env::var_os("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP").as_deref() == Some("1".as_ref())
+}
+
+fn postprocess_neutral_chroma_enabled() -> bool {
+    std::env::var_os("VIDEOFORGE_POSTPROCESS_NEUTRAL_CHROMA").as_deref() == Some("1".as_ref())
+}
+
+fn claim_postprocess_kernel_debug_dump_slot() -> bool {
+    postprocess_kernel_debug_enabled()
+        && POSTPROCESS_KERNEL_DEBUG_DUMP_WRITTEN
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+}
+
+fn debug_dump_dir() -> PathBuf {
+    if let Some(override_dir) = std::env::var_os("VIDEOFORGE_NVDEC_DEBUG_DUMP_DIR") {
+        return PathBuf::from(override_dir);
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let base = if cwd.file_name().and_then(|name| name.to_str()) == Some("src-tauri") {
+        cwd.parent().map(PathBuf::from).unwrap_or(cwd)
+    } else {
+        cwd
+    };
+
+    base.join("artifacts").join("nvdec_debug")
+}
+
+fn f32_to_u8(v: f32) -> u8 {
+    let scaled = (v.clamp(0.0, 1.0) * 255.0).round();
+    scaled as u8
+}
+
+fn write_rgb_planar_f32_preview(texture: &GpuTexture, host: &[u8], path: &PathBuf) -> Result<()> {
+    let w = texture.width as usize;
+    let h = texture.height as usize;
+    let plane_bytes = w * h * std::mem::size_of::<f32>();
+    if host.len() < plane_bytes * 3 {
+        return Err(EngineError::FormatMismatch {
+            expected: PixelFormat::RgbPlanarF32,
+            actual: texture.format,
+        });
+    }
+
+    let (r_plane, rest) = host.split_at(plane_bytes);
+    let (g_plane, b_plane) = rest.split_at(plane_bytes);
+    let mut ppm = Vec::with_capacity(32 + w * h * 3);
+    ppm.extend_from_slice(format!("P6\n{} {}\n255\n", w, h).as_bytes());
+
+    for idx in 0..(w * h) {
+        let r = f32::from_le_bytes(r_plane[idx * 4..idx * 4 + 4].try_into().unwrap());
+        let g = f32::from_le_bytes(g_plane[idx * 4..idx * 4 + 4].try_into().unwrap());
+        let b = f32::from_le_bytes(b_plane[idx * 4..idx * 4 + 4].try_into().unwrap());
+        ppm.push(f32_to_u8(r));
+        ppm.push(f32_to_u8(g));
+        ppm.push(f32_to_u8(b));
+    }
+
+    fs::write(path, ppm).map_err(|e| {
+        EngineError::Decode(format!(
+            "Failed to write postprocess kernel preview '{}': {e}",
+            path.display()
+        ))
+    })
+}
+
+fn write_postprocess_kernel_input_debug_dump(
+    texture: &GpuTexture,
+    ctx: &GpuContext,
+    nv12_pitch: usize,
+) -> Result<()> {
+    let dump_dir = debug_dump_dir();
+    fs::create_dir_all(&dump_dir).map_err(|e| {
+        EngineError::Decode(format!(
+            "Failed to create postprocess kernel debug dump dir '{}': {e}",
+            dump_dir.display()
+        ))
+    })?;
+
+    let base = format!(
+        "postprocess_input_{}x{}_pitch{}_fmt_{:?}",
+        texture.width, texture.height, texture.pitch, texture.format
+    );
+    let raw_path = dump_dir.join(format!("{base}.bin"));
+    let meta_path = dump_dir.join(format!("{base}.txt"));
+    let host = texture.data.copy_to_host_sync(ctx)?;
+    fs::write(&raw_path, &host).map_err(|e| {
+        EngineError::Decode(format!(
+            "Failed to write postprocess kernel input dump '{}': {e}",
+            raw_path.display()
+        ))
+    })?;
+
+    let mut metadata = format!(
+        concat!(
+            "texture_width={texture_width}\n",
+            "texture_height={texture_height}\n",
+            "texture_pitch={texture_pitch}\n",
+            "texture_format={texture_format:?}\n",
+            "nv12_pitch={nv12_pitch}\n",
+            "channel_stride_elements={channel_stride}\n",
+            "raw_path={raw_path}\n",
+            "note=raw RGB inference output consumed by rgb_to_nv12 kernel\n"
+        ),
+        texture_width = texture.width,
+        texture_height = texture.height,
+        texture_pitch = texture.pitch,
+        texture_format = texture.format,
+        nv12_pitch = nv12_pitch,
+        channel_stride = texture.channel_stride_elements(),
+        raw_path = raw_path.display(),
+    );
+
+    if texture.format == PixelFormat::RgbPlanarF32 {
+        let preview_path = dump_dir.join(format!("{base}.ppm"));
+        write_rgb_planar_f32_preview(texture, &host, &preview_path)?;
+        metadata.push_str(&format!("preview_path={}\n", preview_path.display()));
+    }
+
+    fs::write(&meta_path, metadata).map_err(|e| {
+        EngineError::Decode(format!(
+            "Failed to write postprocess kernel metadata '{}': {e}",
+            meta_path.display()
+        ))
+    })?;
+
+    info!(
+        raw_path = %raw_path.display(),
+        meta_path = %meta_path.display(),
+        format = ?texture.format,
+        "Postprocess kernel input debug dump written"
+    );
+    Ok(())
+}
 
 // ─── CUDA C kernel source ────────────────────────────────────────────────────
 
@@ -173,7 +315,8 @@ extern "C" __global__ void rgb_planar_f32_to_nv12(
     int height,
     int y_pitch,
     int uv_pitch,
-    int channel_stride)
+    int channel_stride,
+    int neutral_chroma)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -247,7 +390,8 @@ extern "C" __global__ void rgb_planar_f16_to_nv12(
     int height,
     int y_pitch,
     int uv_pitch,
-    int channel_stride)
+    int channel_stride,
+    int neutral_chroma)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -297,12 +441,16 @@ extern "C" __global__ void rgb_planar_f16_to_nv12(
             count++;
         }
 
-        float u_avg = u_sum / (float)count;
-        float v_avg = v_sum / (float)count;
-
         int uv_idx = (y >> 1) * uv_pitch + (x >> 1) * 2;
-        uv_plane[uv_idx    ] = (unsigned char)fminf(fmaxf(u_avg * 255.0f + 128.0f + 0.5f, 0.0f), 255.0f);
-        uv_plane[uv_idx + 1] = (unsigned char)fminf(fmaxf(v_avg * 255.0f + 128.0f + 0.5f, 0.0f), 255.0f);
+        if (neutral_chroma != 0) {
+            uv_plane[uv_idx    ] = 128;
+            uv_plane[uv_idx + 1] = 128;
+        } else {
+            float u_avg = u_sum / (float)count;
+            float v_avg = v_sum / (float)count;
+            uv_plane[uv_idx    ] = (unsigned char)fminf(fmaxf(u_avg * 255.0f + 128.0f + 0.5f, 0.0f), 255.0f);
+            uv_plane[uv_idx + 1] = (unsigned char)fminf(fmaxf(v_avg * 255.0f + 128.0f + 0.5f, 0.0f), 255.0f);
+        }
     }
 }
 "#;
@@ -645,8 +793,27 @@ impl PreprocessKernels {
         let in_ptr = input.device_ptr();
         let y_ptr = output_buf.device_ptr();
         let uv_ptr = y_ptr + (nv12_pitch * h) as u64;
+        let neutral_chroma = postprocess_neutral_chroma_enabled();
 
         let (config, _) = launch_config_2d(input.width, input.height);
+        let should_dump = claim_postprocess_kernel_debug_dump_slot();
+
+        if should_dump {
+            info!(
+                input_width = input.width,
+                input_height = input.height,
+                input_pitch = input.pitch,
+                input_format = ?input.format,
+                channel_stride = channel_stride,
+                nv12_pitch,
+                neutral_chroma,
+                y_ptr = format_args!("0x{y_ptr:016x}"),
+                uv_ptr = format_args!("0x{uv_ptr:016x}"),
+                out_bytes,
+                "rgb_to_nv12 launch parameters"
+            );
+            write_postprocess_kernel_input_debug_dump(input, ctx, nv12_pitch)?;
+        }
 
         // SAFETY:
         // - `in_ptr` points to valid RgbPlanarF32 device memory (3 × W×H × f32).
@@ -666,6 +833,7 @@ impl PreprocessKernels {
                     nv12_pitch as i32,
                     nv12_pitch as i32,
                     channel_stride as i32,
+                    if neutral_chroma { 1i32 } else { 0i32 },
                 ),
             )?;
         }
@@ -704,8 +872,27 @@ impl PreprocessKernels {
         let in_ptr = input.device_ptr();
         let y_ptr = output_buf.device_ptr();
         let uv_ptr = y_ptr + (nv12_pitch * h) as u64;
+        let neutral_chroma = postprocess_neutral_chroma_enabled();
 
         let (config, _) = launch_config_2d(input.width, input.height);
+        let should_dump = claim_postprocess_kernel_debug_dump_slot();
+
+        if should_dump {
+            info!(
+                input_width = input.width,
+                input_height = input.height,
+                input_pitch = input.pitch,
+                input_format = ?input.format,
+                channel_stride = channel_stride,
+                nv12_pitch,
+                neutral_chroma,
+                y_ptr = format_args!("0x{y_ptr:016x}"),
+                uv_ptr = format_args!("0x{uv_ptr:016x}"),
+                out_bytes,
+                "rgb_f16_to_nv12 launch parameters"
+            );
+            write_postprocess_kernel_input_debug_dump(input, ctx, nv12_pitch)?;
+        }
 
         unsafe {
             self.rgb_f16_to_nv12.clone().launch_on_stream(
@@ -720,6 +907,7 @@ impl PreprocessKernels {
                     nv12_pitch as i32,
                     nv12_pitch as i32,
                     channel_stride as i32,
+                    if neutral_chroma { 1i32 } else { 0i32 },
                 ),
             )?;
         }
@@ -955,19 +1143,14 @@ impl PreprocessPipeline {
         stream: &CudaStream,
     ) -> Result<GpuTexture> {
         match output.format {
-            PixelFormat::RgbPlanarF32 => {
-                self.kernels.rgb_to_nv12(&output, nv12_pitch, ctx, stream)
-            }
-            PixelFormat::RgbPlanarF16 => {
-                self.kernels
-                    .rgb_f16_to_nv12(&output, nv12_pitch, ctx, stream)
-            }
-            other => {
-                Err(EngineError::FormatMismatch {
-                    expected: PixelFormat::RgbPlanarF32,
-                    actual: other,
-                })
-            }
+            PixelFormat::RgbPlanarF32 => self.kernels.rgb_to_nv12(&output, nv12_pitch, ctx, stream),
+            PixelFormat::RgbPlanarF16 => self
+                .kernels
+                .rgb_f16_to_nv12(&output, nv12_pitch, ctx, stream),
+            other => Err(EngineError::FormatMismatch {
+                expected: PixelFormat::RgbPlanarF32,
+                actual: other,
+            }),
         }
     }
 }

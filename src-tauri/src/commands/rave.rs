@@ -6,6 +6,7 @@ use crate::rave_cli::{
     run_benchmark, run_upscale, run_validate, RaveCliConfig, RaveCliError, RaveResult,
 };
 use crate::tauri_contracts::{RaveBenchmarkRequest, RaveValidateRequest};
+use serde::Serialize;
 
 fn default_profile() -> &'static str {
     if cfg!(debug_assertions) {
@@ -312,6 +313,178 @@ fn map_rave_error(error: RaveCliError) -> String {
             Some("Ensure --json mode writes exactly one final JSON object to stdout and logs to stderr."),
         ),
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct RaveEnvironmentBinaryStatus {
+    pub exists: bool,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RaveEnvironmentFfmpegStatus {
+    pub layout_ok: bool,
+    pub abi_ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RaveEnvironmentProviderStatus {
+    pub cudnn_found: bool,
+    pub cudnn_probe: String,
+    pub tensorrt_found: bool,
+    pub tensorrt_probe: String,
+    pub tensorrt_parser_found: bool,
+    pub tensorrt_parser_probe: String,
+    pub tensorrt_plugin_found: bool,
+    pub tensorrt_plugin_probe: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RaveEnvironmentResult {
+    pub ready: bool,
+    pub profile: String,
+    pub hints: Vec<String>,
+    pub rave_bin: RaveEnvironmentBinaryStatus,
+    pub ffmpeg: RaveEnvironmentFfmpegStatus,
+    pub providers: RaveEnvironmentProviderStatus,
+}
+
+fn first_existing_path(paths: &[PathBuf]) -> Option<PathBuf> {
+    paths.iter().find(|p| p.exists()).cloned()
+}
+
+#[tauri::command]
+pub async fn rave_environment() -> Result<RaveEnvironmentResult, String> {
+    let profile = resolve_profile()?;
+    let root = workspace_root().ok_or_else(|| "Failed to resolve workspace root".to_string())?;
+    let config = RaveCliConfig::from_workspace_root(&root);
+
+    let rave_exists = config.bin_path.exists();
+    let ffmpeg_name = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+    let ffprobe_name = if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    };
+    let ffmpeg_path = first_existing_path(&[
+        root.join("third_party")
+            .join("ffmpeg")
+            .join("bin")
+            .join(ffmpeg_name),
+        root.join("third_party").join("ffmpeg").join(ffmpeg_name),
+        root.join("artifacts")
+            .join("ffmpeg")
+            .join("bin")
+            .join(ffmpeg_name),
+    ]);
+    let ffprobe_path = first_existing_path(&[
+        root.join("third_party")
+            .join("ffmpeg")
+            .join("bin")
+            .join(ffprobe_name),
+        root.join("third_party").join("ffmpeg").join(ffprobe_name),
+        root.join("artifacts")
+            .join("ffmpeg")
+            .join("bin")
+            .join(ffprobe_name),
+    ]);
+    let ffmpeg_layout_ok = ffmpeg_path.is_some() && ffprobe_path.is_some();
+    let ffmpeg_abi_ok = ffmpeg_layout_ok;
+
+    let mut hints = Vec::new();
+    if !native_engine_runtime_enabled() {
+        hints.push(
+            "Set VIDEOFORGE_ENABLE_NATIVE_ENGINE=1 before using the native video path.".to_string(),
+        );
+    }
+    if !rave_exists {
+        let searched = config
+            .candidate_paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        hints.push(format!(
+            "Prebuild rave-cli and place rave.exe in one of these locations: {searched}"
+        ));
+    }
+    if !ffmpeg_layout_ok {
+        hints.push(
+            "FFmpeg/ffprobe were not found in the expected repo runtime locations under third_party/ffmpeg or artifacts/."
+                .to_string(),
+        );
+    }
+
+    let trt_dir = first_existing_path(&[
+        root.join("third_party").join("tensorrt"),
+        root.join("artifacts").join("tensorrt"),
+    ]);
+    let probe_in_dir = |name: &str| -> (bool, String) {
+        let path = trt_dir
+            .as_ref()
+            .map(|dir: &PathBuf| dir.join(name))
+            .unwrap_or_else(|| root.join("third_party").join("tensorrt").join(name));
+        (path.exists(), path.to_string_lossy().to_string())
+    };
+
+    let (cudnn_found, cudnn_probe) = probe_in_dir("cudnn64_9.dll");
+    let (tensorrt_found, tensorrt_probe) = probe_in_dir("nvinfer_10.dll");
+    let (tensorrt_parser_found, tensorrt_parser_probe) = probe_in_dir("nvonnxparser_10.dll");
+    let (tensorrt_plugin_found, tensorrt_plugin_probe) = probe_in_dir("nvinfer_plugin_10.dll");
+
+    if !cudnn_found {
+        hints.push(format!("Missing cuDNN runtime: {cudnn_probe}"));
+    }
+    if !tensorrt_found {
+        hints.push(format!("Missing TensorRT runtime: {tensorrt_probe}"));
+    }
+    if !tensorrt_parser_found {
+        hints.push(format!(
+            "Missing TensorRT ONNX parser: {tensorrt_parser_probe}"
+        ));
+    }
+    if !tensorrt_plugin_found {
+        hints.push(format!(
+            "Missing TensorRT plugin runtime: {tensorrt_plugin_probe}"
+        ));
+    }
+
+    let ready = native_engine_runtime_enabled()
+        && rave_exists
+        && ffmpeg_layout_ok
+        && ffmpeg_abi_ok
+        && cudnn_found
+        && tensorrt_found
+        && tensorrt_parser_found
+        && tensorrt_plugin_found;
+
+    Ok(RaveEnvironmentResult {
+        ready,
+        profile,
+        hints,
+        rave_bin: RaveEnvironmentBinaryStatus {
+            exists: rave_exists,
+            path: Some(config.bin_path.to_string_lossy().to_string()),
+        },
+        ffmpeg: RaveEnvironmentFfmpegStatus {
+            layout_ok: ffmpeg_layout_ok,
+            abi_ok: ffmpeg_abi_ok,
+        },
+        providers: RaveEnvironmentProviderStatus {
+            cudnn_found,
+            cudnn_probe,
+            tensorrt_found,
+            tensorrt_probe,
+            tensorrt_parser_found,
+            tensorrt_parser_probe,
+            tensorrt_plugin_found,
+            tensorrt_plugin_probe,
+        },
+    })
 }
 
 #[tauri::command]

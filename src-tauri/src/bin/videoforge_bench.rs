@@ -4,13 +4,13 @@ use std::process::{self, Stdio};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
-use app_lib::commands::upscale::{run_upscale_job, JobProgress, JobProgressFn, UpscaleJobConfig};
 #[cfg(feature = "native_engine")]
 use app_lib::commands::native_engine::{
-    native_benchmark_done_json, native_benchmark_result_json,
-    native_benchmark_warmup_start_json, run_native_tool_request, NativeToolRunRequest,
+    native_benchmark_done_json, native_benchmark_result_json, native_benchmark_warmup_start_json,
+    run_native_tool_request, NativeToolRunRequest,
 };
 use app_lib::commands::native_runtime::configure_repo_tool_runtime_path;
+use app_lib::commands::upscale::{run_upscale_job, JobProgress, JobProgressFn, UpscaleJobConfig};
 use app_lib::control::ResearchConfig;
 use app_lib::edit_config::EditConfig;
 use app_lib::models;
@@ -234,10 +234,9 @@ fn run_dry_run_checks(args: &BenchArgs) -> Result<(), String> {
 
 #[cfg(feature = "native_engine")]
 async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
-    let onnx_model = args
-        .onnx_model
-        .as_ref()
-        .unwrap_or_else(|| emit_error_and_exit("Native benchmarking requires --onnx-model <path>."));
+    let onnx_model = args.onnx_model.as_ref().unwrap_or_else(|| {
+        emit_error_and_exit("Native benchmarking requires --onnx-model <path>.")
+    });
 
     let base_request = NativeToolRunRequest::new(
         args.input.clone(),
@@ -262,10 +261,9 @@ async fn run_native_bench(args: &BenchArgs, precision: &str, started: Instant) {
             warmup_output.clone(),
         ));
         let warmup_started = Instant::now();
-        match run_native_tool_request(
-            base_request.clone().with_output_path(warmup_output.clone()),
-        )
-        .await {
+        match run_native_tool_request(base_request.clone().with_output_path(warmup_output.clone()))
+            .await
+        {
             Ok(report) => {
                 let mut payload = native_benchmark_result_json(
                     &report,
@@ -462,9 +460,7 @@ fn parse_args(args: Vec<String>) -> Result<BenchArgs, CliExit> {
     let precision = required_arg(precision, "--precision")?;
 
     let model = if native {
-        onnx_model
-            .clone()
-            .unwrap_or_else(|| "native".to_string())
+        onnx_model.clone().unwrap_or_else(|| "native".to_string())
     } else {
         required_arg(model, "--model")?
     };

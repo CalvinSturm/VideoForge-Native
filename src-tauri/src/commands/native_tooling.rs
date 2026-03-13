@@ -185,10 +185,8 @@ impl NativeToolRunRequest {
     }
 
     pub fn runtime_overrides(&self) -> NativeRuntimeOverrides {
-        NativeRuntimeOverrides::native_command(self.native_direct).with_trt_cache(
-            self.trt_cache_dir.is_some(),
-            self.trt_cache_dir.clone(),
-        )
+        NativeRuntimeOverrides::native_command(self.native_direct)
+            .with_trt_cache(self.trt_cache_dir.is_some(), self.trt_cache_dir.clone())
     }
 }
 
@@ -221,7 +219,10 @@ pub fn default_native_tool_trt_cache_dir() -> PathBuf {
 #[cfg(feature = "native_engine")]
 pub fn native_tool_warmup_output_path(output: &str, run_idx: u32) -> String {
     let path = Path::new(output);
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     parent
@@ -237,7 +238,10 @@ pub fn native_result_summary_json(
     use serde_json::{Map, Value};
 
     let mut map = Map::new();
-    map.insert("output".to_string(), Value::String(report.output_path.clone()));
+    map.insert(
+        "output".to_string(),
+        Value::String(report.output_path.clone()),
+    );
     map.insert("engine".to_string(), Value::String(report.engine.clone()));
     map.insert(
         "encoder_mode".to_string(),
@@ -313,7 +317,11 @@ pub fn native_result_summary_json(
     );
     map.insert(
         "frames_decoded".to_string(),
-        report.perf.frames_decoded.map(Value::from).unwrap_or(Value::Null),
+        report
+            .perf
+            .frames_decoded
+            .map(Value::from)
+            .unwrap_or(Value::Null),
     );
     map.insert(
         "frames_preprocessed".to_string(),
@@ -325,11 +333,19 @@ pub fn native_result_summary_json(
     );
     map.insert(
         "frames_inferred".to_string(),
-        report.perf.frames_inferred.map(Value::from).unwrap_or(Value::Null),
+        report
+            .perf
+            .frames_inferred
+            .map(Value::from)
+            .unwrap_or(Value::Null),
     );
     map.insert(
         "frames_encoded".to_string(),
-        report.perf.frames_encoded.map(Value::from).unwrap_or(Value::Null),
+        report
+            .perf
+            .frames_encoded
+            .map(Value::from)
+            .unwrap_or(Value::Null),
     );
     map.insert(
         "preprocess_avg_us".to_string(),
@@ -373,15 +389,27 @@ pub fn native_result_summary_json(
     );
     map.insert(
         "encode_avg_us".to_string(),
-        report.perf.encode_avg_us.map(Value::from).unwrap_or(Value::Null),
+        report
+            .perf
+            .encode_avg_us
+            .map(Value::from)
+            .unwrap_or(Value::Null),
     );
     map.insert(
         "vram_current_mb".to_string(),
-        report.perf.vram_current_mb.map(Value::from).unwrap_or(Value::Null),
+        report
+            .perf
+            .vram_current_mb
+            .map(Value::from)
+            .unwrap_or(Value::Null),
     );
     map.insert(
         "vram_peak_mb".to_string(),
-        report.perf.vram_peak_mb.map(Value::from).unwrap_or(Value::Null),
+        report
+            .perf
+            .vram_peak_mb
+            .map(Value::from)
+            .unwrap_or(Value::Null),
     );
     map.insert(
         "effective_max_batch".to_string(),

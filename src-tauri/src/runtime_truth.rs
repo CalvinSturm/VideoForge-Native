@@ -223,11 +223,7 @@ pub struct RunObservedMetrics {
 }
 
 impl RunObservedMetrics {
-    pub fn new(
-        run_id: impl Into<String>,
-        route_id: impl Into<String>,
-        status: RunStatus,
-    ) -> Self {
+    pub fn new(run_id: impl Into<String>, route_id: impl Into<String>, status: RunStatus) -> Self {
         Self {
             schema_version: RUN_OBSERVED_METRICS_SCHEMA_V1.to_string(),
             run_id: run_id.into(),
@@ -400,7 +396,10 @@ mod tests {
             value.get("engine_family").and_then(Value::as_str),
             Some("python")
         );
-        assert_eq!(value.get("input_path").and_then(Value::as_str), Some("in.mp4"));
+        assert_eq!(
+            value.get("input_path").and_then(Value::as_str),
+            Some("in.mp4")
+        );
         assert_eq!(
             value.get("output_path").and_then(Value::as_str),
             Some("out.mp4")
@@ -509,8 +508,8 @@ mod tests {
 
     #[test]
     fn field_origin_serializes_to_stable_snake_case_values() {
-        let value = serde_json::to_value(FieldOrigin::FallbackAdjusted)
-            .expect("serialize field origin");
+        let value =
+            serde_json::to_value(FieldOrigin::FallbackAdjusted).expect("serialize field origin");
         assert_eq!(value, Value::String("fallback_adjusted".to_string()));
     }
 }

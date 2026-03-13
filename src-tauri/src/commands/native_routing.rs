@@ -2,24 +2,24 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "native_engine")]
+use crate::run_manifest::{
+    maybe_write_run_manifest, run_artifacts_enabled_from_env, RunManifestInputs, WorkerCapsSnapshot,
+};
+#[cfg(feature = "native_engine")]
 use crate::runtime_truth::{
     log_run_observed_metrics, log_runtime_config_snapshot, NativeRuntimeConfigExtension,
     NativeRuntimeMetricsExtension, RunObservedMetrics, RunStatus, RuntimeConfigExtensions,
     RuntimeConfigSnapshot, RuntimeEngineFamily, RuntimeFallbackInfo, RuntimeMetricsExtensions,
     RuntimeSnapshotKind,
 };
-#[cfg(feature = "native_engine")]
-use crate::run_manifest::{
-    maybe_write_run_manifest, run_artifacts_enabled_from_env, RunManifestInputs, WorkerCapsSnapshot,
-};
 
+#[cfg(feature = "native_engine")]
+use crate::commands::native_direct_pipeline::run_native_pipeline;
 #[cfg(feature = "native_engine")]
 use crate::commands::native_engine::{
     native_engine_direct_enabled, native_engine_runtime_enabled, native_temp_token,
     NativePerfReport, NativeUpscaleError, NativeUpscaleResult,
 };
-#[cfg(feature = "native_engine")]
-use crate::commands::native_direct_pipeline::run_native_pipeline;
 #[cfg(feature = "native_engine")]
 use crate::commands::native_probe::NativeDirectPlan;
 
@@ -119,8 +119,9 @@ impl NativeJobSpec {
         audio: Option<bool>,
         requested_max_batch: Option<u32>,
     ) -> Result<Self, String> {
-        let make_err =
-            |code: &str, msg: &str| serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap();
+        let make_err = |code: &str, msg: &str| {
+            serde_json::to_string(&NativeUpscaleError::new(code, msg)).unwrap()
+        };
 
         if !Path::new(&model_path).exists() {
             return Err(make_err(
@@ -259,7 +260,10 @@ impl NativeJobSpec {
         })
     }
 
-    pub(crate) fn prepare_direct_plan(&self, ffmpeg_cmd: String) -> Result<NativeDirectPlan, String> {
+    pub(crate) fn prepare_direct_plan(
+        &self,
+        ffmpeg_cmd: String,
+    ) -> Result<NativeDirectPlan, String> {
         use videoforge_engine::codecs::sys::cudaVideoCodec as CudaCodec;
 
         NativeDirectPlan::prepare(self, ffmpeg_cmd, CudaCodec::H264)
@@ -350,12 +354,15 @@ pub(crate) fn build_native_runtime_snapshot(
         model_format: Some("onnx".to_string()),
         scale: Some(job.scale),
         precision: Some(job.precision.clone()),
-        fallback: route.fallback_reason_code.as_ref().map(|_| RuntimeFallbackInfo {
-            from_route_id: "native_direct".to_string(),
-            to_route_id: route_id.to_string(),
-            reason_code: route.fallback_reason_code.clone(),
-            reason_message: route.fallback_reason_message.clone(),
-        }),
+        fallback: route
+            .fallback_reason_code
+            .as_ref()
+            .map(|_| RuntimeFallbackInfo {
+                from_route_id: "native_direct".to_string(),
+                to_route_id: route_id.to_string(),
+                reason_code: route.fallback_reason_code.clone(),
+                reason_message: route.fallback_reason_message.clone(),
+            }),
         extensions: RuntimeConfigExtensions {
             python: None,
             native: Some(NativeRuntimeConfigExtension {
