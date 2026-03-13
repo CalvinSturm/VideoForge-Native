@@ -187,36 +187,79 @@ fn validate_worker_protocol_version(found: Option<u32>, typed_ipc: bool) -> Resu
     }
 }
 
-#[allow(clippy::too_many_arguments)] // TODO(clippy): payload builder keeps explicit optional knobs for readability.
-fn build_create_shm_payload(
+struct CreateShmRequest<'a> {
     width: usize,
     height: usize,
     scale: usize,
     ring_size: usize,
     shm_proto_v2: bool,
     shm_ring_size: Option<u32>,
-    event_in_name: Option<&str>,
-    event_out_name: Option<&str>,
-) -> serde_json::Value {
+    event_in_name: Option<&'a str>,
+    event_out_name: Option<&'a str>,
+}
+
+struct VideoPipelinePlan {
+    source_fps: f64,
+    process_w: usize,
+    process_h: usize,
+    start_time: f64,
+    process_duration: f64,
+    process_frames: u64,
+    scale_factor: usize,
+    target_fps: u32,
+    filters: String,
+}
+
+fn build_create_shm_payload(request: &CreateShmRequest<'_>) -> serde_json::Value {
     let mut payload = json!({
-        "width": width,
-        "height": height,
-        "scale": scale,
-        "ring_size": ring_size
+        "width": request.width,
+        "height": request.height,
+        "scale": request.scale,
+        "ring_size": request.ring_size
     });
-    if let Some(name) = event_in_name {
+    if let Some(name) = request.event_in_name {
         payload["event_in_name"] = json!(name);
     }
-    if let Some(name) = event_out_name {
+    if let Some(name) = request.event_out_name {
         payload["event_out_name"] = json!(name);
     }
-    if shm_proto_v2 {
+    if request.shm_proto_v2 {
         payload["shm_proto_v2"] = json!(true);
     }
-    if let Some(ring_size) = shm_ring_size {
+    if let Some(ring_size) = request.shm_ring_size {
         payload["shm_ring_size"] = json!(ring_size);
     }
     payload
+}
+
+fn build_video_pipeline_plan(
+    input_path: &str,
+    edit_config: &EditConfig,
+    scale: u32,
+) -> Result<VideoPipelinePlan, String> {
+    let (input_w, input_h, source_duration, source_fps, _total_frames) =
+        video_pipeline::probe_video(input_path).map_err(|e| e.to_string())?;
+    let (process_w, process_h) = calculate_output_dimensions(edit_config, input_w, input_h);
+    let start_time = edit_config.trim_start;
+    let end_time = if edit_config.trim_end > 0.0 {
+        edit_config.trim_end
+    } else {
+        source_duration
+    };
+    let process_duration = (end_time - start_time).max(0.1);
+    let process_frames = (process_duration * source_fps).round() as u64;
+
+    Ok(VideoPipelinePlan {
+        source_fps,
+        process_w,
+        process_h,
+        start_time,
+        process_duration,
+        process_frames,
+        scale_factor: scale as usize,
+        target_fps: edit_config.fps,
+        filters: build_ffmpeg_filters(edit_config, input_w, input_h),
+    })
 }
 
 fn resolve_shm_ring_override(
@@ -566,27 +609,16 @@ pub async fn run_upscale_job(
     }
 
     // ── Video pipeline ───────────────────────────────────────────────────────
-    let probe_res = video_pipeline::probe_video(&config.input_path).map_err(|e| e.to_string())?;
-    let (input_w, input_h, duration, fps, _total_frames) = probe_res;
-
-    let (process_w, process_h) = calculate_output_dimensions(&config.edit_config, input_w, input_h);
-    let start_time = config.edit_config.trim_start;
-    let end_time = if config.edit_config.trim_end > 0.0 {
-        config.edit_config.trim_end
-    } else {
-        duration
-    };
-    let process_duration = (end_time - start_time).max(0.1);
-    let process_frames = (process_duration * fps).round() as u64;
-    let scale_factor = config.scale as usize;
+    let pipeline_plan =
+        build_video_pipeline_plan(&config.input_path, &config.edit_config, config.scale)?;
 
     tracing::info!(
         job_id = %job_id,
-        width = process_w,
-        height = process_h,
-        fps,
-        frames = process_frames,
-        scale = scale_factor,
+        width = pipeline_plan.process_w,
+        height = pipeline_plan.process_h,
+        fps = pipeline_plan.source_fps,
+        frames = pipeline_plan.process_frames,
+        scale = pipeline_plan.scale_factor,
         "Video pipeline starting"
     );
 
@@ -630,16 +662,16 @@ pub async fn run_upscale_job(
     let _out_ready_event_lifetime_guard = out_ready_event;
 
     // Request Python to create the SHM ring buffer.
-    let create_shm_payload = build_create_shm_payload(
-        process_w,
-        process_h,
-        scale_factor,
-        shm::RING_SIZE,
-        worker_caps.use_shm_proto_v2,
-        resolved_ring_override,
-        event_in_name.as_deref(),
-        event_out_name.as_deref(),
-    );
+    let create_shm_payload = build_create_shm_payload(&CreateShmRequest {
+        width: pipeline_plan.process_w,
+        height: pipeline_plan.process_h,
+        scale: pipeline_plan.scale_factor,
+        ring_size: shm::RING_SIZE,
+        shm_proto_v2: worker_caps.use_shm_proto_v2,
+        shm_ring_size: resolved_ring_override,
+        event_in_name: event_in_name.as_deref(),
+        event_out_name: event_out_name.as_deref(),
+    });
 
     ipc::put_request(
         &publisher,
@@ -671,9 +703,9 @@ pub async fn run_upscale_job(
 
     let shm = shm::VideoShm::open_with_expected_ring_size(
         &shm_path,
-        process_w,
-        process_h,
-        scale_factor,
+        pipeline_plan.process_w,
+        pipeline_plan.process_h,
+        pipeline_plan.scale_factor,
         resolved_ring_override.map(|v| v as usize),
     )
     .map_err(|e| e.to_string())?;
@@ -727,21 +759,19 @@ pub async fn run_upscale_job(
     }
     tracing::info!(job_id = %job_id, "Python frame loop started (SHM atomic polling)");
 
-    let filters = build_ffmpeg_filters(&config.edit_config, input_w, input_h);
-
     // ── Decoder task ─────────────────────────────────────────────────────────
     let decoder_task = async {
         let frames_decoded_ctr = Arc::clone(&frames_decoded_ctr);
         #[cfg(windows)]
         let in_ready_event = in_ready_event.clone();
         let use_nvdec = video_pipeline::probe_nvdec();
-        let mut decoder = video_pipeline::VideoDecoder::new(
-            &config.input_path,
-            start_time,
-            process_duration,
-            &filters,
-            use_nvdec,
-        )
+        let mut decoder = video_pipeline::VideoDecoder::new(video_pipeline::VideoDecoderConfig {
+            input: &config.input_path,
+            start: pipeline_plan.start_time,
+            duration: pipeline_plan.process_duration,
+            filter_str: &pipeline_plan.filters,
+            use_hwaccel: use_nvdec,
+        })
         .await
         .map_err(|e| e.to_string())?;
 
@@ -874,22 +904,24 @@ pub async fn run_upscale_job(
     };
 
     // ── Encoder task ─────────────────────────────────────────────────────────
-    let target_fps = config.edit_config.fps;
     let encoder_task = async {
         let frames_decoded_ctr = Arc::clone(&frames_decoded_ctr);
         let frames_processed_ctr = Arc::clone(&frames_processed_ctr);
         let frames_encoded_ctr = Arc::clone(&frames_encoded_ctr);
-        let mut encoder = video_pipeline::VideoEncoder::new_with_audio(
-            &output_path,
-            fps as u32,
-            target_fps,
-            process_w * scale_factor,
-            process_h * scale_factor,
-            Some(&config.input_path),
-            start_time,
-            process_duration,
-            precision == "deterministic",
-        )
+        let mut encoder =
+            video_pipeline::VideoEncoder::new_with_audio(video_pipeline::VideoEncoderConfig {
+                output: &output_path,
+                source_fps: pipeline_plan.source_fps as u32,
+                target_fps: pipeline_plan.target_fps,
+                width: pipeline_plan.process_w * pipeline_plan.scale_factor,
+                height: pipeline_plan.process_h * pipeline_plan.scale_factor,
+                audio: Some(video_pipeline::EncoderAudioInput {
+                    source: &config.input_path,
+                    start: pipeline_plan.start_time,
+                    duration: pipeline_plan.process_duration,
+                }),
+                deterministic: precision == "deterministic",
+            })
         .await
         .map_err(|e| e.to_string())?;
 
@@ -920,15 +952,18 @@ pub async fn run_upscale_job(
 
             processed_count += 1;
             frames_encoded_ctr.store(processed_count, Ordering::Relaxed);
-            let is_last_frame = processed_count >= process_frames;
+            let is_last_frame = processed_count >= pipeline_plan.process_frames;
 
             if last_emit.elapsed() > Duration::from_millis(100) || is_last_frame {
-                let pct =
-                    ((processed_count as f64 / process_frames as f64) * 100.0).min(100.0) as u32;
+                let pct = ((processed_count as f64 / pipeline_plan.process_frames as f64) * 100.0)
+                    .min(100.0) as u32;
                 let elapsed = eta_start.elapsed().as_secs_f64();
                 let fps_proc = processed_count as f64 / elapsed;
                 let eta = if fps_proc > 0.0 {
-                    (process_frames.saturating_sub(processed_count) as f64 / fps_proc) as u64
+                    (pipeline_plan
+                        .process_frames
+                        .saturating_sub(processed_count) as f64
+                        / fps_proc) as u64
                 } else {
                     0
                 };
@@ -936,7 +971,7 @@ pub async fn run_upscale_job(
                 tracing::debug!(
                     job_id = %job_id,
                     frame = processed_count,
-                    total = process_frames,
+                    total = pipeline_plan.process_frames,
                     pct,
                     "Encode progress"
                 );
@@ -944,7 +979,10 @@ pub async fn run_upscale_job(
                 progress(JobProgress {
                     pct,
                     frame: processed_count,
-                    message: format!("Processing Frame {}/{}", processed_count, process_frames),
+                    message: format!(
+                        "Processing Frame {}/{}",
+                        processed_count, pipeline_plan.process_frames
+                    ),
                     output_path: None,
                     eta_secs: eta,
                     frames_decoded: Some(frames_decoded_ctr.load(Ordering::Relaxed)),
@@ -1072,7 +1110,7 @@ pub async fn run_upscale_job(
 mod tests {
     use super::{
         build_create_shm_payload, build_python_observed_metrics, resolve_shm_ring_override,
-        validate_worker_protocol_version, JobProgress, StageTimingsMs,
+        validate_worker_protocol_version, CreateShmRequest, JobProgress, StageTimingsMs,
     };
     use crate::runtime_truth::{
         PythonRuntimeConfigExtension, RunStatus, RuntimeConfigExtensions,
@@ -1161,7 +1199,16 @@ mod tests {
 
     #[test]
     fn test_create_shm_payload_omits_event_names_when_absent() {
-        let v = build_create_shm_payload(1920, 1080, 2, 6, false, None, None, None);
+        let v = build_create_shm_payload(&CreateShmRequest {
+            width: 1920,
+            height: 1080,
+            scale: 2,
+            ring_size: 6,
+            shm_proto_v2: false,
+            shm_ring_size: None,
+            event_in_name: None,
+            event_out_name: None,
+        });
         assert_eq!(v["width"], 1920);
         assert_eq!(v["height"], 1080);
         assert_eq!(v["scale"], 2);
@@ -1173,29 +1220,47 @@ mod tests {
 
     #[test]
     fn test_create_shm_payload_includes_event_names_when_present() {
-        let v = build_create_shm_payload(
-            1920,
-            1080,
-            2,
-            6,
-            false,
-            None,
-            Some("vf_shm_abc_in_ready"),
-            Some("vf_shm_abc_out_ready"),
-        );
+        let v = build_create_shm_payload(&CreateShmRequest {
+            width: 1920,
+            height: 1080,
+            scale: 2,
+            ring_size: 6,
+            shm_proto_v2: false,
+            shm_ring_size: None,
+            event_in_name: Some("vf_shm_abc_in_ready"),
+            event_out_name: Some("vf_shm_abc_out_ready"),
+        });
         assert_eq!(v["event_in_name"], "vf_shm_abc_in_ready");
         assert_eq!(v["event_out_name"], "vf_shm_abc_out_ready");
     }
 
     #[test]
     fn test_create_shm_payload_includes_shm_proto_v2_when_enabled() {
-        let v = build_create_shm_payload(1920, 1080, 2, 6, true, None, None, None);
+        let v = build_create_shm_payload(&CreateShmRequest {
+            width: 1920,
+            height: 1080,
+            scale: 2,
+            ring_size: 6,
+            shm_proto_v2: true,
+            shm_ring_size: None,
+            event_in_name: None,
+            event_out_name: None,
+        });
         assert_eq!(v["shm_proto_v2"], true);
     }
 
     #[test]
     fn test_create_shm_payload_includes_ring_override_when_present() {
-        let v = build_create_shm_payload(1920, 1080, 2, 6, true, Some(8), None, None);
+        let v = build_create_shm_payload(&CreateShmRequest {
+            width: 1920,
+            height: 1080,
+            scale: 2,
+            ring_size: 6,
+            shm_proto_v2: true,
+            shm_ring_size: Some(8),
+            event_in_name: None,
+            event_out_name: None,
+        });
         assert_eq!(v["shm_ring_size"], 8);
     }
 

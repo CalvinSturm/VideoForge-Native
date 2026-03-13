@@ -266,3 +266,51 @@ impl NativeDirectPlan {
             .pipeline_config(model_precision, inference_max_batch)
     }
 }
+
+#[cfg(all(test, feature = "native_engine"))]
+mod tests {
+    use super::{NativeVideoOutputProfile, NativeVideoSourceProfile};
+    use videoforge_engine::codecs::sys::cudaVideoCodec;
+    use videoforge_engine::core::kernels::ModelPrecision;
+
+    #[test]
+    fn source_profile_maps_codec_to_mux_hint() {
+        let h264 = NativeVideoSourceProfile {
+            coded_width: 1920,
+            coded_height: 1080,
+            fps: 30.0,
+            total_frames: 300,
+            codec: cudaVideoCodec::H264,
+        };
+        let hevc = NativeVideoSourceProfile {
+            codec: cudaVideoCodec::HEVC,
+            ..h264.clone()
+        };
+
+        assert_eq!(h264.mux_codec_hint().get(), Some("h264"));
+        assert_eq!(hevc.mux_codec_hint().get(), Some("hevc"));
+    }
+
+    #[test]
+    fn output_profile_builds_nvenc_and_pipeline_configs() {
+        let output = NativeVideoOutputProfile {
+            width: 3840,
+            height: 2160,
+            nv12_pitch: 4096,
+            fps_num: 24_000,
+            fps_den: 1001,
+        };
+
+        let nvenc = output.nvenc_config();
+        assert_eq!(nvenc.width, 3840);
+        assert_eq!(nvenc.height, 2160);
+        assert_eq!(nvenc.nv12_pitch, 4096);
+        assert_eq!(nvenc.fps_num, 24_000);
+        assert_eq!(nvenc.fps_den, 1001);
+
+        let pipeline = output.pipeline_config(ModelPrecision::F16, 6);
+        assert_eq!(pipeline.encoder_nv12_pitch, 4096);
+        assert_eq!(pipeline.inference_max_batch, 6);
+        assert_eq!(pipeline.model_precision, ModelPrecision::F16);
+    }
+}

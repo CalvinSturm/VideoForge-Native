@@ -983,8 +983,11 @@ async fn check_e2e_native(
 
 // ─── Argument parsing ────────────────────────────────────────────────────────
 
-fn parse_args() -> SmokeArgs {
-    let mut args = std::env::args().skip(1).peekable();
+fn parse_args_from<I>(args: I) -> SmokeArgs
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter().peekable();
     let mut model = None;
     let mut precision = "fp32".to_string();
     let mut timeout_secs = 60u64;
@@ -1131,6 +1134,10 @@ fn parse_args() -> SmokeArgs {
     }
 }
 
+fn parse_args() -> SmokeArgs {
+    parse_args_from(std::env::args().skip(1))
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1260,7 +1267,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::runtime_truth_lines;
+    use super::{parse_args_from, runtime_truth_lines};
     use app_lib::runtime_truth::{
         RunObservedMetrics, RunStatus, RuntimeConfigSnapshot, RuntimeEngineFamily,
     };
@@ -1286,5 +1293,85 @@ mod tests {
         assert!(lines[0].contains("\"run_id\":\"run-smoke-1\""));
         assert!(lines[0].contains("\"route_id\":\"python_sidecar\""));
         assert!(lines[1].contains("\"status\":\"succeeded\""));
+    }
+
+    #[test]
+    fn parse_args_routes_python_modes_to_nested_structs() {
+        let args = parse_args_from([
+            "--model".to_string(),
+            "RCAN_x4".to_string(),
+            "--precision".to_string(),
+            "fp16".to_string(),
+            "--timeout".to_string(),
+            "42".to_string(),
+            "--shm-roundtrip".to_string(),
+            "--width".to_string(),
+            "16".to_string(),
+            "--height".to_string(),
+            "12".to_string(),
+            "--scale".to_string(),
+            "2".to_string(),
+            "--roundtrip-timeout-ms".to_string(),
+            "1234".to_string(),
+            "--e2e-python".to_string(),
+            "--input".to_string(),
+            "input.mp4".to_string(),
+            "--output".to_string(),
+            "output.mp4".to_string(),
+            "--e2e-model".to_string(),
+            "SPAN_x2".to_string(),
+            "--e2e-scale".to_string(),
+            "3".to_string(),
+            "--timeout-ms".to_string(),
+            "9000".to_string(),
+            "--keep-temp".to_string(),
+        ]);
+
+        assert_eq!(args.python.shared.model.as_deref(), Some("RCAN_x4"));
+        assert_eq!(args.python.shared.precision, "fp16");
+        assert_eq!(args.python.shared.timeout_secs, 42);
+
+        let shm = args.python.shm_roundtrip.expect("shm roundtrip mode");
+        assert_eq!(shm.width, 16);
+        assert_eq!(shm.height, 12);
+        assert_eq!(shm.scale, 2);
+        assert_eq!(shm.roundtrip_timeout_ms, 1234);
+
+        let e2e = args.python.e2e.expect("python e2e mode");
+        assert_eq!(e2e.input.as_deref(), Some("input.mp4"));
+        assert_eq!(e2e.output.as_deref(), Some("output.mp4"));
+        assert_eq!(e2e.model, "SPAN_x2");
+        assert_eq!(e2e.scale, 3);
+        assert_eq!(e2e.timeout_ms, 9000);
+        assert!(e2e.keep_temp);
+    }
+
+    #[cfg(feature = "native_engine")]
+    #[test]
+    fn parse_args_routes_native_modes_to_nested_structs() {
+        let args = parse_args_from([
+            "--e2e-native".to_string(),
+            "--input".to_string(),
+            "clip.mp4".to_string(),
+            "--output".to_string(),
+            "native-out.mp4".to_string(),
+            "--e2e-scale".to_string(),
+            "4".to_string(),
+            "--precision".to_string(),
+            "deterministic".to_string(),
+            "--native-direct".to_string(),
+            "--e2e-onnx".to_string(),
+            "model.onnx".to_string(),
+            "--keep-temp".to_string(),
+        ]);
+
+        let native = args.native.e2e.expect("native e2e mode");
+        assert_eq!(native.input.as_deref(), Some("clip.mp4"));
+        assert_eq!(native.output.as_deref(), Some("native-out.mp4"));
+        assert_eq!(native.model_path.as_deref(), Some("model.onnx"));
+        assert_eq!(native.scale, 4);
+        assert_eq!(native.precision, "deterministic");
+        assert!(native.native_direct);
+        assert!(native.keep_temp);
     }
 }

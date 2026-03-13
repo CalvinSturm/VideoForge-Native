@@ -85,12 +85,17 @@ Validation:
 
 ### Track 2: Decompose InputOutputPanel
 
-Status: in progress (2026-03-13)
+Status: complete (2026-03-13)
 
 - [x] Extract research config types/defaults/presets from `InputOutputPanel.tsx`.
 - [x] Extract model display/helpers and reusable small UI helpers.
-- [ ] Split the panel into smaller component sections with clear ownership.
-- [ ] Keep current UI behavior and visual language unchanged.
+- [x] Extract the research controls into a focused section component. Validation: `cd ui && npx tsc --noEmit` on 2026-03-13.
+- [x] Extract the source input block into a focused section component. Validation: `cd ui && npx tsc --noEmit` on 2026-03-13.
+- [x] Extract the crop/transform geometry controls into a focused section component. Validation: `cd ui && npx tsc --noEmit` on 2026-03-13.
+- [x] Extract the color/fps/output post-processing controls into a focused section component. Validation: `cd ui && npx tsc --noEmit` on 2026-03-13.
+- [x] Extract the footer action controls into a focused section component. Validation: `cd ui && npx tsc --noEmit` on 2026-03-13.
+- [x] Split the panel into smaller component sections with clear ownership. Validation: `cd ui && npx tsc --noEmit` on 2026-03-13.
+- [x] Keep current UI behavior and visual language unchanged. Validation: `cd ui && npx tsc --noEmit` on 2026-03-13 after removing the stale inline fallback block.
 
 Files in scope:
 - `ui/src/components/InputOutputPanel.tsx`
@@ -112,12 +117,12 @@ Validation:
 
 ### Track 3: Refactor Python Upscale Orchestration And Video Pipeline Config
 
-Status: not started
+Status: complete (2026-03-13)
 
-- [ ] Replace broad argument lists in `video_pipeline.rs` with typed config/input structs where practical.
-- [ ] Reduce `too_many_arguments` suppressions in `upscale.rs` and `video_pipeline.rs`.
-- [ ] Separate pipeline config shaping from execution orchestration.
-- [ ] Keep Tauri command surface behavior unchanged.
+- [x] Replace broad argument lists in `video_pipeline.rs` with typed config/input structs where practical. Validation: `cd src-tauri && cargo clippy --workspace --all-targets -- -D warnings` and `cd src-tauri && cargo test --workspace` on 2026-03-13.
+- [x] Reduce `too_many_arguments` suppressions in `upscale.rs` and `video_pipeline.rs`. Validation: `cd src-tauri && cargo clippy --workspace --all-targets -- -D warnings` on 2026-03-13; only the intentional flat Tauri IPC command signature remains suppressed.
+- [x] Separate pipeline config shaping from execution orchestration. Validation: `cd src-tauri && cargo clippy --workspace --all-targets -- -D warnings` and `cd src-tauri && cargo test --workspace` on 2026-03-13.
+- [x] Keep Tauri command surface behavior unchanged. Validation: `cd src-tauri && cargo test --workspace` on 2026-03-13.
 
 Files in scope:
 - `src-tauri/src/commands/upscale.rs`
@@ -139,11 +144,11 @@ Validation:
 
 ### Track 4: Validation And Contract Hardening
 
-Status: not started
+Status: in progress (2026-03-13)
 
-- [ ] Add/update tests around newly extracted native module boundaries.
-- [ ] Add/update tests around smoke-mode parsing structure if needed.
-- [ ] Confirm the maintained validation matrix reflects actual expectations.
+- [x] Add/update tests around newly extracted native module boundaries. Added focused tests for native probe/output shaping and streaming mux helpers on 2026-03-13; native-feature execution remains blocked by an existing `--features native_engine` compile failure outside these new tests.
+- [x] Add/update tests around smoke-mode parsing structure if needed. Added direct smoke argument parsing coverage on 2026-03-13. Validation: `cd src-tauri && cargo test --workspace` on 2026-03-13.
+- [ ] Confirm the maintained validation matrix reflects actual expectations. Default matrix is green on 2026-03-13, but opt-in native-feature validation currently fails to compile before tests run.
 
 Files in scope:
 - extracted Rust modules from Tracks 1 and 3
@@ -162,6 +167,8 @@ Validation:
 - `cd src-tauri && cargo clippy --workspace --all-targets -- -D warnings`
 - `cd src-tauri && cargo test --workspace`
 - `cd ui && npx tsc --noEmit`
+- Optional native-feature follow-up (currently blocked by existing compile errors outside Track 4 changes):
+  - `cd src-tauri && cargo test --features native_engine <targeted test>`
 
 ## 5. Suggested Order
 
@@ -175,8 +182,8 @@ Validation:
 
 - [x] Track 0 complete
 - [x] Track 1 complete
-- [ ] Track 2 complete
-- [ ] Track 3 complete
+- [x] Track 2 complete
+- [x] Track 3 complete
 - [ ] Track 4 complete
 
 ## 7. Working Validation Matrix

@@ -61,19 +61,21 @@ pub struct VideoDecoder {
     pub using_hwaccel: bool,
 }
 
+pub struct VideoDecoderConfig<'a> {
+    pub input: &'a str,
+    pub start: f64,
+    pub duration: f64,
+    pub filter_str: &'a str,
+    pub use_hwaccel: bool,
+}
+
 impl VideoDecoder {
     /// Build the FFmpeg decoder argument list.
     ///
     /// When `hwaccel` is true, prepends `-hwaccel cuda` before the input.
     /// FFmpeg internally transfers NVDEC-decoded GPU frames to system memory
     /// when outputting to a rawvideo pipe (equivalent to `av_hwframe_transfer_data`).
-    fn build_args(
-        input: &str,
-        start: f64,
-        duration: f64,
-        filter_str: &str,
-        hwaccel: bool,
-    ) -> Vec<String> {
+    fn build_args(config: &VideoDecoderConfig<'_>, hwaccel: bool) -> Vec<String> {
         let mut args = vec![
             "-hide_banner".to_string(),
             "-loglevel".to_string(),
@@ -87,24 +89,24 @@ impl VideoDecoder {
         }
 
         // Input seeking (fast seek before -i)
-        if start > 0.0 {
+        if config.start > 0.0 {
             args.push("-ss".to_string());
-            args.push(format!("{:.3}", start));
+            args.push(format!("{:.3}", config.start));
         }
 
         // Duration limit
-        if duration > 0.0 {
+        if config.duration > 0.0 {
             args.push("-t".to_string());
-            args.push(format!("{:.3}", duration));
+            args.push(format!("{:.3}", config.duration));
         }
 
         args.push("-i".to_string());
-        args.push(input.to_string());
+        args.push(config.input.to_string());
 
         // Apply filters if any
-        if !filter_str.is_empty() {
+        if !config.filter_str.is_empty() {
             args.push("-vf".to_string());
-            args.push(filter_str.to_string());
+            args.push(config.filter_str.to_string());
         }
 
         args.extend_from_slice(&[
@@ -132,17 +134,11 @@ impl VideoDecoder {
         Ok((child, reader))
     }
 
-    pub async fn new(
-        input: &str,
-        start: f64,
-        duration: f64,
-        filter_str: &str,
-        use_hwaccel: bool,
-    ) -> Result<Self> {
+    pub async fn new(config: VideoDecoderConfig<'_>) -> Result<Self> {
         // Try NVDEC if requested
-        if use_hwaccel {
-            eprintln!("FFmpeg Decoder Starting (NVDEC): {}", input);
-            let args = Self::build_args(input, start, duration, filter_str, true);
+        if config.use_hwaccel {
+            eprintln!("FFmpeg Decoder Starting (NVDEC): {}", config.input);
+            let args = Self::build_args(&config, true);
             match Self::spawn_decoder(&args) {
                 Ok((child, reader)) => {
                     return Ok(Self {
@@ -162,8 +158,8 @@ impl VideoDecoder {
         }
 
         // Software fallback
-        eprintln!("FFmpeg Decoder Starting (software): {}", input);
-        let args = Self::build_args(input, start, duration, filter_str, false);
+        eprintln!("FFmpeg Decoder Starting (software): {}", config.input);
+        let args = Self::build_args(&config, false);
         let (child, reader) = Self::spawn_decoder(&args)?;
 
         Ok(Self {
@@ -308,28 +304,36 @@ pub struct VideoEncoder {
     pub using_nvenc: bool,
 }
 
+pub struct EncoderAudioInput<'a> {
+    pub source: &'a str,
+    pub start: f64,
+    pub duration: f64,
+}
+
+pub struct VideoEncoderConfig<'a> {
+    pub output: &'a str,
+    pub source_fps: u32,
+    pub target_fps: u32,
+    pub width: usize,
+    pub height: usize,
+    pub audio: Option<EncoderAudioInput<'a>>,
+    pub deterministic: bool,
+}
+
+impl VideoEncoderConfig<'_> {
+    fn resolution(&self) -> String {
+        format!("{}x{}", self.width, self.height)
+    }
+
+    fn is_large(&self) -> bool {
+        self.width > 4096 || self.height > 4096
+    }
+}
+
 impl VideoEncoder {
     #[allow(dead_code)]
-    pub async fn new(
-        output: &str,
-        source_fps: u32,
-        target_fps: u32, // 0 = Keep Source FPS
-        width: usize,
-        height: usize,
-        deterministic: bool,
-    ) -> Result<Self> {
-        Self::new_with_audio(
-            output,
-            source_fps,
-            target_fps,
-            width,
-            height,
-            None,
-            0.0,
-            0.0,
-            deterministic,
-        )
-        .await
+    pub async fn new(config: VideoEncoderConfig<'_>) -> Result<Self> {
+        Self::new_with_audio(config).await
     }
 
     /// Build encoder argument list.
@@ -337,21 +341,9 @@ impl VideoEncoder {
     /// `use_nvenc`: when true, uses h264_nvenc/hevc_nvenc with NVENC-specific
     /// preset/tune flags. When false, uses libx264/libx265 software encoding
     /// with equivalent quality settings.
-    #[allow(clippy::too_many_arguments)] // TODO(clippy): keep flat args to avoid broad pipeline refactor in hygiene pass.
-    fn build_encoder_args(
-        output: &str,
-        source_fps: u32,
-        target_fps: u32,
-        width: usize,
-        height: usize,
-        audio_source: Option<&str>,
-        audio_start: f64,
-        audio_duration: f64,
-        use_nvenc: bool,
-        deterministic: bool,
-    ) -> Vec<String> {
-        let resolution = format!("{}x{}", width, height);
-        let is_large = width > 4096 || height > 4096;
+    fn build_encoder_args(config: &VideoEncoderConfig<'_>, use_nvenc: bool) -> Vec<String> {
+        let resolution = config.resolution();
+        let is_large = config.is_large();
 
         let mut args = vec![
             "-y".to_string(),
@@ -365,23 +357,23 @@ impl VideoEncoder {
             "-s".to_string(),
             resolution,
             "-r".to_string(),
-            source_fps.to_string(),
+            config.source_fps.to_string(),
             "-i".to_string(),
             "-".to_string(),
         ];
 
         // Add original file as second input for audio stream
-        if let Some(audio_src) = audio_source {
-            if audio_start > 0.0 {
+        if let Some(audio) = &config.audio {
+            if audio.start > 0.0 {
                 args.push("-ss".to_string());
-                args.push(format!("{:.3}", audio_start));
+                args.push(format!("{:.3}", audio.start));
             }
-            if audio_duration > 0.0 {
+            if audio.duration > 0.0 {
                 args.push("-t".to_string());
-                args.push(format!("{:.3}", audio_duration));
+                args.push(format!("{:.3}", audio.duration));
             }
             args.push("-i".to_string());
-            args.push(audio_src.to_string());
+            args.push(audio.source.to_string());
             args.push("-map".to_string());
             args.push("0:v".to_string());
             args.push("-map".to_string());
@@ -390,10 +382,10 @@ impl VideoEncoder {
 
         // --- FILTER CHAIN CONSTRUCTION ---
         let mut filters = Vec::new();
-        if target_fps > 0 && target_fps != source_fps {
+        if config.target_fps > 0 && config.target_fps != config.source_fps {
             filters.push(format!(
                 "minterpolate=fps={}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1",
-                target_fps
+                config.target_fps
             ));
         }
 
@@ -416,7 +408,7 @@ impl VideoEncoder {
                 "yuv420p".to_string(),
             ]);
 
-            if deterministic {
+            if config.deterministic {
                 // Deterministic: Fixed GOP 60, Const QP 18
                 args.extend_from_slice(&[
                     "-g".to_string(),
@@ -453,7 +445,7 @@ impl VideoEncoder {
                 "yuv420p".to_string(),
             ]);
 
-            if deterministic {
+            if config.deterministic {
                 args.extend_from_slice(&[
                     "-g".to_string(),
                     "60".to_string(),
@@ -477,7 +469,7 @@ impl VideoEncoder {
         }
 
         // Copy audio stream if present (no re-encode)
-        if audio_source.is_some() {
+        if config.audio.is_some() {
             args.extend_from_slice(&["-c:a".to_string(), "copy".to_string()]);
         }
 
@@ -485,7 +477,7 @@ impl VideoEncoder {
         args.extend_from_slice(&[
             "-movflags".to_string(),
             "+faststart".to_string(),
-            output.to_string(),
+            config.output.to_string(),
         ]);
 
         args
@@ -506,43 +498,21 @@ impl VideoEncoder {
 
     /// Create encoder with optional audio source from the original input file.
     /// Tries NVENC first (if available), falls back to libx264/libx265 software.
-    #[allow(clippy::too_many_arguments)] // TODO(clippy): constructor mirrors encode pipeline inputs; refactor can be done separately.
-    pub async fn new_with_audio(
-        output: &str,
-        source_fps: u32,
-        target_fps: u32,
-        width: usize,
-        height: usize,
-        audio_source: Option<&str>,
-        audio_start: f64,
-        audio_duration: f64,
-        deterministic: bool,
-    ) -> Result<Self> {
+    pub async fn new_with_audio(config: VideoEncoderConfig<'_>) -> Result<Self> {
         let nvenc_available = probe_nvenc();
 
         // Try NVENC first
         if nvenc_available {
-            let codec_label = if width > 4096 || height > 4096 {
+            let codec_label = if config.is_large() {
                 "hevc_nvenc"
             } else {
                 "h264_nvenc"
             };
             eprintln!(
                 "FFmpeg Encoder Starting (NVENC): {}x{} -> {} ({})",
-                width, height, output, codec_label
+                config.width, config.height, config.output, codec_label
             );
-            let args = Self::build_encoder_args(
-                output,
-                source_fps,
-                target_fps,
-                width,
-                height,
-                audio_source,
-                audio_start,
-                audio_duration,
-                true,
-                deterministic,
-            );
+            let args = Self::build_encoder_args(&config, true);
             match Self::spawn_encoder(&args) {
                 Ok((child, stdin)) => {
                     return Ok(Self {
@@ -561,27 +531,16 @@ impl VideoEncoder {
         }
 
         // Software fallback
-        let codec_label = if width > 4096 || height > 4096 {
+        let codec_label = if config.is_large() {
             "libx265"
         } else {
             "libx264"
         };
         eprintln!(
             "FFmpeg Encoder Starting (software): {}x{} -> {} ({})",
-            width, height, output, codec_label
+            config.width, config.height, config.output, codec_label
         );
-        let args = Self::build_encoder_args(
-            output,
-            source_fps,
-            target_fps,
-            width,
-            height,
-            audio_source,
-            audio_start,
-            audio_duration,
-            false,
-            deterministic,
-        );
+        let args = Self::build_encoder_args(&config, false);
         let (child, stdin) = Self::spawn_encoder(&args)?;
 
         Ok(Self {

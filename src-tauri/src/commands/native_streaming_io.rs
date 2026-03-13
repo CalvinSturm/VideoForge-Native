@@ -382,3 +382,43 @@ impl videoforge_engine::codecs::nvenc::BitstreamSink for StreamingMuxSink {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "native_engine"))]
+mod tests {
+    use super::{pick_streaming_mux_format, SharedStderrTail, StreamingCodecHint};
+
+    #[test]
+    fn codec_hint_roundtrips_latest_value() {
+        let hint = StreamingCodecHint::new(None);
+        assert_eq!(hint.get(), None);
+
+        hint.set("h264");
+        assert_eq!(hint.get(), Some("h264"));
+
+        hint.set("hevc");
+        assert_eq!(hint.get(), Some("hevc"));
+    }
+
+    #[test]
+    fn picks_h264_and_hevc_from_annex_b_packets() {
+        let h264_packet = [0x00, 0x00, 0x00, 0x01, 0x65, 0x88];
+        let hevc_packet = [0x00, 0x00, 0x00, 0x01, 0x40, 0x01];
+
+        assert_eq!(pick_streaming_mux_format(&h264_packet), "h264");
+        assert_eq!(pick_streaming_mux_format(&hevc_packet), "hevc");
+    }
+
+    #[test]
+    fn stderr_tail_keeps_latest_lines_bounded() {
+        let tail = SharedStderrTail::new();
+        for i in 0..20 {
+            tail.push(format!("line-{i}"));
+        }
+
+        let snapshot = tail.snapshot();
+        assert!(!snapshot.contains("line-0"));
+        assert!(snapshot.contains("line-8"));
+        assert!(snapshot.contains("line-19"));
+        assert_eq!(snapshot.lines().count(), 12);
+    }
+}
