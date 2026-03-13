@@ -22,7 +22,9 @@ use crate::commands::native_streaming_io::{
 use crate::runtime_truth::{log_run_observed_metrics, RunStatus};
 
 #[cfg(feature = "native_engine")]
-use super::{classify_backend_init_error, NativeUpscaleError, NativeUpscaleResult};
+use crate::commands::native_engine::{
+    classify_backend_init_error, NativeUpscaleError, NativeUpscaleResult,
+};
 
 #[cfg(feature = "native_engine")]
 pub(crate) async fn run_native_pipeline(

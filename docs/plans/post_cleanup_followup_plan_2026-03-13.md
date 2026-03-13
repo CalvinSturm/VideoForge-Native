@@ -144,11 +144,11 @@ Validation:
 
 ### Track 4: Validation And Contract Hardening
 
-Status: in progress (2026-03-13)
+Status: complete (2026-03-13)
 
-- [x] Add/update tests around newly extracted native module boundaries. Added focused tests for native probe/output shaping and streaming mux helpers on 2026-03-13; native-feature execution remains blocked by an existing `--features native_engine` compile failure outside these new tests.
+- [x] Add/update tests around newly extracted native module boundaries. Added focused tests for native probe/output shaping and streaming mux helpers on 2026-03-13. Validation: `cd src-tauri && cargo test --features native_engine --lib` on 2026-03-13.
 - [x] Add/update tests around smoke-mode parsing structure if needed. Added direct smoke argument parsing coverage on 2026-03-13. Validation: `cd src-tauri && cargo test --workspace` on 2026-03-13.
-- [ ] Confirm the maintained validation matrix reflects actual expectations. Default matrix is green on 2026-03-13, but opt-in native-feature validation currently fails to compile before tests run.
+- [x] Confirm the maintained validation matrix reflects actual expectations. Default matrix is green on 2026-03-13, and the opt-in native-feature library test pass now compiles and runs on 2026-03-13.
 
 Files in scope:
 - extracted Rust modules from Tracks 1 and 3
@@ -167,8 +167,8 @@ Validation:
 - `cd src-tauri && cargo clippy --workspace --all-targets -- -D warnings`
 - `cd src-tauri && cargo test --workspace`
 - `cd ui && npx tsc --noEmit`
-- Optional native-feature follow-up (currently blocked by existing compile errors outside Track 4 changes):
-  - `cd src-tauri && cargo test --features native_engine <targeted test>`
+- Optional native-feature follow-up:
+  - `cd src-tauri && cargo test --features native_engine --lib`
 
 ## 5. Suggested Order
 
@@ -184,7 +184,7 @@ Validation:
 - [x] Track 1 complete
 - [x] Track 2 complete
 - [x] Track 3 complete
-- [ ] Track 4 complete
+- [x] Track 4 complete
 
 ## 7. Working Validation Matrix
 

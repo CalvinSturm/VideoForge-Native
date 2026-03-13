@@ -10,9 +10,9 @@ use crate::runtime_truth::{
 };
 
 #[cfg(feature = "native_engine")]
-use super::{
-    native_engine_direct_enabled, native_engine_runtime_enabled, NativePerfReport,
-    NativeUpscaleError, NativeUpscaleResult,
+use crate::commands::native_engine::{
+    native_engine_direct_enabled, native_engine_runtime_enabled, native_temp_token,
+    NativePerfReport, NativeUpscaleError, NativeUpscaleResult,
 };
 #[cfg(feature = "native_engine")]
 use crate::commands::native_direct_pipeline::run_native_pipeline;
@@ -216,7 +216,7 @@ impl NativeJobSpec {
             .parent()
             .unwrap_or(Path::new("."))
             .to_path_buf();
-        let file_name = format!("{}_{}_native_upscaled.mp4", stem, super::native_temp_token());
+        let file_name = format!("{}_{}_native_upscaled.mp4", stem, native_temp_token());
         dir.join(file_name).to_string_lossy().to_string()
     }
 
@@ -414,7 +414,9 @@ pub(crate) fn build_native_observed_metrics(
         metrics.error_code = Some(error.code.clone());
         metrics.error_message = Some(error.message.clone());
     }
-    if let Some(native_metrics) = native_metrics.filter(|m| !m.is_empty()) {
+    if let Some(native_metrics) =
+        native_metrics.filter(|m: &NativeRuntimeMetricsExtension| !m.is_empty())
+    {
         metrics.extensions = RuntimeMetricsExtensions {
             python: None,
             native: Some(native_metrics),

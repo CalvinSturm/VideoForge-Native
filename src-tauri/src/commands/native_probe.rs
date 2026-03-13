@@ -6,7 +6,7 @@ use crate::commands::native_routing::{NativeJobSpec, NativeOutputPathStyle};
 use crate::commands::native_streaming_io::StreamingCodecHint;
 
 #[cfg(feature = "native_engine")]
-use super::NativeUpscaleError;
+use crate::commands::native_engine::NativeUpscaleError;
 
 #[cfg(feature = "native_engine")]
 fn probe_video_coded_geometry(

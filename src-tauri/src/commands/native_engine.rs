@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NATIVE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "native_engine")]
-fn native_temp_token() -> String {
+pub(crate) fn native_temp_token() -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -107,7 +107,7 @@ pub struct NativeUpscaleError {
 }
 
 impl NativeUpscaleError {
-    fn new(code: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &str, message: impl Into<String>) -> Self {
         Self {
             code: code.to_string(),
             message: message.into(),
@@ -578,7 +578,7 @@ mod tests {
 }
 
 #[cfg(feature = "native_engine")]
-fn classify_backend_init_error(model_path: &str, err: &str) -> String {
+pub(crate) fn classify_backend_init_error(model_path: &str, err: &str) -> String {
     if err.contains("Load model from")
         && err.contains("Type Error:")
         && (err.contains("tensor(float16)") || err.contains("tensor(float)"))

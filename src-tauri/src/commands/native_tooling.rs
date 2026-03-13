@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "native_engine")]
-use super::{upscale_request_native, NativeUpscaleResult};
+use crate::commands::native_engine::{upscale_request_native, NativeUpscaleResult};
 
 #[cfg(feature = "native_engine")]
 #[derive(Debug, Clone, Default)]
