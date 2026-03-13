@@ -4,9 +4,7 @@ import type { Job } from "../types";
 
 interface JobsPanelProps {
   jobs: Job[];
-  pauseJob: (id: string) => void;
   cancelJob: (id: string) => void;
-  resumeJob: (id: string) => void;
   clearCompleted: () => void;
   showTech: boolean;
 }
@@ -145,7 +143,6 @@ const StatusBadge: React.FC<{ status: string }> = ({ status }) => {
     error: { bg: 'rgba(239,68,68,0.1)', color: '#ef4444', border: 'rgba(239,68,68,0.3)', label: 'FAILED' },
     cancelled: { bg: 'rgba(234,179,8,0.1)', color: '#eab308', border: 'rgba(234,179,8,0.3)', label: 'CANCELLED' },
     running: { bg: 'rgba(0,255,136,0.1)', color: 'var(--brand-primary)', border: 'rgba(0,255,136,0.3)', label: 'RUNNING' },
-    paused: { bg: 'rgba(168,85,247,0.1)', color: '#a855f7', border: 'rgba(168,85,247,0.3)', label: 'PAUSED' },
     queued: { bg: 'rgba(59,130,246,0.1)', color: '#3b82f6', border: 'rgba(59,130,246,0.3)', label: 'QUEUED' }
   };
 

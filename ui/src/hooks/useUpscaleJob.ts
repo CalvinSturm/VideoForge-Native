@@ -72,7 +72,7 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
             id: jobId,
             command: `Upscale: ${video.inputPath.split(/[/\\]/).pop()}`,
             status: "running", progress: 0, statusMessage: "Initializing...",
-            paused: false, eta: 0, startedAt: Date.now()
+            eta: 0, startedAt: Date.now()
         };
         setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
         if (!panels.QUEUE) openPanel('QUEUE');
@@ -223,7 +223,7 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
             id: jobId,
             command: `Transcode: ${video.inputPath.split(/[/\\]/).pop()}`,
             status: "running", progress: 0, statusMessage: "Encoding...",
-            paused: false, eta: 0, startedAt: Date.now()
+            eta: 0, startedAt: Date.now()
         };
         setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
         if (!panels.QUEUE) openPanel('QUEUE');
@@ -261,7 +261,7 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
         const newJob: Job = {
             id: jobId, command: "Validate: production_strict (mock)",
             status: "running", progress: 0, statusMessage: "Validating strict policy...",
-            paused: false, eta: 0, startedAt: Date.now()
+            eta: 0, startedAt: Date.now()
         };
         setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
         if (!panels.QUEUE) openPanel('QUEUE');
@@ -317,7 +317,7 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
         const newJob: Job = {
             id: jobId, command: `PREVIEW SAMPLE`,
             status: "running", progress: 0, statusMessage: "Rendering...",
-            paused: false, eta: 0, startedAt: Date.now()
+            eta: 0, startedAt: Date.now()
         };
         setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
 
@@ -349,14 +349,14 @@ export function useUpscaleJob(opts: UseUpscaleJobOptions) {
     // ── Job management ───────────────────────────────────────────────────────
 
     const clearCompletedJobs = useCallback(() => {
-        setJobs(prev => prev.filter(j => j.status === 'running' || j.status === 'queued' || j.status === 'paused'));
+        setJobs(prev => prev.filter(j => j.status === 'running' || j.status === 'queued'));
     }, [setJobs]);
 
     const handleCancelJob = useCallback(async (id: string) => {
         const job = jobs.find(j => j.id === id);
         if (!job) return;
 
-        if (job.status === 'running' || job.status === 'paused') {
+        if (job.status === 'running') {
             try {
                 setJobs(prev => prev.map(j => j.id === id ? { ...j, status: 'cancelled' as const, progress: 0, eta: 0, completedAt: Date.now() } : j));
                 setLogs(prev => [...prev, `[SYSTEM] Job ${id} cancelled by user.`]);

@@ -492,7 +492,7 @@ const App: React.FC = () => {
     }
 
     const jobId = Date.now().toString();
-    const newJob: Job = { id: jobId, command: `Upscale: ${inputPath.split(/[\\/]/).pop()}`, status: "running", progress: 0, statusMessage: "Initializing...", paused: false, eta: 0, startedAt: Date.now() };
+    const newJob: Job = { id: jobId, command: `Upscale: ${inputPath.split(/[\\/]/).pop()}`, status: "running", progress: 0, statusMessage: "Initializing...", eta: 0, startedAt: Date.now() };
     setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
     if (!panels.QUEUE) openPanel('QUEUE');
 
@@ -661,7 +661,7 @@ const App: React.FC = () => {
   const onExportEdited = async () => {
     if (!inputPath) return addToast("Select input first!", "error");
     const jobId = Date.now().toString();
-    const newJob: Job = { id: jobId, command: `Transcode: ${inputPath.split(/[\\/]/).pop()}`, status: "running", progress: 0, statusMessage: "Encoding...", paused: false, eta: 0, startedAt: Date.now() };
+    const newJob: Job = { id: jobId, command: `Transcode: ${inputPath.split(/[\\/]/).pop()}`, status: "running", progress: 0, statusMessage: "Encoding...", eta: 0, startedAt: Date.now() };
     setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
     if (!panels.QUEUE) openPanel('QUEUE');
 
@@ -700,7 +700,6 @@ const App: React.FC = () => {
       status: "running",
       progress: 0,
       statusMessage: "Validating strict policy...",
-      paused: false,
       eta: 0,
       startedAt: Date.now()
     };
@@ -765,7 +764,7 @@ const App: React.FC = () => {
     const previewConfig = { ...getRustEditConfig(), trim_start: start, trim_end: end };
     let activeScale = upscaleConfig.scaleFactor || getScaleFromModel(model);
     const jobId = "preview_" + Date.now().toString().slice(-6);
-    const newJob: Job = { id: jobId, command: `PREVIEW SAMPLE`, status: "running", progress: 0, statusMessage: "Rendering...", paused: false, eta: 0, startedAt: Date.now() };
+    const newJob: Job = { id: jobId, command: `PREVIEW SAMPLE`, status: "running", progress: 0, statusMessage: "Rendering...", eta: 0, startedAt: Date.now() };
     setJobs(prev => [...prev, newJob]); setActiveJob(newJob); setIsProcessing(true);
 
     // Build comprehensive preview payload with all new fields
@@ -810,7 +809,7 @@ const App: React.FC = () => {
 
   // --- POLISH: Clear Completed Logic ---
   const clearCompletedJobs = () => {
-    setJobs(prev => prev.filter(j => j.status === 'running' || j.status === 'queued' || j.status === 'paused'));
+    setJobs(prev => prev.filter(j => j.status === 'running' || j.status === 'queued'));
   };
 
   // --- Cancel / Dismiss Job Logic ---
@@ -818,11 +817,9 @@ const App: React.FC = () => {
     const job = jobs.find(j => j.id === id);
     if (!job) return;
 
-    if (job.status === 'running' || job.status === 'paused') {
+    if (job.status === 'running') {
       try {
-        // Assume backend has a cancellation command, or just mark as cancelled in UI if backend is fire-and-forget
-        // For now, we'll mark as cancelled. If backend support exists, invoke it here.
-        // await invoke('cancel_job', { jobId: id }); 
+        // Current UI supports dismissing running jobs locally; there is no backend pause/resume contract.
         setJobs(prev => prev.map(j => j.id === id ? { ...j, status: 'cancelled', progress: 0, eta: 0, completedAt: Date.now() } : j));
         setLogs(prev => [...prev, `[SYSTEM] Job ${id} cancelled by user.`]);
         if (activeJob?.id === id) setActiveJob(null);
@@ -845,7 +842,7 @@ const App: React.FC = () => {
       SETTINGS: <InputOutputPanel mode={mode} setMode={setMode} pickInput={pickInput} inputPath={inputPath} pickOutput={pickOutput} outputPath={outputPath} model={model} setModel={setModel} availableModels={availableModels} loadingModel={loadingModel} loadModel={() => { }} startUpscale={startUpscale} onRunValidate={startRaveValidate} isValidPaths={isValidPaths} showTech={showTechSpecs} showResearchParams={showResearchParams} videoState={completeVideoState} editState={editState} setEditState={setEditState} onExportEdited={onExportEdited} viewMode={viewMode} setViewMode={setViewMode} />,
       PREVIEW: <PreviewPanel inputPreview={inputPath} activeJob={activeJob} videoState={completeVideoState} onFileDrop={handleNewInput} mode={mode} editState={editState} setEditState={setEditState} viewMode={viewMode} setViewMode={setViewMode} showTech={showTechSpecs} />,
       // Updated to pass clearCompleted
-      QUEUE: <JobsPanel jobs={jobs} pauseJob={() => { }} cancelJob={handleCancelJob} resumeJob={() => { }} clearCompleted={clearCompletedJobs} showTech={showTechSpecs} />,
+      QUEUE: <JobsPanel jobs={jobs} cancelJob={handleCancelJob} clearCompleted={clearCompletedJobs} showTech={showTechSpecs} />,
       ACTIVITY: <LogsPanel logs={logs} setLogs={setLogs} darkMode={darkMode} logsEndRef={logsEndRef} />
     };
   }, [mode, inputPath, outputPath, model, availableModels, loadingModel, isValidPaths, showTechSpecs, showResearchParams, videoState, editState, viewMode, jobs, activeJob, logs, upscaleConfig, modelInfoMap]);

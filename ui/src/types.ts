@@ -1,5 +1,5 @@
 export type UpscaleMode = "image" | "batch" | "video";
-export type JobStatus = "queued" | "running" | "paused" | "done" | "cancelled" | "error";
+export type JobStatus = "queued" | "running" | "done" | "cancelled" | "error";
 
 export interface RavePolicy {
   profile?: string;
@@ -61,7 +61,6 @@ export interface Job {
   progress: number; // Percentage 0-100
   totalFrames?: number;
   statusMessage: string;
-  paused: boolean;
   errorMessage?: string;
   errorCategory?: string;
   errorHint?: string;

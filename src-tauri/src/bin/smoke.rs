@@ -143,6 +143,62 @@ fn check_python_env() -> Option<(String, String)> {
     }
 }
 
+fn runtime_truth_lines(
+    runtime_snapshot: &app_lib::runtime_truth::RuntimeConfigSnapshot,
+    observed_metrics: Option<&app_lib::runtime_truth::RunObservedMetrics>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Ok(snapshot_json) = serde_json::to_string(runtime_snapshot) {
+        lines.push(format!("  → runtime_snapshot: {snapshot_json}"));
+    }
+    if let Some(metrics) = observed_metrics {
+        if let Ok(metrics_json) = serde_json::to_string(metrics) {
+            lines.push(format!("  → observed_metrics: {metrics_json}"));
+        }
+    }
+    lines
+}
+
+fn print_runtime_truth(
+    runtime_snapshot: &app_lib::runtime_truth::RuntimeConfigSnapshot,
+    observed_metrics: Option<&app_lib::runtime_truth::RunObservedMetrics>,
+) {
+    for line in runtime_truth_lines(runtime_snapshot, observed_metrics) {
+        println!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::runtime_truth_lines;
+    use app_lib::runtime_truth::{
+        RunObservedMetrics, RunStatus, RuntimeConfigSnapshot, RuntimeEngineFamily,
+    };
+
+    #[test]
+    fn runtime_truth_lines_embed_runtime_owned_snapshot_and_metrics() {
+        let snapshot = RuntimeConfigSnapshot::new(
+            "run-smoke-1",
+            "python_sidecar",
+            RuntimeEngineFamily::Python,
+            "in.mp4",
+            "out.mp4",
+        );
+        let metrics = RunObservedMetrics::new(
+            "run-smoke-1",
+            "python_sidecar",
+            RunStatus::Succeeded,
+        );
+
+        let lines = runtime_truth_lines(&snapshot, Some(&metrics));
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"run_id\":\"run-smoke-1\""));
+        assert!(lines[0].contains("\"route_id\":\"python_sidecar\""));
+        assert!(lines[1].contains("\"status\":\"succeeded\""));
+    }
+}
+
 // ─── ffprobe helpers ─────────────────────────────────────────────────────────
 
 /// Returns (width, height) of first video stream or None on failure.
@@ -712,6 +768,7 @@ async fn check_e2e_python(
         Ok(Ok(r)) => r,
     };
     check("Job completed", true, "");
+    print_runtime_truth(&report.runtime_snapshot, report.observed_metrics.as_ref());
     let actual_out = &report.output_path;
 
     // E) Validate output
@@ -839,6 +896,9 @@ async fn check_e2e_native(
     );
     for line in summary_lines.iter().skip(1) {
         println!("  → {line}");
+    }
+    if let Some(snapshot) = &report.runtime_snapshot {
+        print_runtime_truth(snapshot, report.observed_metrics.as_ref());
     }
     let actual_out = &report.output_path;
 

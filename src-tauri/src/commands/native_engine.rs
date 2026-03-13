@@ -1,32 +1,48 @@
-//! Native engine MVP — GPU-resident upscaling via engine-v2.
+//! App-facing native video command surface.
 //!
-//! This command is gated behind the `native_engine` Cargo feature.
-//! When the feature is **disabled** (the default), the command returns a
-//! structured `FEATURE_DISABLED` error immediately.
+//! This module owns the native-family control plane exposed through
+//! `upscale_request_native(...)`:
+//! - runtime path discovery for FFmpeg/ffprobe/TensorRT dependencies
+//! - compile-time and runtime gating
+//! - direct-vs-CLI executor selection
+//! - shared native result and perf contracts
+//! - selected direct-to-CLI fallback policy
 //!
-//! When the feature is **enabled** and runtime-gated, the pipeline is:
+//! Compile-time/runtime gates:
+//! - when the `native_engine` Cargo feature is disabled, the command returns
+//!   a structured `FEATURE_DISABLED` error
+//! - `VIDEOFORGE_ENABLE_NATIVE_ENGINE=1` is required before the native family
+//!   will execute
+//! - `VIDEOFORGE_NATIVE_ENGINE_DIRECT=1` requests the in-process direct route
+//! - without the direct flag, the native command uses the CLI-backed route
+//!
+//! Native-family routes:
 //! ```text
-//! FFmpeg demux → Annex B elementary stream (.h264/.hevc temp file)
-//!      ↓
-//! engine-v2 NVDEC → TensorRT → NVENC → FFmpeg mux stdin
-//!      ↓
-//! final .mp4 (+ optional copied audio from original input)
+//! direct route:
+//!   FFmpeg demux stdout -> Annex B elementary stream -> engine-v2
+//!   NVDEC -> preprocess -> TensorRT/ORT -> postprocess -> NVENC
+//!   -> FFmpeg mux stdin -> final .mp4
+//!
+//! CLI-backed route:
+//!   upscale_request_native -> rave subprocess adapter -> final output
 //! ```
 //!
-//! Runtime routing:
-//!
-//! - `VIDEOFORGE_ENABLE_NATIVE_ENGINE=1` is required before the command runs.
-//! - `VIDEOFORGE_NATIVE_ENGINE_DIRECT=1` routes into the true in-process path.
-//! - without the direct flag, the native command stays on the CLI-backed path.
-//!
-//! This file owns the app-facing runtime gating, FFmpeg file-boundary steps,
-//! and the opt-in engine-v2 direct path.
+//! The direct route is streamed at the FFmpeg boundaries in the current
+//! implementation; this module no longer relies on the older temp elementary
+//! stream handoff described in prior docs.
 
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use crate::runtime_truth::{RunObservedMetrics, RuntimeConfigSnapshot};
 #[cfg(feature = "native_engine")]
 use std::collections::VecDeque;
+#[cfg(feature = "native_engine")]
+use crate::runtime_truth::{
+    log_run_observed_metrics, log_runtime_config_snapshot, NativeRuntimeConfigExtension,
+    NativeRuntimeMetricsExtension, RunStatus, RuntimeConfigExtensions, RuntimeEngineFamily,
+    RuntimeFallbackInfo, RuntimeMetricsExtensions, RuntimeSnapshotKind,
+};
 #[cfg(feature = "native_engine")]
 use std::sync::Arc;
 #[cfg(feature = "native_engine")]
@@ -431,6 +447,10 @@ pub struct NativeUpscaleResult {
     pub encoder_mode: String,
     pub encoder_detail: Option<String>,
     pub audio_preserved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_snapshot: Option<RuntimeConfigSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_metrics: Option<RunObservedMetrics>,
     #[serde(flatten)]
     pub perf: NativePerfReport,
 }
@@ -844,6 +864,22 @@ pub fn native_result_summary_json(report: &NativeUpscaleResult) -> serde_json::M
             .map(Value::String)
             .unwrap_or(Value::Null),
     );
+    map.insert(
+        "runtime_snapshot".to_string(),
+        report
+            .runtime_snapshot
+            .as_ref()
+            .map(|snapshot| serde_json::to_value(snapshot).unwrap_or(Value::Null))
+            .unwrap_or(Value::Null),
+    );
+    map.insert(
+        "observed_metrics".to_string(),
+        report
+            .observed_metrics
+            .as_ref()
+            .map(|metrics| serde_json::to_value(metrics).unwrap_or(Value::Null))
+            .unwrap_or(Value::Null),
+    );
     map
 }
 
@@ -957,13 +993,22 @@ pub fn native_smoke_success_lines(report: &NativeUpscaleResult) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "native_engine")]
     use super::{
-        default_native_tool_trt_cache_dir, native_benchmark_done_json,
-        native_smoke_success_lines, native_tool_run_banner, NativePerfReport,
-        NativeRuntimeOverrides, NativeToolRunRequest, NativeUpscaleResult,
-        NativeVideoOutputProfile, NativeVideoSourceProfile,
+        build_native_observed_metrics, build_native_runtime_snapshot,
+        default_native_tool_trt_cache_dir,
+        native_benchmark_done_json, native_result_summary_json, native_smoke_success_lines,
+        native_tool_run_banner,
+        NativeExecutionRoute, NativeJobSpec, NativePerfReport, NativeRuntimeOverrides,
+        NativeToolRunRequest,
+        NativeUpscaleError, NativeUpscaleResult, NativeVideoOutputProfile,
+        NativeVideoSourceProfile,
     };
-    use std::path::PathBuf;
+    #[cfg(feature = "native_engine")]
+    use crate::runtime_truth::{
+        RunObservedMetrics, RunStatus, RuntimeConfigSnapshot, RuntimeEngineFamily,
+        RUNTIME_CONFIG_SNAPSHOT_SCHEMA_V1, RUN_OBSERVED_METRICS_SCHEMA_V1,
+    };
     use std::sync::{Mutex, OnceLock};
 
     fn env_test_lock() -> &'static Mutex<()> {
@@ -987,7 +1032,7 @@ mod tests {
         {
             #[cfg(feature = "native_engine")]
             let _runtime = NativeRuntimeOverrides::native_command(true)
-                .with_trt_cache(true, Some(PathBuf::from("cache-dir")))
+                .with_trt_cache(true, Some(std::path::PathBuf::from("cache-dir")))
                 .apply();
 
             assert_eq!(
@@ -1042,7 +1087,7 @@ mod tests {
             .with_output_path("out.mp4")
             .with_max_batch(Some(4))
             .with_native_direct(true)
-            .with_trt_cache_dir(Some(PathBuf::from("cache-dir")));
+            .with_trt_cache_dir(Some(std::path::PathBuf::from("cache-dir")));
 
         {
             let _runtime = req.runtime_overrides().apply();
@@ -1117,6 +1162,8 @@ mod tests {
             encoder_mode: "nvenc".to_string(),
             encoder_detail: None,
             audio_preserved: true,
+            runtime_snapshot: None,
+            observed_metrics: None,
             perf: NativePerfReport {
                 requested_executor: Some("direct".to_string()),
                 executed_executor: Some("direct".to_string()),
@@ -1151,6 +1198,61 @@ mod tests {
         assert_eq!(payload["warmup_runs"], 2);
         assert_eq!(payload["elapsed_ms"], 999);
         assert_eq!(payload["output"], "out.mp4");
+        assert!(payload["runtime_snapshot"].is_null());
+        assert!(payload["observed_metrics"].is_null());
+    }
+
+    #[cfg(feature = "native_engine")]
+    #[test]
+    fn native_result_summary_json_embeds_runtime_truth_objects() {
+        let runtime_snapshot = RuntimeConfigSnapshot::new(
+            "run-1",
+            "native_direct",
+            RuntimeEngineFamily::Native,
+            "in.mp4",
+            "out.mp4",
+        );
+        let observed_metrics =
+            RunObservedMetrics::new("run-1", "native_direct", RunStatus::Succeeded);
+        let report = NativeUpscaleResult {
+            output_path: "out.mp4".to_string(),
+            engine: "native_direct".to_string(),
+            encoder_mode: "nvenc".to_string(),
+            encoder_detail: None,
+            audio_preserved: true,
+            runtime_snapshot: Some(runtime_snapshot),
+            observed_metrics: Some(observed_metrics),
+            perf: NativePerfReport {
+                requested_executor: Some("direct".to_string()),
+                executed_executor: Some("direct".to_string()),
+                direct_attempted: true,
+                fallback_used: false,
+                fallback_reason_code: None,
+                fallback_reason_message: None,
+                frames_processed: 10,
+                effective_max_batch: 1,
+                trt_cache_enabled: false,
+                trt_cache_dir: None,
+                total_elapsed_ms: Some(42),
+                frames_decoded: Some(10),
+                frames_preprocessed: None,
+                frames_inferred: Some(10),
+                frames_encoded: Some(10),
+                preprocess_avg_us: None,
+                inference_frame_avg_us: None,
+                inference_dispatch_avg_us: None,
+                postprocess_frame_avg_us: None,
+                postprocess_dispatch_avg_us: None,
+                encode_avg_us: None,
+                vram_current_mb: None,
+                vram_peak_mb: None,
+            },
+        };
+
+        let payload = native_result_summary_json(&report);
+        assert_eq!(payload["runtime_snapshot"]["run_id"], "run-1");
+        assert_eq!(payload["observed_metrics"]["route_id"], "native_direct");
+        assert_eq!(payload["observed_metrics"]["status"], "succeeded");
     }
 
     #[cfg(feature = "native_engine")]
@@ -1169,6 +1271,8 @@ mod tests {
             encoder_mode: "nvenc".to_string(),
             encoder_detail: Some("h264".to_string()),
             audio_preserved: true,
+            runtime_snapshot: None,
+            observed_metrics: None,
             perf: NativePerfReport {
                 frames_processed: 10,
                 effective_max_batch: 1,
@@ -1199,6 +1303,127 @@ mod tests {
         assert_eq!(lines[0], "frames=10 encoder_mode=nvenc encoder_detail=h264");
         assert!(lines.iter().any(|line| line == "encoder_mode=nvenc"));
         assert!(lines.iter().any(|line| line == "encoder_detail=h264"));
+    }
+
+    #[cfg(feature = "native_engine")]
+    #[test]
+    fn native_runtime_snapshot_serializes_direct_route_fields() {
+        let job = NativeJobSpec {
+            run_id: "run-321".to_string(),
+            input_path: "in.mp4".to_string(),
+            requested_output_path: "explicit.mp4".to_string(),
+            model_path: "model.onnx".to_string(),
+            scale: 4,
+            precision: "fp16".to_string(),
+            preserve_audio: false,
+            max_batch: 2,
+            trt_cache_enabled: true,
+            trt_cache_dir: Some("cache-dir".to_string()),
+        };
+        let snapshot = build_native_runtime_snapshot(&job, &NativeExecutionRoute::direct());
+        let value = serde_json::to_value(&snapshot).expect("serialize direct native snapshot");
+
+        assert_eq!(value["schema_version"], RUNTIME_CONFIG_SNAPSHOT_SCHEMA_V1);
+        assert_eq!(value["snapshot_kind"], "run_start");
+        assert_eq!(value["run_id"], "run-321");
+        assert_eq!(value["route_id"], "native_direct");
+        assert_eq!(value["engine_family"], "native");
+        assert_eq!(value["requested_executor"], "direct");
+        assert_eq!(value["executed_executor"], "direct");
+        assert_eq!(value["output_path"], "explicit.mp4");
+        assert_eq!(value["model_path"], "model.onnx");
+        assert_eq!(value["model_format"], "onnx");
+        assert_eq!(value["extensions"]["native"]["requested_output_path"], "explicit.mp4");
+        assert_eq!(value["extensions"]["native"]["preserve_audio"], false);
+        assert!(value.get("fallback").is_none());
+    }
+
+    #[cfg(feature = "native_engine")]
+    #[test]
+    fn native_runtime_snapshot_serializes_route_and_fallback_fields() {
+        let job = NativeJobSpec {
+            run_id: "run-456".to_string(),
+            input_path: "in.mp4".to_string(),
+            requested_output_path: "".to_string(),
+            model_path: "model.onnx".to_string(),
+            scale: 2,
+            precision: "fp16".to_string(),
+            preserve_audio: true,
+            max_batch: 4,
+            trt_cache_enabled: true,
+            trt_cache_dir: Some("cache-dir".to_string()),
+        };
+        let route = NativeExecutionRoute::cli_fallback(&NativeUpscaleError::new(
+            "PIPELINE",
+            "NVENC init failed",
+        ));
+        let snapshot = build_native_runtime_snapshot(&job, &route);
+        let value = serde_json::to_value(&snapshot).expect("serialize native snapshot");
+
+        assert_eq!(value["schema_version"], RUNTIME_CONFIG_SNAPSHOT_SCHEMA_V1);
+        assert_eq!(value["run_id"], "run-456");
+        assert_eq!(value["snapshot_kind"], "route_fallback");
+        assert_eq!(value["engine_family"], "native");
+        assert_eq!(value["route_id"], "native_via_rave_cli");
+        assert_eq!(value["requested_executor"], "direct");
+        assert_eq!(value["executed_executor"], "cli");
+        assert_eq!(value["fallback"]["from_route_id"], "native_direct");
+        assert_eq!(value["fallback"]["to_route_id"], "native_via_rave_cli");
+        assert_eq!(value["fallback"]["reason_code"], "PIPELINE");
+        assert_eq!(
+            value["extensions"]["native"]["trt_cache_enabled"],
+            true
+        );
+    }
+
+    #[cfg(feature = "native_engine")]
+    #[test]
+    fn native_observed_metrics_maps_perf_report_without_inventing_missing_fields() {
+        let perf = NativePerfReport {
+            frames_processed: 120,
+            effective_max_batch: 4,
+            trt_cache_enabled: true,
+            trt_cache_dir: Some("cache-dir".to_string()),
+            requested_executor: Some("direct".to_string()),
+            executed_executor: Some("direct".to_string()),
+            direct_attempted: true,
+            fallback_used: false,
+            fallback_reason_code: None,
+            fallback_reason_message: None,
+            total_elapsed_ms: Some(3210),
+            frames_decoded: Some(120),
+            frames_preprocessed: Some(120),
+            frames_inferred: Some(120),
+            frames_encoded: Some(120),
+            preprocess_avg_us: None,
+            inference_frame_avg_us: Some(5100),
+            inference_dispatch_avg_us: None,
+            postprocess_frame_avg_us: None,
+            postprocess_dispatch_avg_us: None,
+            encode_avg_us: Some(1400),
+            vram_current_mb: None,
+            vram_peak_mb: Some(4096),
+        };
+        let metrics =
+            build_native_observed_metrics("run-456", "native_direct", RunStatus::Succeeded, Some(&perf), None);
+        let value = serde_json::to_value(&metrics).expect("serialize native observed metrics");
+
+        assert_eq!(value["schema_version"], RUN_OBSERVED_METRICS_SCHEMA_V1);
+        assert_eq!(value["run_id"], "run-456");
+        assert_eq!(value["route_id"], "native_direct");
+        assert_eq!(value["status"], "succeeded");
+        assert_eq!(value["total_elapsed_ms"], 3210);
+        assert_eq!(value["work_units_processed"], 120);
+        assert_eq!(value["extensions"]["native"]["frames_preprocessed"], 120);
+        assert_eq!(value["extensions"]["native"]["inference_frame_avg_us"], 5100);
+        assert_eq!(value["extensions"]["native"]["encode_avg_us"], 1400);
+        assert!(value["extensions"]["native"]
+            .get("preprocess_avg_us")
+            .is_none());
+        assert!(value["extensions"]["native"]
+            .get("vram_current_mb")
+            .is_none());
+        assert!(value.get("requested_executor").is_none());
     }
 }
 
@@ -1275,6 +1500,7 @@ struct NativeCliExecutionPlan {
 #[cfg(feature = "native_engine")]
 #[derive(Debug, Clone)]
 struct NativeJobSpec {
+    run_id: String,
     input_path: String,
     requested_output_path: String,
     model_path: String,
@@ -1345,6 +1571,7 @@ impl NativeJobSpec {
         let (trt_cache_enabled, trt_cache_dir) = trt_cache_runtime(&model_path);
 
         Ok(Self {
+            run_id: crate::ipc::protocol::next_request_id(),
             input_path,
             requested_output_path: output_path,
             model_path,
@@ -1442,6 +1669,13 @@ impl NativeJobSpec {
         NativeDirectPlan::prepare(self, ffmpeg_cmd, CudaCodec::H264)
     }
 
+    fn resolved_output_path_for_route(&self, route: &NativeExecutionRoute) -> String {
+        match route.executed_executor {
+            "direct" => self.resolved_output_path(NativeOutputPathStyle::DirectTemp),
+            _ => self.resolved_output_path(NativeOutputPathStyle::CliStable),
+        }
+    }
+
     fn base_perf(&self, frames_processed: u64) -> NativePerfReport {
         NativePerfReport {
             frames_processed,
@@ -1492,9 +1726,109 @@ impl NativeJobSpec {
             encoder_mode: encoder_mode.into(),
             encoder_detail,
             audio_preserved: self.preserve_audio,
+            runtime_snapshot: None,
+            observed_metrics: None,
             perf,
         }
     }
+}
+
+#[cfg(feature = "native_engine")]
+fn route_id_for_executor(executed_executor: &str) -> &'static str {
+    match executed_executor {
+        "direct" => "native_direct",
+        _ => "native_via_rave_cli",
+    }
+}
+
+#[cfg(feature = "native_engine")]
+fn build_native_runtime_snapshot(
+    job: &NativeJobSpec,
+    route: &NativeExecutionRoute,
+) -> RuntimeConfigSnapshot {
+    let route_id = route_id_for_executor(route.executed_executor);
+    let mut snapshot = RuntimeConfigSnapshot {
+        requested_executor: Some(route.requested_executor.to_string()),
+        executed_executor: Some(route.executed_executor.to_string()),
+        model_path: Some(job.model_path.clone()),
+        model_format: Some("onnx".to_string()),
+        scale: Some(job.scale),
+        precision: Some(job.precision.clone()),
+        fallback: route.fallback_reason_code.as_ref().map(|_| RuntimeFallbackInfo {
+            from_route_id: "native_direct".to_string(),
+            to_route_id: route_id.to_string(),
+            reason_code: route.fallback_reason_code.clone(),
+            reason_message: route.fallback_reason_message.clone(),
+        }),
+        extensions: RuntimeConfigExtensions {
+            python: None,
+            native: Some(NativeRuntimeConfigExtension {
+                requested_output_path: (!job.requested_output_path.trim().is_empty())
+                    .then(|| job.requested_output_path.clone()),
+                native_runtime_enabled: native_engine_runtime_enabled(),
+                native_direct_enabled: native_engine_direct_enabled(),
+                preserve_audio: job.preserve_audio,
+                max_batch: Some(job.max_batch),
+                trt_cache_enabled: job.trt_cache_enabled,
+                trt_cache_dir: job.trt_cache_dir.clone(),
+            }),
+        },
+        ..RuntimeConfigSnapshot::new(
+            job.run_id.clone(),
+            route_id,
+            RuntimeEngineFamily::Native,
+            job.input_path.clone(),
+            job.resolved_output_path_for_route(route),
+        )
+    };
+
+    if snapshot.fallback.is_some() {
+        snapshot.snapshot_kind = RuntimeSnapshotKind::RouteFallback;
+    }
+
+    snapshot
+}
+
+#[cfg(feature = "native_engine")]
+fn build_native_observed_metrics(
+    run_id: &str,
+    route_id: &str,
+    status: RunStatus,
+    perf: Option<&NativePerfReport>,
+    error: Option<&NativeUpscaleError>,
+) -> RunObservedMetrics {
+    let native_metrics = perf.map(|perf| NativeRuntimeMetricsExtension {
+        frames_decoded: perf.frames_decoded,
+        frames_preprocessed: perf.frames_preprocessed,
+        frames_inferred: perf.frames_inferred,
+        frames_encoded: perf.frames_encoded,
+        preprocess_avg_us: perf.preprocess_avg_us,
+        inference_frame_avg_us: perf.inference_frame_avg_us,
+        inference_dispatch_avg_us: perf.inference_dispatch_avg_us,
+        postprocess_frame_avg_us: perf.postprocess_frame_avg_us,
+        postprocess_dispatch_avg_us: perf.postprocess_dispatch_avg_us,
+        encode_avg_us: perf.encode_avg_us,
+        vram_current_mb: perf.vram_current_mb,
+        vram_peak_mb: perf.vram_peak_mb,
+    });
+    let mut metrics = RunObservedMetrics::new(run_id, route_id, status);
+    if let Some(perf) = perf {
+        metrics.total_elapsed_ms = perf.total_elapsed_ms;
+        metrics.work_units_processed = perf
+            .frames_encoded
+            .or_else(|| (perf.frames_processed > 0).then_some(perf.frames_processed));
+    }
+    if let Some(error) = error {
+        metrics.error_code = Some(error.code.clone());
+        metrics.error_message = Some(error.message.clone());
+    }
+    if let Some(native_metrics) = native_metrics.filter(|m| !m.is_empty()) {
+        metrics.extensions = RuntimeMetricsExtensions {
+            python: None,
+            native: Some(native_metrics),
+        };
+    }
+    metrics
 }
 
 #[cfg(feature = "native_engine")]
@@ -1668,15 +2002,27 @@ async fn run_native_via_rave_cli(
     }
 
     let perf = build_cli_perf_report(job, &res.json, res.progress.as_ref());
-
-    Ok(job.build_result(
+    let runtime_snapshot = build_native_runtime_snapshot(job, &route);
+    let observed_metrics = build_native_observed_metrics(
+        &job.run_id,
+        route_id_for_executor(route.executed_executor),
+        RunStatus::Succeeded,
+        Some(&perf),
+        None,
+    );
+    let mut result = job.build_result(
         output,
         "native_via_rave_cli",
         "rave_cli",
         None,
         perf,
         route,
-    ))
+    );
+    result.runtime_snapshot = Some(runtime_snapshot);
+    result.observed_metrics = Some(observed_metrics.clone());
+    log_run_observed_metrics(&observed_metrics);
+
+    Ok(result)
 }
 
 #[cfg(feature = "native_engine")]
@@ -1695,9 +2041,29 @@ fn should_fallback_to_rave_cli(err: &NativeUpscaleError) -> bool {
 #[cfg(feature = "native_engine")]
 async fn run_native_job(job: NativeJobSpec) -> Result<NativeUpscaleResult, String> {
     match requested_native_executor() {
-        NativeRequestedExecutor::Direct => run_direct_with_fallback(job).await,
+        NativeRequestedExecutor::Direct => {
+            log_runtime_config_snapshot(&build_native_runtime_snapshot(
+                &job,
+                &NativeExecutionRoute::direct(),
+            ));
+            run_direct_with_fallback(job).await
+        }
         NativeRequestedExecutor::Cli => {
-            run_native_via_rave_cli(&job, NativeExecutionRoute::cli_requested()).await
+            let route = NativeExecutionRoute::cli_requested();
+            log_runtime_config_snapshot(&build_native_runtime_snapshot(&job, &route));
+            let result = run_native_via_rave_cli(&job, route.clone()).await;
+            if let Err(err_json) = &result {
+                if let Some(err) = decode_native_error(err_json) {
+                    log_run_observed_metrics(&build_native_observed_metrics(
+                        &job.run_id,
+                        route_id_for_executor(route.executed_executor),
+                        RunStatus::Failed,
+                        None,
+                        Some(&err),
+                    ));
+                }
+            }
+            result
         }
     }
 }
@@ -1713,13 +2079,35 @@ async fn run_direct_with_fallback(job: NativeJobSpec) -> Result<NativeUpscaleRes
                 return Err(err_json);
             };
             if should_fallback_to_rave_cli(&err) {
+                let route = NativeExecutionRoute::cli_fallback(&err);
+                log_runtime_config_snapshot(&build_native_runtime_snapshot(&job, &route));
                 tracing::warn!(
+                    run_id = %job.run_id,
                     code = %err.code,
                     message = %err.message,
                     "Direct native path failed; falling back to CLI-backed native path"
                 );
-                run_native_via_rave_cli(&job, NativeExecutionRoute::cli_fallback(&err)).await
+                let cli_result = run_native_via_rave_cli(&job, route.clone()).await;
+                if let Err(cli_err_json) = &cli_result {
+                    if let Some(cli_err) = decode_native_error(cli_err_json) {
+                        log_run_observed_metrics(&build_native_observed_metrics(
+                            &job.run_id,
+                            route_id_for_executor(route.executed_executor),
+                            RunStatus::Failed,
+                            None,
+                            Some(&cli_err),
+                        ));
+                    }
+                }
+                cli_result
             } else {
+                log_run_observed_metrics(&build_native_observed_metrics(
+                    &job.run_id,
+                    "native_direct",
+                    RunStatus::Failed,
+                    None,
+                    Some(&err),
+                ));
                 Err(err_json)
             }
         }
@@ -2161,15 +2549,28 @@ async fn run_engine_pipeline(
     );
 
     tracing::info!(output = %plan.output_path, "Native engine upscale complete");
-
-    Ok(job.build_result(
+    let route = NativeExecutionRoute::direct();
+    let runtime_snapshot = build_native_runtime_snapshot(job, &route);
+    let observed_metrics = build_native_observed_metrics(
+        &job.run_id,
+        "native_direct",
+        RunStatus::Succeeded,
+        Some(&perf),
+        None,
+    );
+    let mut result = job.build_result(
         plan.output_path.clone(),
         "native_v2",
         encoder_mode,
         encoder_detail,
         perf,
-        NativeExecutionRoute::direct(),
-    ))
+        route,
+    );
+    result.runtime_snapshot = Some(runtime_snapshot);
+    result.observed_metrics = Some(observed_metrics.clone());
+    log_run_observed_metrics(&observed_metrics);
+
+    Ok(result)
 }
 
 // =============================================================================

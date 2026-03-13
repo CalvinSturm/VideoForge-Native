@@ -21,6 +21,11 @@
 
 ## Current Docs
 
+- [`docs/architecture_status_truth.md`](docs/architecture_status_truth.md) — canonical architecture and status source.
+- [`docs/capability_matrix.md`](docs/capability_matrix.md) — canonical feature and support matrix.
+- [`docs/runtime_path_contracts.md`](docs/runtime_path_contracts.md) — canonical route, gating, and fallback contracts.
+- [`docs/state_and_persistence.md`](docs/state_and_persistence.md) — canonical operational state model.
+- [`docs/metrics_trust.md`](docs/metrics_trust.md) — canonical metric provenance and comparison rules.
 - [`docs/README.md`](docs/README.md) — entrypoint for current docs and status references.
 - [`implementation_plan.md`](implementation_plan.md) — native engine execution tracker and archived status summary.
 - [`docs/native_engine_handoff_2026-03-07.md`](docs/native_engine_handoff_2026-03-07.md) — latest native-only handoff and recommended next steps.
@@ -276,15 +281,18 @@ VideoForge/
 
 ## Status
 
-Current repo state, based on the checked-in native planning docs:
+Current repo state, based on the canonical docs and checked-in code:
 
 - Python remains the default engine path.
 - Native direct and native-cli now share a larger control plane and result contract.
 - The direct native path has removed the main temp-file boundaries in favor of streamed demux/mux.
-- Remaining work is mostly documentation cleanup, benchmark/tool alignment, and selective native productization.
+- Remaining work is architecture-contract hardening, benchmark/tool alignment, and selective native productization.
 
 For current planning detail, start with:
 
+- [`docs/architecture_status_truth.md`](docs/architecture_status_truth.md)
+- [`docs/capability_matrix.md`](docs/capability_matrix.md)
+- [`docs/runtime_path_contracts.md`](docs/runtime_path_contracts.md)
 - [`implementation_plan.md`](implementation_plan.md)
 - [`docs/native_engine_handoff_2026-03-07.md`](docs/native_engine_handoff_2026-03-07.md)
 - [`docs/README.md`](docs/README.md)

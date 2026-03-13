@@ -20,7 +20,14 @@ use crate::python_env::{
     build_worker_argv, get_free_port, resolve_python_environment, BaseWorkerArgs, ProcessGuard,
     WorkerCaps, PYTHON_PIDS,
 };
-use crate::run_manifest::{maybe_write_run_manifest, RunManifestInputs};
+use crate::runtime_truth::{
+    log_run_observed_metrics, log_runtime_config_snapshot, PythonRuntimeConfigExtension,
+    PythonRuntimeMetricsExtension, RunObservedMetrics, RunStatus, RuntimeConfigExtensions,
+    RuntimeConfigSnapshot, RuntimeEngineFamily, RuntimeMediaKind, RuntimeMetricsExtensions,
+};
+use crate::run_manifest::{
+    maybe_write_run_manifest, RunManifestInputs, WorkerCapsSnapshot,
+};
 use crate::video_pipeline;
 #[cfg(windows)]
 use crate::win_events::{create_named_event, format_event_name, NamedEvent};
@@ -57,6 +64,8 @@ pub struct UpscaleJobConfig {
 pub struct UpscaleJobReport {
     pub output_path: String,
     pub frames_encoded: u64,
+    pub runtime_snapshot: RuntimeConfigSnapshot,
+    pub observed_metrics: Option<RunObservedMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +123,33 @@ fn progress_to_event_payload(p: &JobProgress) -> serde_json::Value {
         j["stage_ms"] = serde_json::to_value(stage).unwrap_or_default();
     }
     j
+}
+
+fn build_python_observed_metrics(
+    run_id: &str,
+    status: RunStatus,
+    total_elapsed_ms: Option<u64>,
+    frames_decoded: Option<u64>,
+    frames_processed: Option<u64>,
+    frames_encoded: Option<u64>,
+    error_message: Option<String>,
+) -> RunObservedMetrics {
+    let python_metrics = PythonRuntimeMetricsExtension {
+        frames_decoded,
+        frames_processed,
+        frames_encoded,
+    };
+    let mut metrics = RunObservedMetrics::new(run_id, "python_sidecar", status);
+    metrics.total_elapsed_ms = total_elapsed_ms;
+    metrics.work_units_processed = frames_encoded;
+    metrics.error_message = error_message;
+    if !python_metrics.is_empty() {
+        metrics.extensions = RuntimeMetricsExtensions {
+            python: Some(python_metrics),
+            native: None,
+        };
+    }
+    metrics
 }
 
 fn extract_handshake_protocol_version(raw: &str) -> Option<u32> {
@@ -267,6 +303,38 @@ pub async fn run_upscale_job(
 
     // Generate a session-scoped job ID for IPC correlation.
     let job_id = ipc::protocol::next_request_id();
+    let runtime_snapshot = RuntimeConfigSnapshot {
+        media_kind: Some(if is_img {
+            RuntimeMediaKind::Image
+        } else {
+            RuntimeMediaKind::Video
+        }),
+        model_key: Some(config.model.clone()),
+        scale: Some(config.scale),
+        precision: Some(precision.clone()),
+        extensions: RuntimeConfigExtensions {
+            python: Some(PythonRuntimeConfigExtension {
+                python_bin: config.python_bin.clone(),
+                script_path: config.script_path.clone(),
+                zenoh_timeout_secs: config.zenoh_timeout_secs,
+                enable_run_artifacts: config.enable_run_artifacts,
+                use_shm_proto_v2: config.use_shm_proto_v2,
+                shm_ring_size_override: config.shm_ring_size_override,
+                resolved_shm_ring_size: resolved_ring_override,
+                worker_caps: WorkerCapsSnapshot::from(&worker_caps),
+                ipc_protocol_version: Some(crate::ipc::PROTOCOL_VERSION),
+            }),
+            native: None,
+        },
+        ..RuntimeConfigSnapshot::new(
+            job_id.clone(),
+            "python_sidecar",
+            RuntimeEngineFamily::Python,
+            config.input_path.clone(),
+            output_path.clone(),
+        )
+    };
+    log_runtime_config_snapshot(&runtime_snapshot);
 
     tracing::info!(
         job_id = %job_id,
@@ -277,6 +345,9 @@ pub async fn run_upscale_job(
         is_image = is_img,
         "Upscale request started"
     );
+
+    let observed_started = Instant::now();
+    let result: Result<UpscaleJobReport, String> = async {
 
     // ── Zenoh setup ──────────────────────────────────────────────────────────
     let port = get_free_port();
@@ -488,6 +559,16 @@ pub async fn run_upscale_job(
         return Ok(UpscaleJobReport {
             output_path,
             frames_encoded: 0,
+            runtime_snapshot: runtime_snapshot.clone(),
+            observed_metrics: Some(build_python_observed_metrics(
+                &job_id,
+                RunStatus::Succeeded,
+                Some(observed_started.elapsed().as_millis() as u64),
+                None,
+                None,
+                None,
+                None,
+            )),
         });
     }
 
@@ -958,15 +1039,54 @@ pub async fn run_upscale_job(
     Ok(UpscaleJobReport {
         output_path,
         frames_encoded,
+        runtime_snapshot: runtime_snapshot.clone(),
+        observed_metrics: Some(build_python_observed_metrics(
+            &job_id,
+            RunStatus::Succeeded,
+            Some(observed_started.elapsed().as_millis() as u64),
+            Some(frames_decoded_ctr.load(Ordering::Relaxed)),
+            Some(frames_processed_ctr.load(Ordering::Relaxed)),
+            Some(frames_encoded),
+            None,
+        )),
     })
+    }
+    .await;
+
+    match &result {
+        Ok(report) => {
+            if let Some(metrics) = &report.observed_metrics {
+                log_run_observed_metrics(metrics);
+            }
+        }
+        Err(error) => {
+            log_run_observed_metrics(&build_python_observed_metrics(
+                &job_id,
+                RunStatus::Failed,
+                Some(observed_started.elapsed().as_millis() as u64),
+                None,
+                None,
+                None,
+                Some(error.clone()),
+            ));
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_create_shm_payload, resolve_shm_ring_override, validate_worker_protocol_version,
-        JobProgress, StageTimingsMs,
+        build_create_shm_payload, build_python_observed_metrics, resolve_shm_ring_override,
+        validate_worker_protocol_version, JobProgress, StageTimingsMs,
     };
+    use crate::runtime_truth::{
+        PythonRuntimeConfigExtension, RunStatus, RuntimeConfigExtensions,
+        RuntimeConfigSnapshot, RuntimeEngineFamily, RuntimeMediaKind,
+        RUNTIME_CONFIG_SNAPSHOT_SCHEMA_V1, RUN_OBSERVED_METRICS_SCHEMA_V1,
+    };
+    use crate::run_manifest::WorkerCapsSnapshot;
 
     #[test]
     fn test_handshake_version_match_ok() {
@@ -1090,6 +1210,76 @@ mod tests {
     fn ring_override_requires_v2_fails_fast() {
         let err = resolve_shm_ring_override(false, Some(8)).unwrap_err();
         assert!(err.contains("SHM_RING_SIZE_REQUIRES_V2"));
+    }
+
+    #[test]
+    fn python_runtime_snapshot_serializes_expected_fields() {
+        let snapshot = RuntimeConfigSnapshot {
+            media_kind: Some(RuntimeMediaKind::Video),
+            model_key: Some("RCAN_x4".to_string()),
+            scale: Some(4),
+            precision: Some("fp16".to_string()),
+            extensions: RuntimeConfigExtensions {
+                python: Some(PythonRuntimeConfigExtension {
+                    python_bin: "python.exe".to_string(),
+                    script_path: "python/shm_worker.py".to_string(),
+                    zenoh_timeout_secs: 60,
+                    enable_run_artifacts: false,
+                    use_shm_proto_v2: false,
+                    shm_ring_size_override: None,
+                    resolved_shm_ring_size: None,
+                    worker_caps: WorkerCapsSnapshot::default(),
+                    ipc_protocol_version: Some(crate::ipc::PROTOCOL_VERSION),
+                }),
+                native: None,
+            },
+            ..RuntimeConfigSnapshot::new(
+                "run-123",
+                "python_sidecar",
+                RuntimeEngineFamily::Python,
+                "in.mp4",
+                "out.mp4",
+            )
+        };
+
+        let value = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        assert_eq!(value["schema_version"], RUNTIME_CONFIG_SNAPSHOT_SCHEMA_V1);
+        assert_eq!(value["run_id"], "run-123");
+        assert_eq!(value["route_id"], "python_sidecar");
+        assert_eq!(value["engine_family"], "python");
+        assert_eq!(value["media_kind"], "video");
+        assert_eq!(value["model_key"], "RCAN_x4");
+        assert_eq!(value["precision"], "fp16");
+        assert_eq!(
+            value["extensions"]["python"]["worker_caps"]["use_events"],
+            false
+        );
+    }
+
+    #[test]
+    fn python_observed_metrics_serializes_only_trustworthy_shared_and_route_fields() {
+        let metrics = build_python_observed_metrics(
+            "run-123",
+            RunStatus::Succeeded,
+            Some(2400),
+            Some(120),
+            Some(120),
+            Some(120),
+            None,
+        );
+        let value = serde_json::to_value(&metrics).expect("serialize observed metrics");
+
+        assert_eq!(value["schema_version"], RUN_OBSERVED_METRICS_SCHEMA_V1);
+        assert_eq!(value["run_id"], "run-123");
+        assert_eq!(value["route_id"], "python_sidecar");
+        assert_eq!(value["status"], "succeeded");
+        assert_eq!(value["total_elapsed_ms"], 2400);
+        assert_eq!(value["work_units_processed"], 120);
+        assert_eq!(value["extensions"]["python"]["frames_decoded"], 120);
+        assert_eq!(value["extensions"]["python"]["frames_processed"], 120);
+        assert_eq!(value["extensions"]["python"]["frames_encoded"], 120);
+        assert!(value["extensions"].get("native").is_none());
+        assert!(value.get("preprocess_avg_us").is_none());
     }
 }
 

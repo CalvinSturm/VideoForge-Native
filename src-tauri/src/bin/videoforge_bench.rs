@@ -14,7 +14,7 @@ use app_lib::control::ResearchConfig;
 use app_lib::edit_config::EditConfig;
 use app_lib::models;
 use app_lib::python_env::resolve_python_environment;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::Mutex as TokioMutex;
 
 #[derive(Debug, Clone)]
@@ -46,6 +46,21 @@ struct BenchArgs {
 #[derive(Default)]
 struct ProgressState {
     started_at: Option<Instant>,
+}
+
+fn python_benchmark_done_json(
+    report: &app_lib::commands::upscale::UpscaleJobReport,
+    elapsed_ms: u128,
+) -> Value {
+    json!({
+        "event": "done",
+        "output": report.output_path,
+        "elapsed_ms": elapsed_ms,
+        "frames_encoded": report.frames_encoded,
+        "mode": "python",
+        "runtime_snapshot": report.runtime_snapshot,
+        "observed_metrics": report.observed_metrics,
+    })
 }
 
 #[tokio::main]
@@ -150,13 +165,10 @@ async fn main() {
         };
 
         match run_upscale_job(job, progress).await {
-            Ok(report) => emit_json(json!({
-                "event": "done",
-                "output": report.output_path,
-                "elapsed_ms": started.elapsed().as_millis(),
-                "frames_encoded": report.frames_encoded,
-                "mode": "python",
-            })),
+            Ok(report) => emit_json(python_benchmark_done_json(
+                &report,
+                started.elapsed().as_millis(),
+            )),
             Err(message) => emit_error_and_exit(&message),
         }
     }
@@ -491,4 +503,39 @@ fn print_usage() {
     eprintln!(
         "Usage:\n  Python mode:\n    cargo run --bin videoforge_bench -- --input <path> --output <path> --model <key> --scale <u32> --precision <fp16|fp32> [--deterministic] [--edit-config <json>] [--dry-run]\n  Native mode:\n    cargo run --features native_engine --bin videoforge_bench -- --native --input <path> --output <path> --onnx-model <path> --scale <u32> --precision <fp16|fp32> [--max-batch <u32>] [--native-direct] [--preserve-audio] [--trt-cache] [--warmup-runs <u32>] [--dry-run]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::python_benchmark_done_json;
+    use app_lib::commands::upscale::UpscaleJobReport;
+    use app_lib::runtime_truth::{
+        RunObservedMetrics, RunStatus, RuntimeConfigSnapshot, RuntimeEngineFamily,
+    };
+
+    #[test]
+    fn python_benchmark_done_json_embeds_runtime_truth_objects() {
+        let report = UpscaleJobReport {
+            output_path: "out.mp4".to_string(),
+            frames_encoded: 12,
+            runtime_snapshot: RuntimeConfigSnapshot::new(
+                "run-123",
+                "python_sidecar",
+                RuntimeEngineFamily::Python,
+                "in.mp4",
+                "out.mp4",
+            ),
+            observed_metrics: Some(RunObservedMetrics::new(
+                "run-123",
+                "python_sidecar",
+                RunStatus::Succeeded,
+            )),
+        };
+
+        let payload = python_benchmark_done_json(&report, 222);
+        assert_eq!(payload["event"], "done");
+        assert_eq!(payload["mode"], "python");
+        assert_eq!(payload["runtime_snapshot"]["run_id"], "run-123");
+        assert_eq!(payload["observed_metrics"]["status"], "succeeded");
+    }
 }

@@ -20,6 +20,7 @@ pub mod ipc;
 pub mod models;
 pub mod python_env;
 pub mod rave_cli;
+pub mod runtime_truth;
 pub mod run_manifest;
 pub mod shm;
 pub mod spatial_map;

@@ -1,26 +1,26 @@
 # Docs Index
 
-This directory contains the current native-engine planning and handoff notes that still match the checked-in workspace.
+This directory contains both the durable architecture contracts and the current native-engine planning notes.
 
 ## Start Here
 
+- [`architecture_status_truth.md`](architecture_status_truth.md)
+  - Canonical architecture and shipped-status summary.
+- [`capability_matrix.md`](capability_matrix.md)
+  - Canonical support matrix for routes, features, and guarantees.
+- [`runtime_path_contracts.md`](runtime_path_contracts.md)
+  - Canonical route, gating, and fallback contracts.
+- [`state_and_persistence.md`](state_and_persistence.md)
+  - Canonical operational state and persistence model.
+- [`metrics_trust.md`](metrics_trust.md)
+  - Canonical metric provenance and comparability rules.
+
+## Status And Planning
+
 - [`../implementation_plan.md`](../implementation_plan.md)
-  - Primary native-engine execution tracker and archived status summary.
+  - Native-engine execution tracker and archived status summary.
 - [`native_engine_handoff_2026-03-07.md`](native_engine_handoff_2026-03-07.md)
-  - Latest handoff for the native direct/native-cli control-plane consolidation work.
-
-## Supporting Native Docs
-
-- [`native_engine_handoff_2026-03-06.md`](native_engine_handoff_2026-03-06.md)
-  - Earlier handoff covering the streamed direct-path stabilization work.
-- [`native_engine_implementation_plan.md`](native_engine_implementation_plan.md)
-  - Older native implementation plan snapshot.
-- [`native_engine_remaining_wins_implementation_plan_2026-03-06.md`](native_engine_remaining_wins_implementation_plan_2026-03-06.md)
-  - Follow-on implementation plan for remaining native wins.
-- [`native_engine_workspace_audit_2026-03-06.md`](native_engine_workspace_audit_2026-03-06.md)
-  - Broader workspace audit of the native path.
-- [`native_engine_optimization_audit.md`](native_engine_optimization_audit.md)
-  - Optimization-focused audit of the native path.
+  - Latest native handoff and resume point.
 
 ## Cross-Engine Audit And Planning Snapshots
 
@@ -33,6 +33,7 @@ This directory contains the current native-engine planning and handoff notes tha
 
 ## Working Rule
 
-- Prefer [`../implementation_plan.md`](../implementation_plan.md) for current native status.
-- Prefer [`native_engine_handoff_2026-03-07.md`](native_engine_handoff_2026-03-07.md) for the latest resume point.
-- Treat the remaining files here as supporting context unless they explicitly supersede those two files.
+- Prefer the five canonical docs above for system truth.
+- Prefer [`../implementation_plan.md`](../implementation_plan.md) for native workstream status.
+- Prefer [`native_engine_handoff_2026-03-07.md`](native_engine_handoff_2026-03-07.md) for the latest native resume point.
+- Treat audit, plan, and handoff files as supporting context unless a canonical doc explicitly delegates to them.
