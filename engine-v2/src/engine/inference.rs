@@ -126,9 +126,13 @@ impl InferencePipeline {
             (inference_output.width as usize + 255) & !255, // 256-byte aligned
         );
 
-        let nv12_output =
-            self.preprocess
-                .postprocess(inference_output, nv12_pitch, &self.ctx, stream)?;
+        let nv12_output = self.preprocess.postprocess(
+            inference_output,
+            nv12_pitch,
+            &self.ctx,
+            stream,
+            envelope.frame_index,
+        )?;
 
         debug!(
             frame = envelope.frame_index,

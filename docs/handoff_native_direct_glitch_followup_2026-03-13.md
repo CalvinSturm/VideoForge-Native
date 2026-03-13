@@ -350,6 +350,19 @@ Expanded evidence now adds:
   - `artifacts/ui_direct_residual_202603157.mp4`
 - in that latest rerun, user-reported black frames did not reproduce
 - that rerun suggests the residual black-frame issue may already be resolved by the later direct-path changes, or was intermittent/run-specific
+- later confirmation output:
+  - `artifacts/ui_direct_residual_202603158.mp4`
+- that later rerun did reproduce a black-frame interval:
+  - `0.0834168 -> 0.125125`
+- later longer-clip confirmation:
+  - user-ran an approximately 8-second clip with no black frames reproduced
+- later longer-clip confirmation:
+  - user-ran an approximately 17-second clip
+  - first couple frames were black
+- current best characterization is therefore:
+  - the major corruption bug is fixed
+  - the remaining residual black-frame issue is intermittent / timing-sensitive rather than a stable always-on failure
+  - the residual issue appears biased toward startup / first frames of the run
 
 ## Validation Status
 
@@ -428,6 +441,12 @@ If the issue does not reproduce across one or two fresh confirmation runs:
 - treat the direct-native corruption investigation as effectively resolved
 - keep the stage-specific debug switches available, but avoid more invasive changes unless the issue returns
 
+If the issue reproduces only sporadically across mixed-length clips:
+
+- treat it as an intermittent synchronization / ownership / reuse problem until disproven
+- avoid broad architectural changes without a fresh bad repro and stage-correlated dumps
+- bias investigation toward startup / first-frame behavior if the bad repro again shows black frames near the beginning of the output
+
 ## Next Suggested Direction
 
 Use the latest clean rerun as the new baseline and confirm stability before doing more invasive debugging.
@@ -450,6 +469,12 @@ Latest known clean recheck:
 
 - output MP4: `artifacts/ui_direct_residual_202603157.mp4`
 - user-reported result: no black frames reproduced
+- longer-clip follow-up:
+  - approximately 8 seconds
+  - user-reported result: no black frames reproduced
+- longer-clip follow-up:
+  - approximately 17 seconds
+  - user-reported result: first couple frames were black
 
 Primary comparison goal if the issue returns:
 
@@ -473,6 +498,11 @@ If the latest clean behavior holds on another confirmation run:
 
 - update this handoff to mark the residual black-frame issue resolved
 - keep the packet-aware demux/mux path as the final fix set
+
+If the next bad repro again shows black frames at the beginning only:
+
+- prioritize frame `0`, `1`, and `2`
+- treat startup / warmup / first-surface ownership as the leading hypothesis
 
 If the black frames are already present in preprocess/postprocess outputs:
 
@@ -668,3 +698,326 @@ Recommended reproduction discipline:
   - or clean
 
 Only after a fresh failing run is captured with matching dumps should the next agent return to frame-stage isolation.
+
+## 2026-03-15 Instrumentation Upgrade
+
+To support the next intermittent startup repro, the direct pipeline dump hooks were widened from first-frame-only to first-`N`-frames-per-run:
+
+- `VIDEOFORGE_PIPELINE_DEBUG_DUMP_FRAMES=<N>`
+  - dumps the first `N` preprocess RGB frames
+  - dumps the first `N` postprocess NV12 frames
+- `VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_FRAMES=<N>`
+  - dumps the first `N` postprocess-kernel RGB inputs
+
+Compatibility behavior:
+
+- `VIDEOFORGE_PIPELINE_DEBUG_DUMP=1` still works and now means `N=1`
+- `VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP=1` still works and now means `N=1`
+
+Important implementation note:
+
+- these dump counters now reset at the start of every `UpscalePipeline::run(...)`
+- repeated UI runs in the same app process can now produce fresh startup dumps without restarting only because the old single-frame process-global counters happened to be unused
+
+Immediate practical effect:
+
+- the next bad startup repro can capture frame `0`, `1`, `2`, `3`, etc. across preprocess, postprocess-kernel input, and postprocess output in one run
+- this removes the previous instrumentation bottleneck where frame `5` could be seen at NVENC handoff but not at earlier pipeline stages
+
+## 2026-03-15 Mid-End Probe Update
+
+A later direct-native repro used this dump set:
+
+- `artifacts/nvdec_debug/ui_direct_midend_probe_20260315_b`
+
+The corresponding final output path recorded by `native_mux_debug.log` was:
+
+- `C:\Users\Calvin\Music\LeakedBB.com_sheesh_17_processed_v2_rave_upscaled.mp4`
+
+What this run proves:
+
+- `native_mux_debug.log` shows a clean packet-aware mux session
+- `mux_mode=packet_aware`
+- `pts`, `dts`, and `mux_pts` are monotonic through the full run
+- `ffmpeg_exit_status=exit code: 0`
+- `blackdetect` reported **no** black intervals in:
+  - the final MP4
+  - the concatenated dumped HEVC stream
+
+Important comparison result:
+
+- the dump window captured only the first `240` encoded frames, while the final MP4 contains `302` frames
+- a bounded frame-by-frame comparison of final MP4 vs dumped HEVC over frames `1..240` matched exactly
+- per-frame PNG SSIM over that bounded `1..240` comparison was:
+  - `count=240 min=1.000000 max=1.000000 avg=1.000000`
+
+Therefore:
+
+- for this run, the final MP4 does **not** diverge from the dumped encoded stream within the captured `240`-frame window
+- any visible glitches seen by the operator in this run must be either:
+  - already present in the encoded stream itself
+  - or located after frame `240`, beyond the current NVENC dump window
+
+## 2026-03-15 Windowed Upstream Dump Controls
+
+To target intermittent glitches away from startup without dumping an entire clip at preprocess/postprocess stages, the direct pipeline now supports a start-frame window for upstream dumps:
+
+- `VIDEOFORGE_PIPELINE_DEBUG_DUMP_START_FRAME=<F>`
+  - applies to both preprocess RGB dumps and postprocess NV12 dumps
+- `VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_START_FRAME=<F>`
+  - applies to postprocess-kernel RGB input dumps
+
+These env vars work with the existing frame-count controls:
+
+- `VIDEOFORGE_PIPELINE_DEBUG_DUMP_FRAMES=<N>`
+- `VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_FRAMES=<N>`
+
+Example meaning:
+
+- `VIDEOFORGE_PIPELINE_DEBUG_DUMP_START_FRAME=150`
+- `VIDEOFORGE_PIPELINE_DEBUG_DUMP_FRAMES=24`
+
+will dump frames `150..173` rather than frames `0..23`.
+
+Additional implementation note:
+
+- postprocess-kernel input dumps are now frame-indexed in their filenames, e.g. `postprocess_input_00150_*`
+
+## Current Best Next Step
+
+If the operator sees a middle or middle-end glitch on a roughly 10-second clip, the next rerun should:
+
+- set `VIDEOFORGE_NVENC_DEBUG_DUMP_FRAMES` high enough to cover the whole clip
+- set the upstream dump start-frame near the suspected glitch band
+- keep the upstream dump frame count modest, e.g. `24`
+
+Suggested starting window for a ~10-second clip:
+
+- start frame around `150`
+- window size `24`
+
+That should finally allow same-run comparison across:
+
+- `preprocess_<target>*`
+- `postprocess_input_<target>*`
+- `postprocess_<target>*`
+- `nvenc_handoff_<target>*`
+- dumped HEVC decode / final MP4
+
+## 2026-03-15 Windowed Probe Result
+
+A subsequent run used:
+
+- dump dir: `artifacts/nvdec_debug/ui_direct_midend_window_20260315`
+- final output: `C:\Users\Calvin\Music\10sectest_rave_upscaled.mp4`
+
+Key observations from that run:
+
+- `native_mux_debug.log` is still clean
+- `packet_count=601`
+- mux timing is monotonic
+- `ffmpeg_exit_status=exit code: 0`
+
+But this run also reproduced the residual startup issue again:
+
+- `blackdetect` on the final MP4 reported:
+  - `black_start:0 black_end:0.0166667`
+  - `black_start:0.05 black_end:0.0666667`
+- `blackdetect` on the concatenated dumped HEVC stream reported the exact same two startup black intervals
+- startup PNG comparison between final MP4 and dumped HEVC frames `1..8` matched exactly with SSIM `1.000000`
+
+What this proves:
+
+- the recurring startup black frames are **not** introduced by final mux
+- they are already present in the dumped encoded stream
+- the direct encode output faithfully carries the bad startup frames forward
+
+What this run does **not** prove:
+
+- where those startup black frames first appear upstream
+
+Reason:
+
+- this run intentionally targeted upstream pipeline/kernel dumps at frame window `150..173`
+- the startup-bad frames were therefore outside the captured preprocess / postprocess-input / postprocess dump window
+
+Updated practical implication:
+
+- the residual issue is still biased toward startup in at least some failing runs
+- the next targeted upstream capture should move the start-frame window back to `0`
+- if the operator later sees a genuinely mid-run glitch without startup blacks, then the window can move forward again
+
+## 2026-03-15 Startup Window Result
+
+A later run used:
+
+- dump dir: `artifacts/nvdec_debug/ui_direct_startup_window_20260315`
+- final output: `C:\Users\Calvin\Music\LeakedBB.com_sheesh_17_processed_v2_rave_upscaled.mp4`
+
+This run reproduced:
+
+- a startup black frame
+- a separate visual glitch later in the clip
+
+What was confirmed from the startup side:
+
+- `blackdetect` on the final MP4 reported:
+  - `black_start:0 black_end:0.0333333 black_duration:0.0333333`
+- `blackdetect` on the concatenated dumped HEVC stream reported the exact same startup black interval
+- mux remained clean:
+  - `packet_count=302`
+  - monotonic timing in `native_mux_debug.log`
+  - `ffmpeg_exit_status=exit code: 0`
+
+Most important isolation result:
+
+- frame `0` is already black in **preprocess RGB**
+- frame `0` is also black in:
+  - postprocess-kernel input RGB
+  - postprocess NV12 output
+  - NVENC handoff NV12
+
+Measured with `ffmpeg` `blackframe` on the dumped images:
+
+- `preprocess_00000_*` -> `pblack:100`
+- `postprocess_input_00000_*` -> `pblack:100`
+- `postprocess_00000_*` -> `pblack:100`
+- `nvenc_handoff_00000_*` -> `pblack:100`
+
+Frames `1` and `2` in those same startup dumps were **not** flagged as black by the same check.
+
+Current strongest statement:
+
+- the first confirmed bad stage for the startup black frame is now **no later than preprocess output**
+- the remaining unresolved question for startup is whether frame `0` was already black at decode ingress
+
+Implication:
+
+- the next startup-focused repro should enable `VIDEOFORGE_NVDEC_DEBUG_DUMP=1`
+- that should finally determine whether frame `0` is already black in the decoded NV12 surface, or whether the first corruption occurs between decode output and preprocess output
+
+Important limitation of this run:
+
+- the separate middle glitch was not isolated upstream, because this run only captured frames `0..11` at preprocess / postprocess stages
+
+## 2026-03-15 NVDEC-Enabled Clean Counterexample
+
+A later rerun used:
+
+- dump dir: `artifacts/nvdec_debug/ui_direct_startup_nvdec_20260315`
+- final output: `artifacts/ui_direct_startup_nvdec_20260315.mp4`
+
+This run did **not** reproduce the startup black frame.
+
+What was checked:
+
+- `blackdetect` on the final MP4 returned no black intervals
+- `native_mux_debug.log` remained clean:
+  - `packet_count=302`
+  - monotonic timing
+  - `ffmpeg_exit_status=exit code: 0`
+- NVDEC frame `0` was dumped and converted from pitched NV12 to a dense NV12 image for inspection
+- `blackframe` did **not** flag:
+  - decoded `frame_00000`
+  - `preprocess_00000`
+  - `postprocess_00000`
+
+Implication:
+
+- this run is a clean counterexample with `VIDEOFORGE_NVDEC_DEBUG_DUMP=1` enabled
+- it does **not** answer whether the startup-black failure begins in NVDEC or after NVDEC, because the failure did not reproduce
+- the remaining required capture is now very specific:
+- rerun with the same NVDEC-enabled startup command until the startup black frame reproduces
+- then compare decoded `frame_00000` against `preprocess_00000`
+
+## 2026-03-15 NVDEC Windowed Dump Upgrade
+
+The NVDEC dump path now matches the newer pipeline/kernel dump controls.
+
+New env vars:
+
+- `VIDEOFORGE_NVDEC_DEBUG_DUMP_FRAMES=<N>`
+- `VIDEOFORGE_NVDEC_DEBUG_DUMP_START_FRAME=<F>`
+
+Behavior:
+
+- `VIDEOFORGE_NVDEC_DEBUG_DUMP=1` still works and remains backward-compatible as a single-frame dump (`N=1`, `F=0`)
+- when `VIDEOFORGE_NVDEC_DEBUG_DUMP_FRAMES` is set, NVDEC will dump a frame window starting at `VIDEOFORGE_NVDEC_DEBUG_DUMP_START_FRAME`
+
+Example:
+
+- `VIDEOFORGE_NVDEC_DEBUG_DUMP_FRAMES=4`
+- `VIDEOFORGE_NVDEC_DEBUG_DUMP_START_FRAME=5`
+
+will dump decoded frames `5..8`.
+
+Why this matters:
+
+- the latest failing NVDEC-enabled retry did **not** black out frame `0`
+- `blackdetect` on `artifacts/ui_direct_startup_nvdec_retry_20260315.mp4` reported:
+  - `black_start:0.166667 black_end:0.2 black_duration:0.0333333`
+- that maps to frame `5`
+- frame `5` was already black in:
+  - `preprocess_00005_*`
+  - `postprocess_input_00005_*`
+  - `postprocess_00005_*`
+  - `nvenc_handoff_00005_*`
+- frame `6` was clean across those same stages
+
+Updated immediate next step:
+
+- rerun with:
+  - `VIDEOFORGE_NVDEC_DEBUG_DUMP_FRAMES=8`
+  - `VIDEOFORGE_NVDEC_DEBUG_DUMP_START_FRAME=4`
+- keep the startup pipeline/kernel window enabled
+- if the same frame-`5` failure reproduces, compare:
+  - decoded `frame_00005_*`
+  - `preprocess_00005_*`
+
+That next run should finally answer whether frame `5` is already black at NVDEC output or first turns black between NVDEC and preprocess.
+
+## 2026-03-15 `third_party/rave` Reference Comparison
+
+The clean reference path in `third_party/rave` was inspected specifically at the decode → preprocess boundary:
+
+- `third_party/rave/crates/rave-nvcodec/src/nvdec.rs`
+- `third_party/rave/crates/rave-pipeline/src/pipeline.rs`
+
+Most important comparison result:
+
+- the strongest corruption-capable mismatch was **not** in demux or mux
+- the strongest mismatch was in **decoded NV12 buffer lifetime during preprocess**
+
+Reference `rave` behavior:
+
+- preprocess waits on the decode event
+- launches `nv12_to_rgb`
+- explicitly calls `GpuContext::sync_stream(&ctx.preprocess_stream)` before recycling the decoded NV12 input buffer
+
+Earlier `engine-v2` behavior:
+
+- preprocess waited on `decode_ready`
+- launched `prepare()`
+- recorded `preprocess_ready`
+- immediately recycled the decoded NV12 input buffer back to the pool
+
+Why that looked suspicious:
+
+- recording `preprocess_ready` is enough to protect downstream inference
+- it is **not** enough to make the decoded NV12 input safe for immediate reuse
+- if the buffer pool reissued that NV12 allocation while `preprocess_stream` was still reading it, that would create exactly the kind of intermittent early-frame corruption seen in this investigation
+
+Patch applied:
+
+- `engine-v2/src/engine/pipeline.rs`
+- preprocess now explicitly calls `GpuContext::sync_stream(&ctx.preprocess_stream)` before `frame.texture.try_recycle(ctx)`
+
+Validation:
+
+- `cargo fmt --manifest-path engine-v2/Cargo.toml`
+- `cargo test --manifest-path engine-v2/Cargo.toml --lib`
+
+Current hypothesis after the `rave` comparison:
+
+- the decode→preprocess input-buffer reuse race was the most defensible remaining root-cause candidate in `engine-v2`
+- the next required step is a direct-native repro rerun after this patch to see whether the intermittent early black/glitch issue disappears or becomes materially rarer

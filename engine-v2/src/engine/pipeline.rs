@@ -51,7 +51,7 @@ use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -67,8 +67,8 @@ use crate::core::kernels::{ModelPrecision, PreprocessKernels, PreprocessPipeline
 use crate::core::types::{FrameEnvelope, GpuTexture, PixelFormat};
 use crate::error::{EngineError, Result};
 
-static PREPROCESS_DEBUG_DUMP_WRITTEN: AtomicBool = AtomicBool::new(false);
-static POSTPROCESS_DEBUG_DUMP_WRITTEN: AtomicBool = AtomicBool::new(false);
+static PREPROCESS_DEBUG_DUMP_COUNT: AtomicU64 = AtomicU64::new(0);
+static POSTPROCESS_DEBUG_DUMP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // ─── Panic formatting helper ────────────────────────────────────────────────
 
@@ -106,22 +106,54 @@ pub trait FrameDecoder: Send + 'static {
     fn decode_next(&mut self) -> Result<Option<DecodedFrameEnvelope>>;
 }
 
-fn preprocess_debug_dump_enabled() -> bool {
-    std::env::var_os("VIDEOFORGE_PIPELINE_DEBUG_DUMP").as_deref() == Some("1".as_ref())
+fn pipeline_debug_dump_limit() -> Option<u64> {
+    if let Some(raw) = std::env::var("VIDEOFORGE_PIPELINE_DEBUG_DUMP_FRAMES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return Some(raw.max(1));
+    }
+    if std::env::var_os("VIDEOFORGE_PIPELINE_DEBUG_DUMP").as_deref() == Some("1".as_ref()) {
+        return Some(1);
+    }
+    None
 }
 
-fn claim_preprocess_debug_dump_slot() -> bool {
-    preprocess_debug_dump_enabled()
-        && PREPROCESS_DEBUG_DUMP_WRITTEN
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+fn pipeline_debug_dump_start_frame() -> u64 {
+    std::env::var("VIDEOFORGE_PIPELINE_DEBUG_DUMP_START_FRAME")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
-fn claim_postprocess_debug_dump_slot() -> bool {
-    preprocess_debug_dump_enabled()
-        && POSTPROCESS_DEBUG_DUMP_WRITTEN
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+fn should_dump_pipeline_frame(frame_index: u64) -> bool {
+    let Some(limit) = pipeline_debug_dump_limit() else {
+        return false;
+    };
+    let start = pipeline_debug_dump_start_frame();
+    frame_index >= start && frame_index < start.saturating_add(limit)
+}
+
+fn claim_preprocess_debug_dump_slot(frame_index: u64) -> bool {
+    if !should_dump_pipeline_frame(frame_index) {
+        return false;
+    }
+    PREPROCESS_DEBUG_DUMP_COUNT.fetch_add(1, Ordering::AcqRel)
+        < pipeline_debug_dump_limit().unwrap()
+}
+
+fn claim_postprocess_debug_dump_slot(frame_index: u64) -> bool {
+    if !should_dump_pipeline_frame(frame_index) {
+        return false;
+    }
+    POSTPROCESS_DEBUG_DUMP_COUNT.fetch_add(1, Ordering::AcqRel)
+        < pipeline_debug_dump_limit().unwrap()
+}
+
+fn reset_pipeline_debug_dump_state() {
+    PREPROCESS_DEBUG_DUMP_COUNT.store(0, Ordering::Release);
+    POSTPROCESS_DEBUG_DUMP_COUNT.store(0, Ordering::Release);
+    crate::core::kernels::reset_postprocess_kernel_debug_dump_state();
 }
 
 fn debug_dump_dir() -> PathBuf {
@@ -697,6 +729,7 @@ impl UpscalePipeline {
         B: UpscaleBackend + 'static,
         E: FrameEncoder,
     {
+        reset_pipeline_debug_dump_state();
         let (tx_decoded, rx_decoded) =
             mpsc::channel::<DecodedFrameEnvelope>(self.config.decoded_capacity);
         let (tx_preprocessed, rx_preprocessed) =
@@ -1483,7 +1516,7 @@ async fn preprocess_stage(
             "preprocess_ready",
         )?);
 
-        if claim_preprocess_debug_dump_slot() {
+        if claim_preprocess_debug_dump_slot(frame.frame_index) {
             if let Some(event) = &preprocess_ready {
                 event.synchronize()?;
             }
@@ -1500,6 +1533,12 @@ async fn preprocess_stage(
             pctx.profiler
                 .record_stage(PerfStage::Preprocess, elapsed_us);
         }
+
+        // Match the proven `rave` safety pattern: don't make the decoded NV12
+        // allocation reusable until preprocess_stream has definitely finished
+        // reading it. Recording `preprocess_ready` is sufficient for downstream
+        // consumers, but not for recycling the input buffer back to the pool.
+        GpuContext::sync_stream(&ctx.preprocess_stream)?;
 
         // Recycle the consumed NV12 buffer.
         frame.texture.try_recycle(ctx);
@@ -1719,8 +1758,13 @@ async fn inference_stage<B: UpscaleBackend>(
                 rgb_format = ?upscaled_rgb.format,
                 "PIPELINE-BND: inference_stage postprocess input"
             );
-            let upscaled_nv12 =
-                preprocess.postprocess(upscaled_rgb, encoder_pitch, ctx, &ctx.inference_stream)?;
+            let upscaled_nv12 = preprocess.postprocess(
+                upscaled_rgb,
+                encoder_pitch,
+                ctx,
+                &ctx.inference_stream,
+                frame_index,
+            )?;
             debug!(
                 frame_index,
                 pts,
@@ -1729,7 +1773,7 @@ async fn inference_stage<B: UpscaleBackend>(
                 nv12_pitch = upscaled_nv12.pitch,
                 "PIPELINE-BND: inference_stage postprocess complete"
             );
-            if claim_postprocess_debug_dump_slot() {
+            if claim_postprocess_debug_dump_slot(frame_index) {
                 write_postprocess_debug_dump(&upscaled_nv12, ctx, frame_index)?;
             }
             outbound.push(FrameEnvelope {
@@ -1938,5 +1982,64 @@ impl FrameEncoder for MockEncoder {
     fn flush(&mut self) -> Result<()> {
         debug!(frames = self.count, "MockEncoder flushed");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn pipeline_debug_dump_limit_defaults_to_single_frame_flag() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("VIDEOFORGE_PIPELINE_DEBUG_DUMP_FRAMES");
+            std::env::set_var("VIDEOFORGE_PIPELINE_DEBUG_DUMP", "1");
+        }
+        assert_eq!(pipeline_debug_dump_limit(), Some(1));
+        unsafe {
+            std::env::remove_var("VIDEOFORGE_PIPELINE_DEBUG_DUMP");
+        }
+    }
+
+    #[test]
+    fn pipeline_debug_dump_limit_prefers_frame_count_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("VIDEOFORGE_PIPELINE_DEBUG_DUMP", "1");
+            std::env::set_var("VIDEOFORGE_PIPELINE_DEBUG_DUMP_FRAMES", "6");
+        }
+        assert_eq!(pipeline_debug_dump_limit(), Some(6));
+        reset_pipeline_debug_dump_state();
+        assert!(claim_preprocess_debug_dump_slot(0));
+        assert!(claim_preprocess_debug_dump_slot(1));
+        assert!(claim_preprocess_debug_dump_slot(2));
+        assert!(claim_preprocess_debug_dump_slot(3));
+        assert!(claim_preprocess_debug_dump_slot(4));
+        assert!(claim_preprocess_debug_dump_slot(5));
+        assert!(!claim_preprocess_debug_dump_slot(6));
+        unsafe {
+            std::env::remove_var("VIDEOFORGE_PIPELINE_DEBUG_DUMP");
+            std::env::remove_var("VIDEOFORGE_PIPELINE_DEBUG_DUMP_FRAMES");
+        }
+    }
+
+    #[test]
+    fn pipeline_debug_dump_start_frame_selects_target_window() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("VIDEOFORGE_PIPELINE_DEBUG_DUMP_FRAMES", "4");
+            std::env::set_var("VIDEOFORGE_PIPELINE_DEBUG_DUMP_START_FRAME", "100");
+        }
+        assert!(!should_dump_pipeline_frame(99));
+        assert!(should_dump_pipeline_frame(100));
+        assert!(should_dump_pipeline_frame(103));
+        assert!(!should_dump_pipeline_frame(104));
+        unsafe {
+            std::env::remove_var("VIDEOFORGE_PIPELINE_DEBUG_DUMP_FRAMES");
+            std::env::remove_var("VIDEOFORGE_PIPELINE_DEBUG_DUMP_START_FRAME");
+        }
     }
 }

@@ -37,7 +37,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cudarc::driver::{CudaDevice, CudaFunction, CudaStream, DevicePtr, LaunchAsync, LaunchConfig};
 use tracing::info;
@@ -47,21 +47,46 @@ use crate::core::context::GpuContext;
 use crate::core::types::{GpuBuffer, GpuTexture, PixelFormat};
 use crate::error::{EngineError, Result};
 
-static POSTPROCESS_KERNEL_DEBUG_DUMP_WRITTEN: AtomicBool = AtomicBool::new(false);
+static POSTPROCESS_KERNEL_DEBUG_DUMP_COUNT: AtomicU64 = AtomicU64::new(0);
 
-fn postprocess_kernel_debug_enabled() -> bool {
-    std::env::var_os("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP").as_deref() == Some("1".as_ref())
+fn postprocess_kernel_debug_dump_limit() -> Option<u64> {
+    if let Some(raw) = std::env::var("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_FRAMES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return Some(raw.max(1));
+    }
+    if std::env::var_os("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP").as_deref() == Some("1".as_ref())
+    {
+        return Some(1);
+    }
+    None
+}
+
+fn postprocess_kernel_debug_dump_start_frame() -> u64 {
+    std::env::var("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_START_FRAME")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 fn postprocess_neutral_chroma_enabled() -> bool {
     std::env::var_os("VIDEOFORGE_POSTPROCESS_NEUTRAL_CHROMA").as_deref() == Some("1".as_ref())
 }
 
-fn claim_postprocess_kernel_debug_dump_slot() -> bool {
-    postprocess_kernel_debug_enabled()
-        && POSTPROCESS_KERNEL_DEBUG_DUMP_WRITTEN
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+fn claim_postprocess_kernel_debug_dump_slot(frame_index: u64) -> bool {
+    let Some(limit) = postprocess_kernel_debug_dump_limit() else {
+        return false;
+    };
+    let start = postprocess_kernel_debug_dump_start_frame();
+    if frame_index < start || frame_index >= start.saturating_add(limit) {
+        return false;
+    }
+    POSTPROCESS_KERNEL_DEBUG_DUMP_COUNT.fetch_add(1, Ordering::AcqRel) < limit
+}
+
+pub(crate) fn reset_postprocess_kernel_debug_dump_state() {
+    POSTPROCESS_KERNEL_DEBUG_DUMP_COUNT.store(0, Ordering::Release);
 }
 
 fn debug_dump_dir() -> PathBuf {
@@ -121,6 +146,7 @@ fn write_postprocess_kernel_input_debug_dump(
     texture: &GpuTexture,
     ctx: &GpuContext,
     nv12_pitch: usize,
+    frame_index: u64,
 ) -> Result<()> {
     let dump_dir = debug_dump_dir();
     fs::create_dir_all(&dump_dir).map_err(|e| {
@@ -131,8 +157,8 @@ fn write_postprocess_kernel_input_debug_dump(
     })?;
 
     let base = format!(
-        "postprocess_input_{}x{}_pitch{}_fmt_{:?}",
-        texture.width, texture.height, texture.pitch, texture.format
+        "postprocess_input_{:05}_{}x{}_pitch{}_fmt_{:?}",
+        frame_index, texture.width, texture.height, texture.pitch, texture.format
     );
     let raw_path = dump_dir.join(format!("{base}.bin"));
     let meta_path = dump_dir.join(format!("{base}.txt"));
@@ -775,6 +801,7 @@ impl PreprocessKernels {
         nv12_pitch: usize,
         ctx: &GpuContext,
         stream: &CudaStream,
+        frame_index: u64,
     ) -> Result<GpuTexture> {
         if input.format != PixelFormat::RgbPlanarF32 {
             return Err(EngineError::FormatMismatch {
@@ -796,7 +823,7 @@ impl PreprocessKernels {
         let neutral_chroma = postprocess_neutral_chroma_enabled();
 
         let (config, _) = launch_config_2d(input.width, input.height);
-        let should_dump = claim_postprocess_kernel_debug_dump_slot();
+        let should_dump = claim_postprocess_kernel_debug_dump_slot(frame_index);
 
         if should_dump {
             info!(
@@ -812,7 +839,7 @@ impl PreprocessKernels {
                 out_bytes,
                 "rgb_to_nv12 launch parameters"
             );
-            write_postprocess_kernel_input_debug_dump(input, ctx, nv12_pitch)?;
+            write_postprocess_kernel_input_debug_dump(input, ctx, nv12_pitch, frame_index)?;
         }
 
         // SAFETY:
@@ -854,6 +881,7 @@ impl PreprocessKernels {
         nv12_pitch: usize,
         ctx: &GpuContext,
         stream: &CudaStream,
+        frame_index: u64,
     ) -> Result<GpuTexture> {
         if input.format != PixelFormat::RgbPlanarF16 {
             return Err(EngineError::FormatMismatch {
@@ -875,7 +903,7 @@ impl PreprocessKernels {
         let neutral_chroma = postprocess_neutral_chroma_enabled();
 
         let (config, _) = launch_config_2d(input.width, input.height);
-        let should_dump = claim_postprocess_kernel_debug_dump_slot();
+        let should_dump = claim_postprocess_kernel_debug_dump_slot(frame_index);
 
         if should_dump {
             info!(
@@ -891,7 +919,7 @@ impl PreprocessKernels {
                 out_bytes,
                 "rgb_f16_to_nv12 launch parameters"
             );
-            write_postprocess_kernel_input_debug_dump(input, ctx, nv12_pitch)?;
+            write_postprocess_kernel_input_debug_dump(input, ctx, nv12_pitch, frame_index)?;
         }
 
         unsafe {
@@ -1141,12 +1169,17 @@ impl PreprocessPipeline {
         nv12_pitch: usize,
         ctx: &GpuContext,
         stream: &CudaStream,
+        frame_index: u64,
     ) -> Result<GpuTexture> {
         match output.format {
-            PixelFormat::RgbPlanarF32 => self.kernels.rgb_to_nv12(&output, nv12_pitch, ctx, stream),
-            PixelFormat::RgbPlanarF16 => self
-                .kernels
-                .rgb_f16_to_nv12(&output, nv12_pitch, ctx, stream),
+            PixelFormat::RgbPlanarF32 => {
+                self.kernels
+                    .rgb_to_nv12(&output, nv12_pitch, ctx, stream, frame_index)
+            }
+            PixelFormat::RgbPlanarF16 => {
+                self.kernels
+                    .rgb_f16_to_nv12(&output, nv12_pitch, ctx, stream, frame_index)
+            }
             other => Err(EngineError::FormatMismatch {
                 expected: PixelFormat::RgbPlanarF32,
                 actual: other,
@@ -1185,5 +1218,67 @@ fn launch_config_1d(count: usize) -> LaunchConfig {
         grid_dim: grid,
         block_dim: (block, 1, 1),
         shared_mem_bytes: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn postprocess_kernel_debug_dump_limit_defaults_to_single_frame_flag() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_FRAMES");
+            std::env::set_var("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP", "1");
+        }
+        assert_eq!(postprocess_kernel_debug_dump_limit(), Some(1));
+        unsafe {
+            std::env::remove_var("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP");
+        }
+    }
+
+    #[test]
+    fn postprocess_kernel_debug_dump_limit_prefers_frame_count_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP", "1");
+            std::env::set_var("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_FRAMES", "4");
+        }
+        assert_eq!(postprocess_kernel_debug_dump_limit(), Some(4));
+        reset_postprocess_kernel_debug_dump_state();
+        assert!(claim_postprocess_kernel_debug_dump_slot(0));
+        assert!(claim_postprocess_kernel_debug_dump_slot(1));
+        assert!(claim_postprocess_kernel_debug_dump_slot(2));
+        assert!(claim_postprocess_kernel_debug_dump_slot(3));
+        assert!(!claim_postprocess_kernel_debug_dump_slot(4));
+        unsafe {
+            std::env::remove_var("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP");
+            std::env::remove_var("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_FRAMES");
+        }
+    }
+
+    #[test]
+    fn postprocess_kernel_debug_dump_start_frame_selects_target_window() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_FRAMES", "3");
+            std::env::set_var(
+                "VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_START_FRAME",
+                "150",
+            );
+        }
+        reset_postprocess_kernel_debug_dump_state();
+        assert!(!claim_postprocess_kernel_debug_dump_slot(149));
+        assert!(claim_postprocess_kernel_debug_dump_slot(150));
+        assert!(claim_postprocess_kernel_debug_dump_slot(151));
+        assert!(claim_postprocess_kernel_debug_dump_slot(152));
+        assert!(!claim_postprocess_kernel_debug_dump_slot(153));
+        unsafe {
+            std::env::remove_var("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_FRAMES");
+            std::env::remove_var("VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_START_FRAME");
+        }
     }
 }

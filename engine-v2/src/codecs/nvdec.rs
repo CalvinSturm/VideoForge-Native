@@ -44,7 +44,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use cudarc::driver::DevicePtr;
 
@@ -55,8 +54,6 @@ use crate::core::context::GpuContext;
 use crate::core::types::{FrameEnvelope, GpuBuffer, GpuTexture, PixelFormat};
 use crate::engine::pipeline::{DecodedFrameEnvelope, FrameDecoder, StreamReadyEvent};
 use crate::error::{EngineError, Result};
-
-static NVDEC_DEBUG_DUMP_WRITTEN: AtomicBool = AtomicBool::new(false);
 
 // ─── Bitstream source trait ──────────────────────────────────────────────
 
@@ -129,15 +126,38 @@ pub struct NvDecoder {
 }
 
 impl NvDecoder {
-    fn debug_dump_enabled() -> bool {
-        std::env::var_os("VIDEOFORGE_NVDEC_DEBUG_DUMP").as_deref() == Some("1".as_ref())
+    fn debug_dump_limit() -> Option<u64> {
+        if let Some(raw) = std::env::var("VIDEOFORGE_NVDEC_DEBUG_DUMP_FRAMES")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            return Some(raw.max(1));
+        }
+
+        if std::env::var_os("VIDEOFORGE_NVDEC_DEBUG_DUMP").as_deref() == Some("1".as_ref()) {
+            Some(1)
+        } else {
+            None
+        }
     }
 
-    fn claim_debug_dump_slot() -> bool {
-        Self::debug_dump_enabled()
-            && NVDEC_DEBUG_DUMP_WRITTEN
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+    fn debug_dump_start_frame() -> u64 {
+        std::env::var("VIDEOFORGE_NVDEC_DEBUG_DUMP_START_FRAME")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    fn should_dump_frame(frame_index: u64) -> bool {
+        let Some(limit) = Self::debug_dump_limit() else {
+            return false;
+        };
+        let start = Self::debug_dump_start_frame();
+        frame_index >= start && frame_index < start.saturating_add(limit)
+    }
+
+    fn claim_debug_dump_slot(frame_index: u64) -> bool {
+        Self::should_dump_frame(frame_index)
     }
 
     fn debug_dump_dir() -> PathBuf {
@@ -505,7 +525,7 @@ impl NvDecoder {
         );
 
         let src_pitch_usize = src_pitch as usize;
-        let should_dump = Self::claim_debug_dump_slot();
+        let should_dump = Self::claim_debug_dump_slot(self.frame_index);
 
         if should_dump {
             info!(
@@ -931,4 +951,62 @@ pub fn wait_for_event(target_stream: &cudarc::driver::CudaStream, event: CUevent
         check_cu(cuStreamWaitEvent(raw_stream, event, 0), "cuStreamWaitEvent")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NvDecoder;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn nvdec_debug_dump_limit_supports_legacy_flag() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::remove_var("VIDEOFORGE_NVDEC_DEBUG_DUMP_FRAMES");
+            std::env::remove_var("VIDEOFORGE_NVDEC_DEBUG_DUMP_START_FRAME");
+            std::env::set_var("VIDEOFORGE_NVDEC_DEBUG_DUMP", "1");
+        }
+        assert_eq!(NvDecoder::debug_dump_limit(), Some(1));
+        unsafe {
+            std::env::remove_var("VIDEOFORGE_NVDEC_DEBUG_DUMP");
+        }
+    }
+
+    #[test]
+    fn nvdec_debug_dump_limit_prefers_frames_override() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("VIDEOFORGE_NVDEC_DEBUG_DUMP", "1");
+            std::env::set_var("VIDEOFORGE_NVDEC_DEBUG_DUMP_FRAMES", "6");
+            std::env::remove_var("VIDEOFORGE_NVDEC_DEBUG_DUMP_START_FRAME");
+        }
+        assert_eq!(NvDecoder::debug_dump_limit(), Some(6));
+        unsafe {
+            std::env::remove_var("VIDEOFORGE_NVDEC_DEBUG_DUMP");
+            std::env::remove_var("VIDEOFORGE_NVDEC_DEBUG_DUMP_FRAMES");
+        }
+    }
+
+    #[test]
+    fn nvdec_debug_dump_start_frame_selects_target_window() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::remove_var("VIDEOFORGE_NVDEC_DEBUG_DUMP");
+            std::env::set_var("VIDEOFORGE_NVDEC_DEBUG_DUMP_FRAMES", "4");
+            std::env::set_var("VIDEOFORGE_NVDEC_DEBUG_DUMP_START_FRAME", "5");
+        }
+        assert!(!NvDecoder::should_dump_frame(4));
+        assert!(NvDecoder::should_dump_frame(5));
+        assert!(NvDecoder::should_dump_frame(8));
+        assert!(!NvDecoder::should_dump_frame(9));
+        unsafe {
+            std::env::remove_var("VIDEOFORGE_NVDEC_DEBUG_DUMP_FRAMES");
+            std::env::remove_var("VIDEOFORGE_NVDEC_DEBUG_DUMP_START_FRAME");
+        }
+    }
 }
