@@ -12,6 +12,18 @@
 - There is no obvious HTTP server or database layer in the inspected repo; the “API” is Tauri invoke commands plus local IPC between Rust and Python.
 - Read `ui/src/App.tsx`, `ui/src/hooks/useUpscaleJob.ts`, `src-tauri/src/lib.rs`, `src-tauri/src/commands/upscale.rs`, `src-tauri/src/commands/native_engine.rs`, `python/shm_worker.py`, and `engine-v2/src/lib.rs` first.
 
+## Docs Authority
+- Treat the five canonical docs in `docs/` as the primary source of truth for current behavior:
+  - `docs/architecture_status_truth.md`
+  - `docs/capability_matrix.md`
+  - `docs/runtime_path_contracts.md`
+  - `docs/state_and_persistence.md`
+  - `docs/metrics_trust.md`
+- Treat `docs/README.md` as the docs entrypoint.
+- Treat `docs/archive/README.md` and files under `docs/archive/` as historical context only.
+- Treat handoff docs as working transfer context, not durable architecture authority, unless a canonical doc explicitly delegates to them.
+- Treat `SMOKE_TEST.md` as the live operational smoke runbook.
+
 ## Repo Shape
 - `ui/`: frontend app.
 - `src-tauri/`: Tauri desktop host and Rust backend/API.
@@ -67,6 +79,9 @@
   - Local run artifacts: `src-tauri/src/run_manifest.rs`.
 
 ## Video Upscaling Engines
+- Use this section as a quick orientation map.
+- For durable route/gating/support truth, prefer the canonical docs listed above.
+
 - Primary engine families found:
   - Python sidecar engine.
   - Native Rust engine.
