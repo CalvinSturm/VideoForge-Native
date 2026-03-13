@@ -131,7 +131,7 @@ Key files or subsystems likely to change:
 
 - `tools/ci/check_native_smoke_perf.ps1`
 - `src-tauri/src/bin/smoke.rs`
-- `docs/native_engine_workspace_audit_2026-03-06.md`
+- `docs/archive/native_engine_workspace_audit_2026-03-06.md`
 - any adjacent native-engine docs kept as working references
 
 Acceptance criteria:

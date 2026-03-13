@@ -141,8 +141,8 @@ Out of scope:
 
 Key files or subsystems likely to change:
 
-- `docs/native_engine_optimization_audit.md`
-- `docs/native_engine_implementation_plan.md`
+- `docs/archive/native_engine_optimization_audit.md`
+- `docs/archive/native_engine_implementation_plan.md`
 - possibly adjacent docs that still describe the wrong active path
 
 Acceptance criteria:

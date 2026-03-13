@@ -7,7 +7,7 @@
 
 ## How To Use This File
 - This file is the archived execution tracker for the native engine workstream.
-- For the latest resume point, start with [`docs/native_engine_handoff_2026-03-07.md`](/C:/Users/Calvin/Desktop/VideoForge1/docs/native_engine_handoff_2026-03-07.md).
+- For the latest archived resume point, start with [`native_engine_handoff_2026-03-07.md`](/C:/Users/Calvin/Desktop/VideoForge1/docs/archive/native_engine_handoff_2026-03-07.md).
 - After each implemented section, update:
   - the phase status
   - the completed task checkboxes

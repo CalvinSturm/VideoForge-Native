@@ -1,6 +1,6 @@
 # Docs Index
 
-This directory contains both the durable architecture contracts and the current native-engine planning notes.
+This directory contains the durable architecture contracts plus archived planning and handoff snapshots.
 
 ## Start Here
 
@@ -15,12 +15,14 @@ This directory contains both the durable architecture contracts and the current 
 - [`metrics_trust.md`](metrics_trust.md)
   - Canonical metric provenance and comparability rules.
 
-## Status And Planning
+## Archived Status And Planning
 
-- [`../implementation_plan.md`](../implementation_plan.md)
-  - Native-engine execution tracker and archived status summary.
-- [`native_engine_handoff_2026-03-07.md`](native_engine_handoff_2026-03-07.md)
-  - Latest native handoff and resume point.
+- [`archive/implementation_plan.md`](archive/implementation_plan.md)
+  - Archived native-engine execution tracker and status snapshot.
+- [`archive/native_engine_handoff_2026-03-07.md`](archive/native_engine_handoff_2026-03-07.md)
+  - Archived native handoff snapshot.
+- [`archive/native_engine_implementation_plan.md`](archive/native_engine_implementation_plan.md)
+  - Archived native workstream implementation tracker.
 
 ## Cross-Engine Audit And Planning Snapshots
 
@@ -34,6 +36,5 @@ This directory contains both the durable architecture contracts and the current 
 ## Working Rule
 
 - Prefer the five canonical docs above for system truth.
-- Prefer [`../implementation_plan.md`](../implementation_plan.md) for native workstream status.
-- Prefer [`native_engine_handoff_2026-03-07.md`](native_engine_handoff_2026-03-07.md) for the latest native resume point.
+- Treat files under [`archive/`](archive/) as historical context, not current-source-of-truth guidance.
 - Treat audit, plan, and handoff files as supporting context unless a canonical doc explicitly delegates to them.
