@@ -1021,3 +1021,42 @@ Current hypothesis after the `rave` comparison:
 
 - the decode→preprocess input-buffer reuse race was the most defensible remaining root-cause candidate in `engine-v2`
 - the next required step is a direct-native repro rerun after this patch to see whether the intermittent early black/glitch issue disappears or becomes materially rarer
+
+## 2026-03-15 Latest Clean Startup-Targeted Recheck
+
+A later targeted startup run used:
+
+- dump dir: `artifacts/nvdec_debug/ui_direct_oneblack_start_20260313`
+- final output: `artifacts/ui_direct_oneblack_start_20260313.mp4`
+
+Run shape:
+
+- `VIDEOFORGE_ENABLE_NATIVE_ENGINE=1`
+- `VIDEOFORGE_NATIVE_ENGINE_DIRECT=1`
+- `VIDEOFORGE_NVDEC_DEBUG_DUMP=1`
+- `VIDEOFORGE_NVDEC_DEBUG_DUMP_FRAMES=4`
+- `VIDEOFORGE_NVDEC_DEBUG_DUMP_START_FRAME=0`
+- `VIDEOFORGE_NVENC_DEBUG_DUMP_FRAMES=8`
+- `VIDEOFORGE_PIPELINE_DEBUG_DUMP_FRAMES=4`
+- `VIDEOFORGE_PIPELINE_DEBUG_DUMP_START_FRAME=0`
+- `VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_FRAMES=4`
+- `VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP_START_FRAME=0`
+- `VIDEOFORGE_NATIVE_MUX_DEBUG=1`
+
+What this latest targeted run showed:
+
+- the export was visually clean
+- no startup black frame was observed
+- the operator reported it as a "perfect export"
+
+Updated interpretation:
+
+- the direct-native major corruption issue remains fixed
+- the decode→preprocess lifetime fix appears to have materially improved the intermittent early-frame issue
+- the remaining residual problem, if it still exists, is intermittent enough that the latest startup-targeted capture came out clean
+
+Practical guidance going forward:
+
+- keep the startup-targeted debug recipe available for future regressions
+- do not remove the stage-specific debug env switches
+- if the early black/glitch issue reappears, use the same startup-targeted capture first before making further code changes

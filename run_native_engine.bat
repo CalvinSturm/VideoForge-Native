@@ -1,0 +1,16 @@
+@echo off
+setlocal
+
+cd /d "%~dp0"
+
+set "VIDEOFORGE_ENABLE_NATIVE_ENGINE=1"
+set "VIDEOFORGE_NATIVE_ENGINE_DIRECT=1"
+
+echo Starting VideoForge with native engine enabled...
+echo VIDEOFORGE_ENABLE_NATIVE_ENGINE=%VIDEOFORGE_ENABLE_NATIVE_ENGINE%
+echo VIDEOFORGE_NATIVE_ENGINE_DIRECT=%VIDEOFORGE_NATIVE_ENGINE_DIRECT%
+echo.
+
+npm run dev:native
+
+pause
