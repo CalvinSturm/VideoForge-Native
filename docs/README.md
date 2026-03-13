@@ -18,9 +18,13 @@ This directory contains the durable architecture contracts plus archived plannin
 ## Active Working Docs
 
 - [`handoff_native_direct_glitch_followup_2026-03-13.md`](handoff_native_direct_glitch_followup_2026-03-13.md)
-  - Active native direct investigation handoff.
+  - Resolved native direct investigation record; resume from it only if the regression returns.
+- [`product_engineering_roadmap_2026-03-13.md`](product_engineering_roadmap_2026-03-13.md)
+  - Product and engineering roadmap for the next VideoForge phase.
 - [`release_hygiene_checklist.md`](release_hygiene_checklist.md)
   - Release and packaging metadata checklist.
+- [`next_phase_direction_2026-03-13.md`](next_phase_direction_2026-03-13.md)
+  - Short transition note for the post-cleanup optimization and product phase.
 
 ## Historical Docs
 
