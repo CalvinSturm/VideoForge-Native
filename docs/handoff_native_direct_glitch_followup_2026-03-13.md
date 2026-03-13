@@ -494,3 +494,107 @@ If NVENC handoff is clean and encoded decode is black:
   - `VIDEOFORGE_PIPELINE_DEBUG_DUMP=1` for preprocess/postprocess surface dumps
   - `VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP=1` for postprocess kernel input dumps
   - `VIDEOFORGE_NATIVE_MUX_DEBUG=1` for mux logging
+
+## 2026-03-15 Residual Rerun With Fresh Dump Dir
+
+A fresh direct-native residual rerun was captured with an explicit isolated dump directory and postprocess-kernel dumps enabled.
+
+Run shape:
+
+- direct native
+- fresh app process
+- `VIDEOFORGE_ENABLE_NATIVE_ENGINE=1`
+- `VIDEOFORGE_NATIVE_ENGINE_DIRECT=1`
+- `VIDEOFORGE_NVENC_DEBUG_DUMP_FRAMES=48`
+- `VIDEOFORGE_PIPELINE_DEBUG_DUMP=1`
+- `VIDEOFORGE_NATIVE_MUX_DEBUG=1`
+- `VIDEOFORGE_POSTPROCESS_KERNEL_DEBUG_DUMP=1`
+- `VIDEOFORGE_NVDEC_DEBUG_DUMP_DIR=.../artifacts/nvdec_debug/ui_direct_residual_20260315_fresh`
+
+Output:
+
+- `artifacts/ui_direct_residual_20260315.mp4`
+
+Dump directory:
+
+- `artifacts/nvdec_debug/ui_direct_residual_20260315_fresh/`
+
+### What this rerun produced
+
+The fresh dump directory contains:
+
+- `nvenc_handoff_00000` through `nvenc_handoff_00047`
+- `nvenc_bitstream_packet_00000` through `nvenc_bitstream_packet_00047`
+- `preprocess_00000_*`
+- `postprocess_00000_*`
+- one `postprocess_input_*`
+- `native_mux_debug.log`
+
+### What this rerun proves
+
+1. The direct dump path is working again when forced into a fresh dump directory.
+2. The pipeline-stage dump path is still effectively single-frame only:
+   - only `preprocess_00000_*` was written
+   - only `postprocess_00000_*` was written
+   - only one `postprocess_input_*` dump was written
+3. Full-frame NVENC handoff and bitstream dumps were still captured for all 48 frames.
+
+### Updated stage-of-failure narrowing
+
+Frame `0`:
+
+- this rerun includes `preprocess_00000_*`
+- this rerun includes `postprocess_00000_*`
+- this rerun includes `nvenc_handoff_00000_*`
+- this rerun includes `nvenc_bitstream_packet_00000_*`
+
+Conclusion for frame `0`:
+
+- frame `0` is already black by postprocess output
+- frame `0` is also black by NVENC handoff
+- therefore the first black stage for frame `0` is **not later than postprocess output**
+- this rerun does **not** prove whether frame `0` first becomes black in preprocess output, postprocess kernel input, or during RGB->NV12 postprocess itself
+
+Frame `5`:
+
+- this rerun includes `nvenc_handoff_00005_*`
+- this rerun includes `nvenc_bitstream_packet_00005_*`
+- this rerun does **not** include `preprocess_00005_*`
+- this rerun does **not** include `postprocess_00005_*`
+- this rerun does **not** include a frame-indexed `postprocess_input_00005_*`
+
+Conclusion for frame `5`:
+
+- frame `5` is definitely already black by NVENC handoff
+- frame `5` also survives into the dumped HEVC packet path
+- this rerun still does **not** determine whether frame `5` first becomes black in preprocess output, postprocess input, or postprocess output
+
+### Most important implication
+
+The investigation is now blocked more by instrumentation granularity than by fault-domain uncertainty.
+
+Current direct-path dump behavior is sufficient to prove:
+
+- frame `0` is black by postprocess output
+- frame `5` is black by NVENC handoff
+- mux is not the residual fault domain
+- generic NVENC packet corruption is not the residual fault domain
+
+But current pipeline debug dumping is still not sufficient to answer the key remaining question for frame `5`:
+
+- whether the first black stage is preprocess RGB
+- postprocess kernel input RGB
+- or postprocess NV12 output
+
+### Next required direction
+
+The next investigation step should stay focused on the direct native path and make the pipeline dump path frame-selective rather than first-frame-only, so the same rerun can capture:
+
+- `preprocess_00005_*`
+- `postprocess_input_00005_*`
+- `postprocess_00005_*`
+
+Until that is done, the strongest current statement is:
+
+- frame `0` turns black no later than postprocess output
+- frame `5` turns black no later than NVENC handoff
