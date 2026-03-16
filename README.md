@@ -1,10 +1,13 @@
 # VideoForge-Native
 
-> Local-first AI video and image enhancement with a native GPU engine path.
+> Local-first image and video enhancement with deterministic execution paths.
 
 VideoForge-Native is a desktop app for enhancing video and images on your own machine.
 
-It is built for people who want faster local workflows, direct control over models and settings, and a clearer path from experiment to repeatable result without sending media to the cloud.
+It is built for faster local workflows, direct control over models and settings, and repeatable results without sending media to the cloud.
+
+<img src="docs/assets/1.png" alt="VideoForge app screen shot" width="1024"/>
+
 
 ## Why it matters
 
